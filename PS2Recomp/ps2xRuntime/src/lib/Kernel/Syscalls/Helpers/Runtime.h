@@ -1,0 +1,400 @@
+static void setRegU32(R5900Context *ctx, int reg, uint32_t value)
+{
+    if (!ctx || reg < 0 || reg > 31)
+        return;
+    SET_GPR_U32(ctx, reg, value);
+}
+
+static void rpcCopyToRdram(uint8_t *rdram, uint32_t dst, uint32_t src, size_t size)
+{
+    if (!rdram || size == 0)
+        return;
+
+    ps2TraceGuestRangeWrite(rdram, dst, static_cast<uint32_t>(size), "rpcCopyToRdram", nullptr);
+
+    constexpr size_t kMaxRpcTransferBytes = 1u * 1024u * 1024u;
+    const size_t clampedSize = std::min(size, kMaxRpcTransferBytes);
+    if (clampedSize != size)
+    {
+        static uint32_t warnCount = 0;
+        if (warnCount < 8)
+        {
+            std::cerr << "[SifCallRpc] clamping copy size from " << size
+                      << " to " << clampedSize
+                      << " bytes (dst=0x" << std::hex << dst
+                      << " src=0x" << src << std::dec << ")" << std::endl;
+            ++warnCount;
+        }
+    }
+
+    for (size_t i = 0; i < clampedSize; ++i)
+    {
+        const uint32_t dstAddr = dst + static_cast<uint32_t>(i);
+        const uint32_t srcAddr = src + static_cast<uint32_t>(i);
+        uint8_t *dstPtr = getMemPtr(rdram, dstAddr);
+        const uint8_t *srcPtr = getConstMemPtr(rdram, srcAddr);
+        if (!dstPtr || !srcPtr)
+        {
+            break;
+        }
+        *dstPtr = *srcPtr;
+    }
+}
+
+static void rpcZeroRdram(uint8_t *rdram, uint32_t dst, size_t size)
+{
+    if (!rdram || size == 0)
+        return;
+
+    ps2TraceGuestRangeWrite(rdram, dst, static_cast<uint32_t>(size), "rpcZeroRdram", nullptr);
+
+    constexpr size_t kMaxRpcTransferBytes = 1u * 1024u * 1024u;
+    const size_t clampedSize = std::min(size, kMaxRpcTransferBytes);
+    if (clampedSize != size)
+    {
+        static uint32_t warnCount = 0;
+        if (warnCount < 8)
+        {
+            std::cerr << "[SifCallRpc] clamping zero size from " << size
+                      << " to " << clampedSize
+                      << " bytes (dst=0x" << std::hex << dst << std::dec << ")" << std::endl;
+            ++warnCount;
+        }
+    }
+
+    for (size_t i = 0; i < clampedSize; ++i)
+    {
+        const uint32_t dstAddr = dst + static_cast<uint32_t>(i);
+        uint8_t *dstPtr = getMemPtr(rdram, dstAddr);
+        if (!dstPtr)
+        {
+            break;
+        }
+        *dstPtr = 0;
+    }
+}
+
+static bool readStackU32(uint8_t *rdram, uint32_t sp, uint32_t offset, uint32_t &out)
+{
+    uint8_t *ptr = getMemPtr(rdram, sp + offset);
+    if (!ptr)
+        return false;
+    out = *reinterpret_cast<uint32_t *>(ptr);
+    return true;
+}
+
+static uint32_t rpcAllocPacketAddr(uint8_t *rdram)
+{
+    if (kRpcPacketPoolCount == 0)
+        return 0;
+
+    uint32_t slot = g_rpc_packet_index++ % kRpcPacketPoolCount;
+    uint32_t addr = kRpcPacketPoolBase + (slot * kRpcPacketSize);
+    rpcZeroRdram(rdram, addr, kRpcPacketSize);
+    return addr;
+}
+
+static uint32_t rpcAllocServerAddr(uint8_t *rdram)
+{
+    if (kRpcServerPoolCount == 0)
+        return 0;
+
+    uint32_t slot = g_rpc_server_index++ % kRpcServerPoolCount;
+    uint32_t addr = kRpcServerPoolBase + (slot * kRpcServerStride);
+    rpcZeroRdram(rdram, addr, kRpcServerStride);
+    return addr;
+}
+
+inline std::string translatePs2Path(const char *ps2Path)
+{
+    if (!ps2Path || !*ps2Path)
+    {
+        return {};
+    }
+
+    const ps2x::iop::ParsedPs2Path parsed = ps2x::iop::parsePs2Path(ps2Path);
+    if (!parsed)
+    {
+        return {};
+    }
+
+    auto resolveWithBase = [&](const std::filesystem::path &base, const std::string &suffix) -> std::string
+    {
+        const std::string normalizedSuffix = normalizePs2PathSuffix(suffix);
+        std::filesystem::path resolved = base;
+        if (!normalizedSuffix.empty())
+        {
+            resolved /= std::filesystem::path(normalizedSuffix);
+        }
+        return resolved.lexically_normal().string();
+    };
+
+    switch (parsed.device)
+    {
+    case ps2x::iop::Ps2PathDevice::Host:
+        return resolveWithBase(getConfiguredHostRoot(), parsed.path);
+    case ps2x::iop::Ps2PathDevice::Cdrom:
+        return resolveWithBase(getConfiguredCdRoot(), parsed.path);
+    case ps2x::iop::Ps2PathDevice::MemoryCard0:
+        return resolveWithBase(getConfiguredMcRoot(), parsed.path);
+    case ps2x::iop::Ps2PathDevice::NativeHost:
+        return std::filesystem::path(parsed.path).lexically_normal().string();
+    default:
+        return {};
+    }
+}
+
+static bool localtimeSafe(const std::time_t *t, std::tm *out)
+{
+#ifdef _WIN32
+    return localtime_s(out, t) == 0;
+#else
+    return localtime_r(t, out) != nullptr;
+#endif
+}
+
+static void encodePs2Time(std::time_t t, uint8_t out[8])
+{
+    std::tm tm{};
+    if (!localtimeSafe(&t, &tm))
+    {
+        std::memset(out, 0, 8);
+        return;
+    }
+
+    uint16_t year = static_cast<uint16_t>(tm.tm_year + 1900);
+    out[0] = 0;
+    out[1] = static_cast<uint8_t>(tm.tm_sec);
+    out[2] = static_cast<uint8_t>(tm.tm_min);
+    out[3] = static_cast<uint8_t>(tm.tm_hour);
+    out[4] = static_cast<uint8_t>(tm.tm_mday);
+    out[5] = static_cast<uint8_t>(tm.tm_mon + 1);
+    out[6] = static_cast<uint8_t>(year & 0xFF);
+    out[7] = static_cast<uint8_t>((year >> 8) & 0xFF);
+}
+
+static std::time_t fileTimeToTimeT(std::filesystem::file_time_type ft)
+{
+    auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+    return std::chrono::system_clock::to_time_t(sctp);
+}
+
+static bool gmtimeSafe(const std::time_t *t, std::tm *out)
+{
+#ifdef _WIN32
+    return gmtime_s(out, t) == 0;
+#else
+    return gmtime_r(t, out) != nullptr;
+#endif
+}
+
+static int getTimezoneOffsetMinutes()
+{
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+    std::tm gmt{};
+    if (!localtimeSafe(&now, &local) || !gmtimeSafe(&now, &gmt))
+        return 0;
+
+    std::time_t localTime = std::mktime(&local);
+    std::time_t gmtTime = std::mktime(&gmt);
+    if (localTime == static_cast<std::time_t>(-1) || gmtTime == static_cast<std::time_t>(-1))
+        return 0;
+
+    double diff = std::difftime(localTime, gmtTime);
+    return static_cast<int>(diff / 60.0);
+}
+
+static uint32_t packOsdConfig(uint32_t spdifMode, uint32_t screenType, uint32_t videoOutput,
+                              uint32_t japLanguage, uint32_t ps1drvConfig, uint32_t version,
+                              uint32_t language, int timezoneOffset)
+{
+    uint32_t raw = 0;
+    raw |= (spdifMode & 0x1) << 0;
+    raw |= (screenType & 0x3) << 1;
+    raw |= (videoOutput & 0x1) << 3;
+    raw |= (japLanguage & 0x1) << 4;
+    raw |= (ps1drvConfig & 0xFF) << 5;
+    raw |= (version & 0x7) << 13;
+    raw |= (language & 0x1F) << 16;
+    raw |= (static_cast<uint32_t>(timezoneOffset) & 0x7FF) << 21;
+    return raw;
+}
+
+static uint32_t packOsdConfig2(uint32_t format, uint32_t daylightSaving, uint32_t timeFormat,
+                               uint32_t dateFormat, uint32_t version, uint32_t language)
+{
+    const uint32_t flags =
+        ((daylightSaving & 0x1u) << 4) |
+        ((timeFormat & 0x1u) << 5) |
+        ((dateFormat & 0x3u) << 6);
+
+    return (format & 0xFFu) |
+           ((flags & 0xFFu) << 8) |
+           ((version & 0xFFu) << 16) |
+           ((language & 0xFFu) << 24);
+}
+
+static int decodeTimezoneOffset(uint32_t raw)
+{
+    int tz = static_cast<int>((raw >> 21) & 0x7FF);
+    if (tz & 0x400)
+        tz |= ~0x7FF;
+    return tz;
+}
+
+static int clampTimezoneOffset(int tz)
+{
+    if (tz < -1024)
+        return -1024;
+    if (tz > 1023)
+        return 1023;
+    return tz;
+}
+
+static uint32_t sanitizeOsdConfigRaw(uint32_t raw)
+{
+    uint32_t spdifMode = raw & 0x1;
+    uint32_t screenType = (raw >> 1) & 0x3;
+    if (screenType > 2)
+        screenType = 0;
+    uint32_t videoOutput = (raw >> 3) & 0x1;
+    uint32_t japLanguage = (raw >> 4) & 0x1;
+    uint32_t ps1drvConfig = (raw >> 5) & 0xFF;
+    uint32_t version = (raw >> 13) & 0x7;
+    if (version > 2)
+        version = 1;
+    uint32_t language = (raw >> 16) & 0x1F;
+    int tz = clampTimezoneOffset(decodeTimezoneOffset(raw));
+    return packOsdConfig(spdifMode, screenType, videoOutput, japLanguage, ps1drvConfig, version, language, tz);
+}
+
+static uint32_t sanitizeOsdConfig2Raw(uint32_t raw)
+{
+    const uint32_t format = raw & 0xFFu;
+    const uint32_t flags = (raw >> 8) & 0xFFu;
+    const uint32_t daylightSaving = (flags >> 4) & 0x1u;
+    const uint32_t timeFormat = (flags >> 5) & 0x1u;
+    uint32_t dateFormat = (flags >> 6) & 0x3u;
+    if (dateFormat > 2u)
+        dateFormat = 0u;
+
+    uint32_t version = (raw >> 16) & 0xFFu;
+    if (version > 2u)
+        version = 1u;
+
+    const uint32_t language = (raw >> 24) & 0xFFu;
+    return packOsdConfig2(format, daylightSaving, timeFormat, dateFormat, version, language);
+}
+
+static uint32_t syncOsdConfigRawVersionLanguage(uint32_t raw, uint32_t version, uint32_t language)
+{
+    raw &= ~((0x7u << 13) | (0x1Fu << 16));
+    raw |= (version & 0x7u) << 13;
+    raw |= (language & 0x1Fu) << 16;
+    return sanitizeOsdConfigRaw(raw);
+}
+
+static uint32_t makeReadableOsdConfig2RawLocked()
+{
+    const uint32_t version = (g_osd_config_raw >> 13) & 0x7u;
+    const uint32_t language = (g_osd_config_raw >> 16) & 0x1Fu;
+    uint32_t raw = g_osd_config2_raw & 0x0000FFFFu;
+    raw |= (version & 0xFFu) << 16;
+    raw |= (language & 0xFFu) << 24;
+    return sanitizeOsdConfig2Raw(raw);
+}
+
+static void ensureOsdConfigInitialized()
+{
+    std::lock_guard<std::mutex> lock(g_osd_mutex);
+    if (g_osd_config_initialized)
+        return;
+
+    int tz = clampTimezoneOffset(getTimezoneOffsetMinutes());
+    uint32_t spdifMode = 1;   // disabled
+    uint32_t screenType = 0;  // 4:3
+    uint32_t videoOutput = 0; // RGB
+    uint32_t japLanguage = 1; // non-japanese
+    uint32_t ps1drvConfig = 0;
+    uint32_t version = 1;  // OSD2
+    uint32_t language = 1; // English
+    g_osd_config_raw = packOsdConfig(spdifMode, screenType, videoOutput, japLanguage, ps1drvConfig, version, language, tz);
+    g_osd_config2_raw = packOsdConfig2(0, 0, 0, 0, version, language);
+    g_osd_config_initialized = true;
+}
+
+static uint32_t allocTlsAddr(uint8_t *rdram)
+{
+    if (!rdram || kTlsPoolCount == 0)
+        return 0;
+
+    std::lock_guard<std::mutex> lock(g_tls_mutex);
+    uint32_t slot = g_tls_index++ % kTlsPoolCount;
+    uint32_t addr = kTlsPoolBase + (slot * kTlsBlockSize);
+    rpcZeroRdram(rdram, addr, kTlsBlockSize);
+    return addr;
+}
+
+static uint32_t allocBootModeAddr(uint8_t *rdram, size_t bytes)
+{
+    if (!rdram)
+        return 0;
+
+    size_t aligned = (bytes + 15u) & ~15u;
+    if (g_bootmode_pool_offset + aligned > kBootModePoolBytes)
+        return 0;
+
+    uint32_t addr = kBootModePoolBase + g_bootmode_pool_offset;
+    g_bootmode_pool_offset += static_cast<uint32_t>(aligned);
+    rpcZeroRdram(rdram, addr, aligned);
+    return addr;
+}
+
+static uint32_t createBootModeEntry(uint8_t *rdram, uint8_t id, uint16_t value, uint8_t lenField, const uint32_t *data, uint8_t dataCount)
+{
+    uint8_t allocCount = (dataCount == 0) ? 1 : dataCount;
+    size_t bytes = static_cast<size_t>(1 + allocCount) * sizeof(uint32_t);
+    uint32_t addr = allocBootModeAddr(rdram, bytes);
+    if (!addr)
+        return 0;
+
+    uint32_t header = (static_cast<uint32_t>(lenField) << 24) |
+                      (static_cast<uint32_t>(id) << 16) |
+                      (static_cast<uint32_t>(value) & 0xFFFFu);
+
+    uint32_t *dst = reinterpret_cast<uint32_t *>(getMemPtr(rdram, addr));
+    if (!dst)
+        return 0;
+
+    dst[0] = header;
+    for (uint8_t i = 0; i < allocCount; ++i)
+    {
+        dst[1 + i] = (data && i < dataCount) ? data[i] : 0;
+    }
+
+    return addr;
+}
+
+static void ensureBootModeTable(uint8_t *rdram)
+{
+    std::lock_guard<std::mutex> lock(g_bootmode_mutex);
+    if (g_bootmode_initialized)
+        return;
+
+    g_bootmode_pool_offset = 0;
+    g_bootmode_addresses.clear();
+
+    const uint32_t boot3Data[1] = {0};
+    const uint32_t boot5Data[1] = {0};
+
+    g_bootmode_addresses[1] = createBootModeEntry(rdram, 1, 0, 0, nullptr, 0);
+    g_bootmode_addresses[3] = createBootModeEntry(rdram, 3, 0, 1, boot3Data, 1);
+    g_bootmode_addresses[4] = createBootModeEntry(rdram, 4, 0, 0, nullptr, 0);
+    g_bootmode_addresses[5] = createBootModeEntry(rdram, 5, 0, 1, boot5Data, 1);
+    g_bootmode_addresses[6] = createBootModeEntry(rdram, 6, 0, 0, nullptr, 0);
+    g_bootmode_addresses[7] = createBootModeEntry(rdram, 7, 0, 0, nullptr, 0);
+
+    g_bootmode_initialized = true;
+}

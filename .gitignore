@@ -1,0 +1,34 @@
+# Oyun ROM/varlık dosyaları (telif hakkı - paylaşılamaz)
+SCUS_973.99
+PART1.PAK
+*.iso
+
+# Build çıktıları
+output/
+PS2Recomp/build/
+PS2Recomp/out/
+
+# Log/geçici dosyalar
+*.log
+*.txt
+imgui.ini
+*.bak*
+*.patch
+
+# PS2Recomp içindeki büyük recompile çıktıları
+PS2Recomp/ps2xRuntime/src/runner/
+PS2Recomp/ps2xRuntime/include/ps2_recompiled_functions.h
+PS2Recomp/ps2xRuntime/include/ps2_recompiled_stubs.h
+PS2Recomp/ps2xRuntime/include/ps2_all_declarations.h
+
+# PCSX2 kaynak (ayrı proje)
+pcsx2_source/
+
+# mc kartlar
+mc0/
+mc1/
+
+# IDE
+.vs/
+.vscode/
+.idea/

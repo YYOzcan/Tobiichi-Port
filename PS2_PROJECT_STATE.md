@@ -1,0 +1,90 @@
+<!-- ⛔ RULES — Re-read this section EVERY TIME you open this file. -->
+<!-- These rules also appear in the SKILL.md. Redundancy is intentional. -->
+
+# ⛔ QUICK RULES (mandatory re-read)
+
+1. **Build:** `cmake --build <build_dir>` — NEVER add `--clean-first`, `--target clean`, or delete the build directory.
+2. **Files:** NEVER modify `runner/*.cpp`. Fix in `src/lib/` or game overrides.
+3. **Headers:** NEVER modify `.h` without asking user. Triggers mass rebuild.
+4. **Git:** NEVER use destructive git commands (`checkout`, `clean`, `reset`, `stash`, `pull`).
+5. **Verify:** NEVER assume file names/paths. Use tools (`list_dir`, `find_by_name`, `grep_search`).
+
+---
+
+# PS2 Recomp — Project State (Project Tobiichi)
+> Auto-maintained by Origami Tobiichi. DO NOT DELETE. Read at session start, update after every major action.
+
+## Boot Status
+- [x] Loaded `03-ps2recomp-pipeline.md`
+- [x] Loaded `04-runtime-syscalls-stubs.md`
+- [x] Verified comprehension
+
+## Game Info
+- **Title**: God of War (Project Tobiichi)
+- **Region**: NTSC-U (USA)
+- **Serial**: SCUS-97399
+- **Has Symbols**: stripped
+
+## Workspace Paths
+- **PS2Recomp Repo**: `/home/yigit/Belgelerim/Origami Tobiichi/PS2Recomp`
+- **Game Workspace**: `/home/yigit/Belgelerim/Origami Tobiichi`
+- **ISO Path**: `/home/yigit/Belgelerim/God of War (USA).iso`
+- **Output Dir**: `/home/yigit/Belgelerim/Origami Tobiichi/output/`
+
+## Binaries
+| Role | File Name | Type | Path | TOML Config | Status |
+|------|-----------|------|------|-------------|--------|
+| Main | SCUS_973.99 | ELF | `/home/yigit/Belgelerim/Origami Tobiichi/SCUS_973.99` | `/home/yigit/Belgelerim/Origami Tobiichi/god_of_war.toml` | recompiled (6426 files) |
+
+## Environment Setup
+- **OS**: Linux x86_64
+- **Host Tools**: Clang 22.1.8 / GCC 16.2.1, Ninja 1.13.2, CMake 4.4.3
+
+## Current Phase
+PHASE_RUNTIME_BUILD
+
+## Build Configuration
+- **CMake Generator**: Ninja
+- **C++ Compiler**: GCC / Clang
+- **Build Type**: Release
+- **Ghidra CSV Path**: N/A
+- **single_file_output**: false
+
+## PCSX2 MCP Status
+- **Status**: Not Connected
+- **Game Loaded**: N/A
+- **Match**: N/A
+
+## Active Runner Command
+<!-- ACTIVE RUNNER COMMAND: -->
+`./PS2Recomp/build/ps2xRuntime/ps2EntryRunner SCUS_973.99` (cwd: game workspace)
+
+## Unique Crashes & Subsystem Map
+| Crash Address/PC | Subsystem | Callstack/Context | Proposed Fix Type | Regression Status | Resolution |
+| ---------------- | --------- | ----------------- | ----------------- | ----------------- | ---------- |
+| Compiler Host | Build System / Host Vector | `_mm_extract_epi32` in `ps2_runtime.h` | Add `-msse4.1` compiler flag to CMake | Untested | Pending user approval for CMakeLists surgery |
+| 0x171038 (in 0x171008) | EE / Game list traversal | Main spins in `sub_00171008` list loop (called from 0x2294E8), thread2 Ready | Bounded hook (256 nodes + range check) | Verified 2026-10-03 | FIXED by `gow_sub_171008_hook` (enabled) |
+| 0x15F208 (in 0x15F1E8) | EE / Game sorted-list insert | Main spins in `sub_0015F1E8` traverse (`v1 != a2` forever) | Bounded hook (256 nodes + range check) | Verified 2026-10-03 | FIXED by `gow_sub_15f1e8_hook` (enabled) |
+| WaitSema(4) busy-loop | EE scheduler / Semaphores | Thread2 `0x27CBD0` looped `WaitSema(4)` returning `KE_UNKNOWN_SEMID (-408)`; semas 3/4/5 created in `0x27C100` but init failed because `0x282148` stub returned 0 → cleanup at `0x27C248` deleted semas | Return 1 (success) from `0x282148` override | Verified 2026-10-03 | FIXED (thread2 now correctly blocks: status=Waiting waitId=4) |
+| 0x17AA40 (in 0x17AA18) / 0x170BB0 (in 0x170B98) | EE / Game init wait + VFS/IOP data | Main waits on flag `[0x29C4D8]` set via IOP/SIF (never arrives); VFS indirect call `0x232548 → 0x0` skipped by `SkipCallDebug`; dummy vtable neuters `0x17A830` handlers | Needs true VFS/IOP resource path (PART1.PAK via host FS); do NOT bypass `0x17AA18`/`0x170B98` (bypass → top-level ExitThread/dormant at 0xF82/0x293848) | Open | Next work: host-FS backed `sceOpen/sceRead` for TOC/PAK + SIF module responses |
+
+## Resolved Stubs
+| Stub Name | Address | Type | Implemented In | Date |
+|-----------|---------|------|----------------|------|
+
+## Session Journal
+- 2026-10-02: Project initialized. Cloned PS2Recomp. Extracted SCUS_973.99 and SYSTEM.CNF from God of War (USA).iso. Initiated CMake build.
+- 2026-10-03: Boot investigation: SCEA screen rendered, but main thread hit ExitThread (status=5) with missing indirect calls in VFS/resource pool code. Working tree log says thread2 is loop-waiting on `WaitSema(semid=4)`. Applied partial mitigations: StartThread syscall fix is in place; resource pool hook pinned; missing function policy set to `SkipCallDebug` at game-override scope; several generated indirect call sites patched/symlinked to fallthrough. MissingFunctionException now goes `SkipCallDebug`. Need a true VFS/IOP path for resource loading.
+- 2026-10-03 (session 2): Reproduced with fresh 20s runs (`ps2EntryRunner SCUS_973.99`). Fixed three blockers in `ps2xRuntime/src/lib/game_overrides.cpp` (only `src/lib`, no runner/header edits, incremental `cmake --build`): (1) enabled bounded `0x171008` + `0x15F1E8` list hooks; (2) `0x282148` stub now returns 1 (was 0 → init-failure cleanup deleted semas 3/4/5, causing `WaitSema(4) = KE_UNKNOWN_SEMID -408` busy-loop; now thread2 correctly blocks Waiting waitId=4). Rejected bypasses: `0x17AA18`/`0x170B98` hooks (even without global write) push boot to top-level dormant exit at `0xF82`/`0x293848` — the spins are waits for IOP/VFS data, not dead code. Stable baseline: main Running in `0x170B98` loop (`pc=0x170BB0 ra=0x229BE0`), worker Waiting sema4, SCEA/GS frames uploading. Unused diag hooks (`gow_waitsema_diag_hook`, `gow_createsema_diag_hook`) left in place for next session, currently unregistered. Next: host-FS `sceOpen/sceRead` for `GODOFWAR.TOC`/`PART1.PAK` + SIF `0x80000593`/`0x123456`/`0x80001300` payloads so `[0x29C4D8]` gets set and `0x17AA40`/`0x170BB0` loops exit legitimately.
+- 2026-10-03 (session 3): Wired CD image discovery in `applyGodOfWarOverrides` (`PS2_CD_IMAGE` env or `God of War (USA).iso` next to ELF/parent; sets `IoPaths.cdImage` so `sceCdRead` LBN path has a source). Verified log `GoW CD using image`. No behavior change yet: boot does zero `sceCdRead` LBN traffic in this phase (no unresolved-LBN logs either) — stall is not CD-LBN but SIF/IOP: only one `sceSifSetDma` in whole boot, `_sceSifLoadModule` short-circuits via dummy `sid 0x80000593 → moduleId 1`, `0x299120/0x2990D0` reboot/sync stubs skip real IRX boot, so the resource worker's sema4 is never signaled and `0x170B98`/`0x17AA40` lists stay empty. Next: route SIF LoadModule through real `ps2xIOP` IRX execution (`SMPD_IOP.IRX` et al. already in workspace) instead of dummy success, then real RPC payloads for audio/CD streaming.
+- 2026-10-03 (session 4): Proved zero IRX loads happen in boot (added `stderr` to `SifLoadModule`/`SifLoadModuleBuffer` success paths — `RUNTIME_LOG` is compiled out in Release so silence was ambiguous; confirmed zero calls). ELF strings show game knows `smpd_iop.irx` etc. via `cdrom0:%s;1`, yet no loadcore `0x80000593` RPC and no load syscalls fire — IOP runs with no game modules; `0x123456` (SMPD file-streamer: `smpd file streamer` in IRX strings) and `0x80001300` (DBCMAN) are served by dummies. Mapped live SMPD protocol: func `0x0` init, `0x68` session (`DPMS` magic), `0x4D` queued reads from double buffers `0x305940/0x306940` (EE builder `0x26C4B8`, ra `0x26C59C`), `0x0A` completion poll with incrementing index (EE waiter `0x26BF28`, ra `0x26C0AC`, spins on `0x26BB98`). Send words look like direct PAK offsets (`0x00040064`, `0x0008000E`, …). First emulation step applied: func `0x0A` now reports complete (`1`) instead of `0` — no advance yet (main still `0x170BB0`, worker Waiting sema4), data buffers are still empty. Next: implement func `0x4D` host-side reads (`PART1.PAK` @ parsed offset → guest stream buffers) using the EE record layout at `0x26C540–0x26C59C` + `GODOFWAR.TOC` WAD index, then completions unblock `0x170B98`. Temp diag kept (all throttled/finite): `handleIopRpc` hex preview + `gow_sifcallrpc_diag_hook` on `0x297470`.
+- 2026-10-03 (session 5): Decoded `GODOFWAR.TOC` fully: 1669 × `{name[16], offset u32LE, size u32LE}` (24B, 12B zero tail); offsets/sizes validated against `PART1.PAK` (PSS/VPK/WAD payloads present; `R_PERM.WAD` size 0 = resident pseudo-entry). `0x4D` words do NOT match TOC offsets/sizes — descriptors are resolved inside SMPD (unavailable), so LBN-style serving is out. Key redirect: ELF contains `LoadWad('%s')`, `R_Shell`, `R_Hero%d` — game loads WADs **by name** through EE `0x1BE550` resource-table path (currently returning `GOW_DUMMY_OBJ` via `gow_sub_1be550_hook`; VFS hooks `gow_vfs_lookup_resource_hook` et al. exist but disabled). `PART1.PAK` starts with zlib-wrapped `WAD_R_Perm` directory. Menu needs `R_SHELL.WAD` (TOC: off 3599632, size 764565). Next: implement the VFS resource path for real — parse TOC, extract WAD from PAK to EE RAM in `gow_vfs_lookup_resource_hook`/`0x1BE550`, return real headers instead of dummies; leave `0x4D` streaming dummy (menu doesn't need streams). That unblocks `0x170B98` legitimately.
+- 2026-10-04 (session 6): Step 1/5 done — TOC index now lives in runtime (`s_toc_entries`/`s_toc_by_name` in `game_overrides.cpp`): `loadGodOfWarTocFile` parses 24B entries host-side at first `0x1BE550` hit, logs `1667 indexed entries` + `R_SHELL.WAD off=3599632 size=764565` (verified in test run). Hardcoded TOC path replaced by `findGodOfWarFile` (`PS2_GOW_DIR` env → elfDir → cdImage dir → known copies). Behavior unchanged (stable wait baseline). Step 2/5 done same session: `R_SHELL.WAD` (764565 bytes) staged from `PART1.PAK` into EE RAM at `0x01E10000` (`kGoWShellWadRamAddr`), verified `staged R_SHELL.WAD (764565 bytes)` in test run; baseline unchanged. Next step 3/5: wire `0x1BE550` resource table to real staged data instead of `GOW_DUMMY_OBJ`.
+- 2026-10-04 (session 7): Step 3/5 scoped, not closed. Findings: `0x1BE550` dispatches via `[0x32E848+idx*4]` vtable records fed by pool `0x185F28` ← caller `0x1BACC8`; tables are empty because WAD bytes never arrive through game path (SMPD `0x4D` streaming, whose numeric descriptors don't match TOC offsets). ELF loads WADs by name (`LoadWad('%s')`, `R_Shell`), so name path is the attack surface. `PART1.PAK` head parsed: WAD container `{u32 nfiles=888?, u32=8, name[16]=WAD_R_Perm, ...}` with `GroupStart` nesting (`WAD_R_Perm`/`GFXX_R_Perm`). `0x4D` word1 low16 values (100/14/78/11…) fit WAD-internal file indices. Remaining for step 3: finish WAD directory RE (variable records; second record at 0x38) → index→range map → serve `0x4D` reads from PAK → drop dummies in `0x1BE550`/`TreeLookup`. Build green, baseline stable (main `0x170BB0`, worker sema4).
+- 2026-10-04 (session 8): WAD directory mapping 80% done. Record types: FILE = 48B (`name[16]` + 8×u32 `{0,0,0x80000000|id,0,p1,p2,0,0}`, p1/p2 look like dims: GFXX 1024², TXRX 800², MATX/SNDX…), group markers = 32B, WAD header record larger. `0x4D` hypothesis refined: word1 = byte offset into WAD data region (262500/524302/786510 ≈ 256KB-spaced early files, matching indices 1/2/3/7/8/14), session `0x68` carries EE stream buffer addrs (`0x4533C0/0x453440`-class). Outstanding: exact record-length rule for full 888-entry walk (heuristic walk desyncs after ~47 records) → directory end (= data base) + per-packet size rule. Then implement `0x4D` host serve + drop dummies. No behavior change this session (diag + analysis only); build green.
+- 2026-10-04 (session 9): SMPD serve implemented (`ps2_runtime.cpp` `0x123456` branch): ISO9660 walk finds `PART1.PAK` extent (LBN 1547), func `0x68` registers dataBuf (fixed off-by-one: buf is word@24 = `0x453440`, cap word@28 ×2048 + RAM-range guards), func `0x4D` `[cmd=1][(count<<16)|pakLbn][slot]` reads real sectors into the session buffer, `0x0A` acks `idx+1`. Verified SERVED ×10 in test run. Result: main advanced `0x170BB0` → `0x177470` (in `0x176FC8`, tree core, ra `0x176CD4`) and worker left Waiting→Ready (sema4 signaled). New stall: single back-edge loop `→0x177470` (`beq s5,v0 → 0x177B54` never taken) — key-search/insert walk where s5 = target key (arg a2, e.g. `0xFFE4AA7C`), pointees are CODE addrs (vtable/handlers, present), so mechanics fine but the key never matches (cycle/miss chain in nodes). No `0x10` alloc flood (no unbounded growth). Next: instrument the compare operands at `0x177470` (s5 vs per-node key) to find which node's key word is wrong (likely zeroed/uninitialized node from dummy-era inserts), then either repair that node class or bound the walk with miss-exit to the `0x1774F4`-style grow path.
+- 2026-10-04 (session 10): Tree-walk root-caused to a DATA problem, not tree logic. Findings: (1) `0x4D` word1 = `(count<<16)|pakLbn` validated against ISO (PAK base LBN 1547; PAK+11/14/78/100 hold plausible resource bytes); session `0x68` = `DPMS,bufA,lenA,bufB,lenB` with bufB=`0x453440` but only `0x1C010` bytes actually allocated → 40-sector stride overflowed into heap (free-list head → `'SNDX'`). Fixed dest to per-slot append within 40-sector windows; tried honest `0x0A` acking (deadlock) → back to blanket ack with append placement. (2) Proactive PAK-head staging into slot 0 REMOVED — it clobbered heap block `0x4536C4` (free list → `'SNDX'`); heap healthy again after removal. (3) Session struct fully dumped (0x50B: magic, 12 palette-ish words, heap ptrs — no dest pointers; dest lives in per-request layout). Current honest park: main in `0x13DA10` (ra `0x17F760`) on record s0=`0x4DF4D0` (`heap=0x1200034`, garbage unit/count) — allocated but never filled; heap itself healthy. Next: trace who fills `0x4DF4D0`-class records (0x17F448 list source — stream copy vs SIF-buf vs later 0x4D), then deliver exactly that chunk.
+- 2026-10-04 (session 11): Park fully root-caused via mid-function hook at `0x13DCD8` (checkpoint-resume fires per lap): allocator scans with t0=`0x0`, s2=`0x1200034` (bogus heap from unfilled s0) — infinite low-RAM walk. Fix applied: fail-fast in `gow_memalloc_hook` on bogus heaps (EE-RAM range + `0xC0DE1111` magic; heap 0 keeps legacy behavior) → clean NULL instead of infinite scan. Result: game now retries cleanly and parks back at the honest `0x170BB0` list-wait (no crash, no corruption). Re-proved: `0x170B98` bounded hook still pushes boot to dormant exit (`pc=0x0`) — reverted; that spin must wait for real data. Exact remaining gap: s0=`0x4DF4D0` (allocated by `0x17E9B8`-path via `0x13D954`, caller `0x17EA90`) never filled; its filler needs the stream chunk backing `[s0+4]=heap`/`unit`/`count` fields (currently `0x1200034`/`0x1FE0210E`/`0xD041` garbage). Consumer ra=`0x17F760` (`0x17F448` walker, record via `[[0x29C7A8]-0x3850]`). Next: identify s0's backing chunk (trace `0x17E9B8` s3/stream inputs) and extend issuer coverage to it.
+- 2026-10-04 (session 12): Dest mapping refined to slotBase + word3*2048 (16B/20B packets carry sub-offset; 12B default +0) — main advanced to `0x17FDE0` poll loop (`0x17FD10`, indirect status call per lap). All SMPD RPCs verified thread-1 (main is both issuer and consumer; thread 2 never issues). `0x17FDE0` park decoded: s3=`0x0` (list exhausted) with termination flag broken — same single-unfilled-record root cause, now at s0=`0x5044A0` (ra `0x17FC90`/`0x17DB74`, free-heap garbage). Issuer request tables live in the `0x26BX` family (`0x26B918` init, `0x26C478`/`0x26C4B8` issue, `0x26BF28` wait). Mid-function hooks proven as a no-header-change observation technique (used at `0x13DCD8`, `0x17FDE0`). Heap verified healthy (no more `'SNDX'` free-list corruption). Next: read `0x26B918` table-fill to learn the full request list (or proactively serve the gap LBNs into never-requested slots), so the issuer's directory completes and s0-class records get filled.
+- 2026-10-04 (session 13): Word1 split corrected to `(lbn=hi,count=lo)` — LBN 4/8/12 + counts describe ONE coherent ~200KB directory region (verified `SND_SHARDCOLLECT` at PAK+8KB; old split served scattered fragments). Dest reverted to ring-append (slot scatter + sub-offsets both misplace; ring keeps the region contiguous). Result: tree path behaves identically for the first 20 keys (expected — early bytes overlap), park returns to the clean `0x177470` tree-miss on key #20 (`0xAA4682D2`, 20 calls, all return except the last). Keys are hashes (absent from PAK as raw u32 — verified). Issuer fired only its 10-request plan and stopped; waiter satisfied; consumer needs record #21 whose chunk was never requested (single-threaded issuer↔consumer stall: main must queue but is parked). Next: dump the issuer's live request plan (`0x2A1360` tables) to see whether #21's chunk is planned-but-unfired (then force-fire it) or unplanned (then complete its directory source).
+- 2026-10-04 (session 14): Issuer tables dumped live (`0x26C4B8` hook): `0x2A1358/60/70` hold send/recv buffer addrs + evolving counters (`0xFF4/0xFFC→…`), full plan visible. All RPCs proven thread-1. Tree-miss root cause narrowed to null/self links + a REVERTED bad idea (unvalidated BFS repair rewrote ~20K heap words — caught by repair-count log, reverted to no-op stub, baseline healthy again). Park run-to-run variance (177470 vs 13DA10 vs 17FDE0) = scheduler timing races, same data family. Standing honest stall: key #21 (`0xAA4682D2`) record chunk never requested; issuer plan ends at 10 reads. Next: complete the issuer's directory (gap LBNs) or force-fire #21's chunk once its PAK range is identified from the live request tables.

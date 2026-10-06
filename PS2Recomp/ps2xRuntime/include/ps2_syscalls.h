@@ -1,0 +1,35 @@
+#ifndef PS2_SYSCALLS_H
+#define PS2_SYSCALLS_H
+
+#include "ps2_runtime.h"
+#include "ps2_call_list.h"
+#include <mutex>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <string>
+
+std::string translatePs2Path(const char *ps2Path);
+
+namespace ps2_syscalls
+{
+#define PS2_DECLARE_SYSCALL(name) void name(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    PS2_SYSCALL_LIST(PS2_DECLARE_SYSCALL)
+#undef PS2_DECLARE_SYSCALL
+
+    void iDeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void EnableIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void DisableIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void EnableDmacHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void DisableDmacHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+
+    bool dispatchNumericSyscall(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
+    void initializeGuestKernelState(uint8_t *rdram, PS2Runtime *runtime);
+    void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId);
+    uint64_t GetCurrentVSyncTick(PS2Runtime *runtime);
+    void WaitVSyncTick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, int fixedResult = -1);
+}
+
+#endif // PS2_SYSCALLS_H
+

@@ -1,0 +1,31 @@
+/bin/
+/intermediate/
+.vs/
+out
+.vscode
+build
+
+*.exe
+*.ilk
+*.exp
+*.log
+*.tlog
+*.ipch
+
+# Now we can place the dump code here and test while expand the Runtime
+ps2xRuntime/include/ps2_recompiled_functions.h
+ps2xRuntime/include/ps2_recompiled_stubs.h
+ps2xRuntime/src/runner/ps2_recompiled_functions.cpp
+ps2xRuntime/src/runner/register_functions.cpp
+ps2xRuntime/output
+ps2xRuntime/src/runner
+android/app/.cxx/
+android/local.properties
+android/.gradle/ 
+.idea/
+# Geçici dosyalar
+ps2_log.txt
+*.bak*
+imgui.ini
+fix_and_build.sh
+test_hook.patch
