@@ -1,59 +1,83 @@
-# Tobiichi Port — God of War PS2 PC Port Projesi
+# Tobiichi Port — God of War PS2 PC Port
 
-Bu repo, **God of War (SCUS-97399)** oyununun PS2'den PC'ye statik yeniden derleme (static recompilation) yöntemiyle taşınması sürecini içermektedir.
+A work-in-progress PC port of **God of War (SCUS-97399)** using static recompilation (MIPS R5900 → C++20) via the [PS2Recomp](https://github.com/ran-j/PS2Recomp) framework.
 
-## Proje Yapısı
+> Inspired by [N64Recomp](https://github.com/Mr-Wiseguy/N64Recomp) and [OpenGOAL](https://github.com/open-goal/jak-project).
+
+---
+
+## Project Structure
 
 ```
-Origami Tobiichi/
-├── PS2Recomp/              # PS2Recomp framework (ran-j/PS2Recomp fork)
+Tobiichi-Port/
+├── PS2Recomp/                  # PS2Recomp framework (forked from ran-j/PS2Recomp)
 │   └── ps2xRuntime/
 │       └── src/lib/
-│           └── game_overrides.cpp  ← GoW'a özgü tüm hook'lar buradadır
-├── god_of_war.toml         # Recompiler konfigürasyonu
-├── GODOFWAR.TOC            # Oyun içerik tablosu
-├── *.IRX                   # IOP modül dosyaları (PlayStation 2 I/O işlemcisi)
-└── SYSTEM.CNF              # PlayStation 2 sistem yapılandırması
+│           └── game_overrides.cpp  ← All God of War-specific hooks live here
+├── god_of_war.toml             # Recompiler configuration
+├── GODOFWAR.TOC                # Game table of contents
+├── *.IRX                       # IOP module binaries (PS2 I/O Processor)
+└── SYSTEM.CNF                  # PS2 system configuration
 ```
 
-## Nasıl Çalışır?
+---
 
-1. God of War ELF dosyası (`SCUS_973.99`) statik olarak MIPS → C++ olarak derlenir
-2. `ps2xRuntime`, PS2 kernel/IOP/GS donanımını HLE (High-Level Emulation) ile taklit eder
-3. `game_overrides.cpp` içindeki hook'lar oyuna özgü donanım senkronizasyonlarını bypass eder
+## How It Works
 
-## Kurulum
+1. The God of War ELF (`SCUS_973.99`) is statically recompiled: **MIPS → C++**
+2. `ps2xRuntime` provides a High-Level Emulation (HLE) layer replacing the PS2 kernel, IOP, SIF, and GS subsystems
+3. `game_overrides.cpp` contains targeted hooks that bypass PS2-specific hardware synchronization loops
+4. The output runs natively on x86-64 Linux/Windows via Raylib/OpenGL
 
-### Gereksinimler
+---
+
+## Build Instructions
+
+### Requirements
 - CMake 3.20+
-- GCC/Clang (C++20)
+- GCC 12+ or Clang 15+ (C++20)
 - Raylib
 
-### Derleme
+### Steps
 ```bash
-cd PS2Recomp
+git clone https://github.com/YYOzcan/Tobiichi-Port.git
+cd Tobiichi-Port/PS2Recomp
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-### Çalıştırma
+### Running
 ```bash
-./build/ps2xRuntime/ps2EntryRunner <SCUS_973.99 yolu> --window
+./build/ps2xRuntime/ps2EntryRunner /path/to/SCUS_973.99 --window
 ```
 
-> **Not:** `SCUS_973.99` ve `PART1.PAK` telif hakkına tabi oyun dosyaları olup bu repoya dahil edilmemiştir.
+> **Note:** `SCUS_973.99` and `PART1.PAK` are copyrighted game files and are **not** included in this repository. You must own a legal copy of the game.
 
-## Durum
+---
 
-- [x] ELF analizi ve recompile
-- [x] Temel kernel (thread, semaphore)
-- [x] GS (Graphics Synthesizer) frame output
-- [x] IOP senkronizasyon stub'ları
-- [x] SCEA logo ekranı görüntüleniyor
-- [ ] Ana oyun thread'i aktif hale getirilmesi
-- [ ] Main menu (Title Screen)
-- [ ] Oynanabilir seviye
+## Current Status
 
-## Katkıda Bulunma
+| Milestone | Status |
+|-----------|--------|
+| ELF analysis & recompilation | ✅ Done |
+| Basic PS2 kernel (threads, semaphores) | ✅ Done |
+| GS (Graphics Synthesizer) frame output | ✅ Done |
+| IOP synchronization stubs | ✅ Done |
+| SCEA logo screen renders | ✅ Done |
+| Main game thread activation | 🔄 In Progress |
+| Title screen / Main menu | ⏳ Pending |
+| Playable level | ⏳ Pending |
 
-Bu proje aktif geliştirme aşamasındadır. Katkıda bulunmak için fork'layıp PR açabilirsiniz.
+---
+
+## Contributing
+
+This project is under active development. Feel free to fork, open issues, or submit pull requests.
+
+**Team / Collaborators:** [@YYOzcan](https://github.com/YYOzcan)
+
+---
+
+## License
+
+This project contains no copyrighted game assets. The tooling and runtime code is provided under the same license as [PS2Recomp](https://github.com/ran-j/PS2Recomp).
