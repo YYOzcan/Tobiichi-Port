@@ -38,7 +38,9 @@ enum GSGifFormat : uint8_t
     GIF_FMT_PACKED = 0,
     GIF_FMT_REGLIST = 1,
     GIF_FMT_IMAGE = 2,
-    GIF_FMT_DISABLED = 3,
+    // GOW-Port: compatibilidad IMAGE2, como GSState::Transfer de PCSX2 (32ac6e2).
+    GIF_FMT_IMAGE2 = 3,
+    GIF_FMT_DISABLED = GIF_FMT_IMAGE2, // conservar el nombre publico anterior
 };
 
 enum GSRegId : uint8_t

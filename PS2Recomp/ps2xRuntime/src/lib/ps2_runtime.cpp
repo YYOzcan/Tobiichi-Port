@@ -1,5 +1,6 @@
 #include "ps2_runtime.h"
 #include "ps2_log.h"
+#include "runtime/ps2_perf.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "game_overrides.h"
@@ -17,8 +18,6 @@
 #include <iostream>
 #include <stdexcept>
 #include <fstream>
-#include <cstdio>
-#include <sys/types.h>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -28,6 +27,55 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include <cstdlib>
+
+#if !defined(PLATFORM_VITA)
+namespace
+{
+    // GOW-Port: salida del SPU2 emulado por el IOP. raylib pide las muestras desde su hilo de audio; el IOP las
+    // produce en el hilo del EE (IopSubsystem::drainAudio usa un mutex). GOW_AUDIO=0 desactiva la salida.
+    std::atomic<ps2x::iop::IopSubsystem *> g_spu2AudioSource{nullptr};
+    AudioStream g_spu2Stream{};
+    bool g_spu2StreamActive = false;
+    constexpr size_t kSpu2MaxLatencyFrames = 4800u; // 100 ms a 48 kHz
+
+    void spu2AudioCallback(void *buffer, unsigned int frames)
+    {
+        int16_t *out = static_cast<int16_t *>(buffer);
+        size_t produced = 0u;
+        if (ps2x::iop::IopSubsystem *source = g_spu2AudioSource.load(std::memory_order_acquire))
+            produced = source->drainAudio(out, frames, kSpu2MaxLatencyFrames);
+        std::fill(out + produced * 2u, out + static_cast<size_t>(frames) * 2u, int16_t{0}); // sin datos: silencio
+    }
+
+    void startSpu2Audio(ps2x::iop::IopSubsystem *source)
+    {
+        const char *setting = std::getenv("GOW_AUDIO");
+        if (g_spu2StreamActive || source == nullptr || !IsAudioDeviceReady() || (setting && setting[0] == '0'))
+            return;
+        SetAudioStreamBufferSizeDefault(1024);
+        g_spu2Stream = LoadAudioStream(48000u, 16u, 2u);
+        SetAudioStreamBufferSizeDefault(0); // el resto de flujos conserva el tamano por defecto
+        if (!IsAudioStreamValid(g_spu2Stream))
+            return;
+        g_spu2AudioSource.store(source, std::memory_order_release);
+        SetAudioStreamCallback(g_spu2Stream, spu2AudioCallback);
+        PlayAudioStream(g_spu2Stream);
+        g_spu2StreamActive = true;
+        std::cerr << "[SPU2] salida de audio a 48 kHz activa (GOW_AUDIO=0 la desactiva)" << std::endl;
+    }
+
+    void stopSpu2Audio()
+    {
+        if (!g_spu2StreamActive)
+            return;
+        StopAudioStream(g_spu2Stream);
+        UnloadAudioStream(g_spu2Stream); // raylib espera a que termine el callback en curso
+        g_spu2AudioSource.store(nullptr, std::memory_order_release);
+        g_spu2StreamActive = false;
+    }
+}
+#endif
 
 namespace ps2_stubs
 {
@@ -110,6 +158,9 @@ namespace
     };
 
     thread_local DispatchHistory g_dispatchHistory;
+    // GOW-Port: cuenta los saltos (no llamadas) despachados, para distinguir un retorno implicito de un salto final
+    // que vuelve a la entrada de la funcion llamada (fork de SotC, c4c20e8).
+    thread_local uint64_t g_guestJumpSerial = 0u;
 
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
@@ -452,18 +503,6 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
-    static uint32_t s_pixelCheckCounter = 0;
-    if (++s_pixelCheckCounter % 60 == 0)
-    {
-        uint32_t nonZero = 0;
-        for (size_t i = 0; i + 4 <= s_scratch.size(); i += 4)
-        {
-            if (s_scratch[i] != 0 || s_scratch[i+1] != 0 || s_scratch[i+2] != 0)
-                nonZero++;
-        }
-        std::cout << "[GS Presentation] non-zero pixels: " << nonZero << " / " << (width * height) << std::endl;
-    }
-
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
@@ -543,6 +582,9 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+#if !defined(PLATFORM_VITA)
+        stopSpu2Audio(); // GOW-Port: antes de destruir el IOP que produce las muestras
+#endif
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -603,10 +645,6 @@ ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &re
 
 bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 {
-    // CdInit RPC (0x80000592, ps2tek): completed synchronously by the
-    // raw-SIFCMD bridge for statically linked libsifcmd boot (Gradius).
-    if (sid == 0x80000592u || sid == 0x80000593u || sid == 0x123456u || sid == 0x80001300u)
-        return true;
     return m_iopSubsystem->canBindRpc(sid);
 }
 
@@ -614,303 +652,20 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
 {
     auto scope = m_iopHost->enterCall(ctx, rdram);
     request.callToken = scope.token();
-    {
-        static int s_rpcLogCount = 0;
-        if (s_rpcLogCount < 40 || request.sid == 0x123456u)
-        {
-            static int s_smpdLogCount = 0;
-            if (request.sid != 0x123456u || s_smpdLogCount < 24)
-            {
-                std::string sendPreview;
-                if (request.send.address && request.send.size > 0)
-                {
-                    const uint32_t previewLen = std::min<uint32_t>(request.send.size, 64);
-                    sendPreview.reserve(previewLen);
-                    for (uint32_t i = 0; i < previewLen; ++i)
-                    {
-                        const char c = static_cast<char>(rdram[request.send.address + i]);
-                        if (c == '\0')
-                        {
-                            sendPreview += '|';
-                            break;
-                        }
-                        sendPreview += (c >= 32 && c < 127) ? c : '.';
-                    }
-                }
-                std::ostringstream hex;
-                hex << std::hex;
-                if (request.send.address && request.send.size > 0)
-                {
-                    const uint32_t n = (request.sid == 0x123456u && request.function == 0x4Du)
-                                           ? std::min<uint32_t>(request.send.size, 64)
-                                           : std::min<uint32_t>(request.send.size, 32);
-                    hex << " sendhex=";
-                    for (uint32_t i = 0; i < n; ++i)
-                    {
-                        hex << static_cast<int>(rdram[request.send.address + i] >> 4);
-                        hex << static_cast<int>(rdram[request.send.address + i] & 0xF);
-                        if (i % 4 == 3 && i + 1 < n)
-                            hex << ' ';
-                    }
-                }
-                std::cerr << "[IOP RPC] sid=0x" << std::hex << request.sid
-                          << " func=0x" << request.function
-                          << " send=0x" << request.send.address << "+" << std::dec << request.send.size
-                          << " recv=0x" << std::hex << request.receive.address << "+" << std::dec << request.receive.size
-                          << " preview=[" << sendPreview << "]" << hex.str()
-                          << " eepc=0x" << ctx->pc << " eera=0x" << GPR_U32(ctx, 31) << std::dec << std::endl;
-                if (request.sid == 0x123456u)
-                    ++s_smpdLogCount;
-                else
-                    ++s_rpcLogCount;
-            }
-        }
-    }
-    ps2x::iop::RpcResult res = m_iopSubsystem->handleRpc(request);
-    if (res.handled) return res;
-
-    if (request.sid == 0x80000593u) // SIF LoadModule RPC
-    {
-        res.handled = true;
-        res.signalCompletion = true;
-        if (request.receive.address && request.receive.size >= 4)
-        {
-            *reinterpret_cast<int32_t *>(rdram + request.receive.address) = 1; // Success moduleId = 1
-        }
-        res.resultAddress = request.receive.address;
-        return res;
-    }
-    else if (request.sid == 0x123456u) // God of War SMPD file-streamer RPC
-    {
-        res.handled = true;
-        res.signalCompletion = true;
-        // Session established by func 0x68 ("DPMS" + bufA/lenA + bufB/lenB,
-        // lengths in 2048B sectors). Func 0x4D packets are
-        // [cmd=1][(count<<16)|pakLbn][slot][...]: read count sectors at
-        // PART1.PAK-relative LBN into the session data buffer. Func 0x0A polls
-        // completion. Served from host: ISO9660 extent of PART1.PAK + raw read.
-        static uint32_t s_smpdPakLbn = 0;
-        static bool s_smpdPakLbnProbed = false;
-        static uint32_t s_smpdDataBuf = 0;
-        static uint32_t s_smpdDataCap = 0;
-        static uint32_t s_smpdCtlBuf = 0;
-        static uint32_t s_smpdServeCount = 0;
-        static uint32_t s_smpdWritePos = 0;
-        static int s_smpdServeLog = 0;
-        auto smpdReadSectors = [&](uint32_t pakLbn, uint32_t count, uint8_t *dst, size_t dstCap) -> bool {
-            if (!s_smpdPakLbnProbed)
-            {
-                s_smpdPakLbnProbed = true;
-                const std::filesystem::path image = getIoPaths().cdImage;
-                FILE *iso = image.empty() ? nullptr : fopen(image.string().c_str(), "rb");
-                if (iso)
-                {
-                    // PVD root record -> root dir -> PART1.PAK;1 extent.
-                    uint8_t pvd[2048];
-                    if (fseek(iso, 16 * 2048, SEEK_SET) == 0 && fread(pvd, 1, 2048, iso) == 2048 && pvd[0] == 1 &&
-                        std::memcmp(pvd + 1, "CD001", 5) == 0)
-                    {
-                        const uint32_t rootLbn = static_cast<uint32_t>(pvd[156 + 2]) |
-                                                 (static_cast<uint32_t>(pvd[156 + 3]) << 8) |
-                                                 (static_cast<uint32_t>(pvd[156 + 4]) << 16) |
-                                                 (static_cast<uint32_t>(pvd[156 + 5]) << 24);
-                        uint8_t sector[2048];
-                        if (fseek(iso, static_cast<long>(rootLbn) * 2048L, SEEK_SET) == 0 &&
-                            fread(sector, 1, 2048, iso) == 2048)
-                        {
-                            size_t p = 0;
-                            while (p + 34 < 2048)
-                            {
-                                const uint8_t ln = sector[p];
-                                if (ln == 0)
-                                {
-                                    break;
-                                }
-                                const uint8_t nl = sector[p + 32];
-                                std::string nm(reinterpret_cast<char *>(sector + p + 33), nl);
-                                if (nm.compare(0, 9, "PART1.PAK") == 0)
-                                {
-                                    s_smpdPakLbn = static_cast<uint32_t>(sector[p + 2]) |
-                                                   (static_cast<uint32_t>(sector[p + 3]) << 8) |
-                                                   (static_cast<uint32_t>(sector[p + 4]) << 16) |
-                                                   (static_cast<uint32_t>(sector[p + 5]) << 24);
-                                    break;
-                                }
-                                p += ln;
-                            }
-                        }
-                    }
-                    fclose(iso);
-                }
-            }
-            if (s_smpdPakLbn == 0)
-            {
-                return false;
-            }
-            const std::filesystem::path image2 = getIoPaths().cdImage;
-            if (image2.empty())
-            {
-                return false;
-            }
-            FILE *iso2 = fopen(image2.string().c_str(), "rb");
-            if (!iso2)
-            {
-                return false;
-            }
-            const uint64_t byteOff = (static_cast<uint64_t>(s_smpdPakLbn) + pakLbn) * 2048u;
-            const uint64_t want = static_cast<uint64_t>(count) * 2048u;
-            bool ok = false;
-            if (want <= dstCap && want <= static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
-            {
-                const size_t wantSize = static_cast<size_t>(want);
-                if (fseeko(iso2, static_cast<off_t>(byteOff), SEEK_SET) == 0 &&
-                    fread(dst, 1, wantSize, iso2) == wantSize)
-                {
-                    ok = true;
-                }
-            }
-            fclose(iso2);
-            return ok;
-        };
-        if (request.function == 0x68u && request.send.size >= 32 && request.send.address != 0)
-        {
-            const uint8_t *s = rdram + request.send.address;
-            auto rd32 = [&](uint32_t o) -> uint32_t {
-                return static_cast<uint32_t>(s[o]) | (static_cast<uint32_t>(s[o + 1]) << 8) |
-                       (static_cast<uint32_t>(s[o + 2]) << 16) | (static_cast<uint32_t>(s[o + 3]) << 24);
-            };
-            if (s[0] == 'D' && s[1] == 'P' && s[2] == 'M' && s[3] == 'S')
-            {
-                // Layout: ["DPMS"][ver][size][0][bufA][lenA][bufB][lenB].
-                s_smpdCtlBuf = rd32(16);
-                s_smpdDataBuf = rd32(24);
-                s_smpdDataCap = rd32(28) * 2048u;
-                s_smpdWritePos = 0;
-                if (s_smpdServeLog < 4)
-                {
-                    std::cerr << "[GoW SMPD] session dataBuf=0x" << std::hex << s_smpdDataBuf << " cap=" << std::dec
-                              << s_smpdDataCap << std::endl;
-                    ++s_smpdServeLog;
-                }
-            }
-        }
-        else if (request.function == 0x4Du && request.send.size >= 12 && request.send.address != 0)
-        {
-            const uint8_t *s = rdram + request.send.address;
-            auto rd32 = [&](uint32_t o) -> uint32_t {
-                return static_cast<uint32_t>(s[o]) | (static_cast<uint32_t>(s[o + 1]) << 8) |
-                       (static_cast<uint32_t>(s[o + 2]) << 16) | (static_cast<uint32_t>(s[o + 3]) << 24);
-            };
-            const uint32_t count = rd32(4) & 0xFFFFu;
-            const uint32_t pakLbn = rd32(4) >> 16;
-            const uint32_t slot = rd32(8);
-            bool served = false;
-            // bufB is a ring: requests append contiguously (slot = stream id
-            // for completion tracking, not a dest selector). Word1 splits as
-            // (lbn=hi, count=lo): LBN 4/8/12 + counts give one coherent
-            // ~200KB directory region; the old (count=hi,lbn=lo) split served
-            // scattered fragments that parsed into garbage records.
-            static uint32_t s_ringPos = 0;
-            if (s_smpdDataBuf >= 0x100000 && s_smpdDataBuf < 0x2000000 && count > 0 && count <= 1024)
-            {
-                const uint64_t want = static_cast<uint64_t>(count) * 2048u;
-                if (s_ringPos + want > s_smpdDataCap)
-                {
-                    s_ringPos = 0;
-                }
-                const uint64_t destOff = s_ringPos;
-                if (destOff + want <= s_smpdDataCap &&
-                    static_cast<uint64_t>(s_smpdDataBuf) + destOff + want <= 0x2000000u)
-                {
-                    uint8_t *dst = rdram + s_smpdDataBuf + destOff;
-                    served = smpdReadSectors(pakLbn, count, dst, static_cast<size_t>(s_smpdDataCap - destOff));
-                    if (served)
-                    {
-                        s_ringPos += static_cast<uint32_t>(want);
-                    }
-                }
-            }
-            if (s_smpdServeLog < 40)
-            {
-                std::cerr << "[GoW SMPD] read slot=" << slot << " pakLbn=" << pakLbn << " count=" << count
-                          << (served ? " SERVED" : " FALLBACK-ZERO");
-                if (s_smpdDataBuf >= 0x100000 && s_smpdDataBuf < 0x2000000 && s_smpdCtlBuf != 0)
-                {
-                    // Dump the whole 0x50-byte session struct to find per-slot
-                    // dest pointers / cursors.
-                    const uint32_t ctlPhys = s_smpdCtlBuf & 0x1FFFFFFFu;
-                    std::cerr << " ctl20=[";
-                    for (int ci = 0; ci < 20; ++ci)
-                    {
-                        if (ci)
-                        {
-                            std::cerr << ",";
-                        }
-                        std::cerr << std::hex << *reinterpret_cast<const uint32_t *>(rdram + ctlPhys + ci * 4) << std::dec;
-                    }
-                    std::cerr << "]";
-                }
-                std::cerr << std::endl;
-                ++s_smpdServeLog;
-            }
-            if (!served && s_smpdDataBuf != 0 && count > 0)
-            {
-                // Keep old behavior (zeros already in place from boot) instead of
-                // short memcpy; completion still reported below.
-            }
-            if (served)
-            {
-                ++s_smpdServeCount;
-            }
-        }
-        if (request.receive.address && request.receive.size >= 4)
-        {
-            int32_t result = 0;
-            if (request.function == 0x0Au)
-            {
-                // Acknowledge the polled index. Flow-control against slot
-                // reuse lives in the producer (bufA cursors, owned by EE);
-                // gating acks on serve order deadlocked the boot (issuer
-                // waits for consumer, consumer waits for issuer).
-                // Corruption is prevented by in-slot append placement on the
-                // serve path instead.
-                uint32_t idx = 0;
-                if (request.send.address != 0 && request.send.size >= 4)
-                {
-                    const uint8_t *s = rdram + request.send.address;
-                    idx = static_cast<uint32_t>(s[0]) | (static_cast<uint32_t>(s[1]) << 8) |
-                          (static_cast<uint32_t>(s[2]) << 16) | (static_cast<uint32_t>(s[3]) << 24);
-                }
-                result = static_cast<int32_t>(idx + 1);
-            }
-            *reinterpret_cast<int32_t *>(rdram + request.receive.address) = result;
-        }
-        res.resultAddress = request.receive.address;
-        return res;
-    }
-    else if (request.sid == 0x80001300u) // DBCMAN RPC
-    {
-        res.handled = true;
-        res.signalCompletion = true;
-        if (request.receive.address && request.receive.size >= 4)
-        {
-            *reinterpret_cast<int32_t *>(rdram + request.receive.address) = 0; // Success
-        }
-        res.resultAddress = request.receive.address;
-        return res;
-    }
-
-    return res;
+    ps2_perf::Scope perf(ps2_perf::Bucket::Iop);
+    return m_iopSubsystem->handleRpc(request);
 }
 
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
     auto scope = m_iopHost->enterCall(nullptr, rdram);
+    ps2_perf::Scope perf(ps2_perf::Bucket::Iop);
     m_iopSubsystem->onSifTransfer(transfer);
 }
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
+    ps2_perf::Scope perf(ps2_perf::Bucket::Iop);
     m_iopSubsystem->runEeCycles(eeCycles);
 }
 
@@ -969,8 +724,10 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+    // GOW-Port: cada flujo conserva su cursor GIF, incluso cuando otro PATH lo interrumpe.
+    m_gifArbiter.reset();
+    m_gifArbiter.setProcessPathPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
+                                    { m_gs.processGIFPacket(data, size, path); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
@@ -1037,8 +794,9 @@ bool PS2Runtime::initialize(const char *title)
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
-        // InitAudioDevice(); -- Audio disabled as requested
-        m_audioBackend.setAudioReady(false);
+        InitAudioDevice();
+        m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        startSpu2Audio(m_iopSubsystem.get()); // GOW-Port
 #endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
@@ -1646,6 +1404,19 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+// GOW-Port branch trace ring
+struct GowBranchRec { uint32_t src, dst, ra, kind; };
+GowBranchRec g_gowRing[256]; std::atomic<uint32_t> g_gowRingPos{0};
+void gowDumpBranchRing(const char *why)
+{
+    uint32_t pos = g_gowRingPos.load();
+    std::fprintf(stderr, "[gow-trace] %s, last branches (oldest first):\n", why);
+    for (uint32_t i = 0; i < 256; ++i) {
+        const GowBranchRec &r = g_gowRing[(pos + i) & 255u];
+        if (r.src == 0 && r.dst == 0) continue;
+        std::fprintf(stderr, "  src=%08x dst=%08x ra=%08x kind=%u\n", r.src, r.dst, r.ra, r.kind);
+    }
+}
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1654,19 +1425,22 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    { uint32_t k = g_gowRingPos.fetch_add(1) & 255u; g_gowRing[k] = {sourcePc, targetPc, ctx ? (uint32_t)_mm_cvtsi128_si32(ctx->r[31]) : 0u, (uint32_t)kind}; }
+
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    if (m_eeScheduler && eeCheckpointDue(EeScheduler::kGuestDispatchCycles))
     {
         return false;
     }
 
     if (!isCall)
     {
+        ++g_guestJumpSerial;
         if (!hasFunction(targetPc))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
@@ -1700,6 +1474,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t checkpointSerial = m_eeCheckpointSerial;
+    const uint64_t jumpSerial = g_guestJumpSerial;
+    ps2_perf::guestEntry(targetPc); // GOW-Port: también cuenta llamadas que no vuelven al dispatcher.
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -1707,7 +1484,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (ctx->pc == entryPc)
+    if (ctx->pc == entryPc && m_eeCheckpointSerial == checkpointSerial && jumpSerial == g_guestJumpSerial)
     {
         ctx->pc = fallthroughPc;
     }
@@ -1942,6 +1719,13 @@ uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
 
 void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
 {
+    // GOW-Port: con setPrivateGuestHeap el heap interno del runtime vive en un rango fijo (God of War:
+    // 0x000A0000-0x000FF000, memoria libre bajo el ELF) para no pisar el heap propio del juego.
+    if (m_privateGuestHeapLimit > m_privateGuestHeapBase)
+    {
+        guestBase = m_privateGuestHeapBase;
+        guestLimit = m_privateGuestHeapLimit;
+    }
     uint32_t base = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
     uint32_t limit = clampGuestHeapLimit(guestLimit);
     if (base == 0u)
@@ -2279,6 +2063,32 @@ uint32_t PS2Runtime::guestHeapLimit() const
     return m_guestHeapConfigured ? m_guestHeapLimit : m_guestHeapSuggestedBase;
 }
 
+void PS2Runtime::setPrivateGuestHeap(uint32_t base, uint32_t limit)
+{
+    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    m_privateGuestHeapBase = base;
+    m_privateGuestHeapLimit = limit;
+    // Si el heap ya existe y no tiene bloques en uso, se mueve ya; si no, al siguiente SetupHeap.
+    const bool inUse = std::any_of(m_guestHeapBlocks.begin(), m_guestHeapBlocks.end(),
+                                   [](const GuestHeapBlock &block) { return !block.free; });
+    if (m_guestHeapConfigured && !inUse)
+    {
+        resetGuestHeapLocked(base, limit);
+    }
+}
+
+void PS2Runtime::limitAsyncCallbackStackTop(uint32_t top)
+{
+    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+    top &= ~(kGuestHeapDefaultAlignment - 1u);
+    if (top > m_asyncCallbackStackFloor && top < m_asyncCallbackStackTop)
+    {
+        m_asyncCallbackStackTop = top;
+    }
+    std::cerr << "[stack] pilas de interrupciones por debajo de 0x" << std::hex << m_asyncCallbackStackTop
+              << " (suelo 0x" << m_asyncCallbackStackFloor << ")" << std::dec << std::endl;
+}
+
 uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment)
 {
     if (size == 0u)
@@ -2515,7 +2325,9 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    const bool due = m_eeScheduler->checkpointDue(cycles);
+    if (due) ++m_eeCheckpointSerial;
+    return due;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
@@ -2707,55 +2519,47 @@ void PS2Runtime::run()
                 const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
                 const auto eeSnapshot = m_eeScheduler->snapshot();
 
-                std::cerr << "[run:tick] tick=" << tick
-                          << " pc=0x" << std::hex << dbgPc
-                          << " ra=0x" << dbgRa
-                          << " sp=0x" << dbgSp
-                          << " gp=0x" << dbgGp
-                          << " dispfb1=0x" << gs.dispfb1
-                          << " display1=0x" << gs.display1
-                          << std::dec
-                          << " activeThreads=" << eeSnapshot.threads.size()
-                          << " dma=" << curDma
-                          << " gif=" << curGif
-                          << " gsw=" << curGs
-                          << " vif=" << curVif
-                          << std::endl;
-                { // TEMP-DEBUG(gradius-watch): gate words for boot progress.
-                    static uint64_t lastWatch = 0;
-                    if (tick - lastWatch >= 30u)
+                RUNTIME_LOG("[run:tick] tick=" << tick
+                                               << " pc=0x" << std::hex << dbgPc
+                                               << " ra=0x" << dbgRa
+                                               << " sp=0x" << dbgSp
+                                               << " gp=0x" << dbgGp
+                                               << " dispfb1=0x" << gs.dispfb1
+                                               << " display1=0x" << gs.display1
+                                               << std::dec
+                                               << " activeThreads=" << eeSnapshot.threads.size()
+                                               << " dma=" << curDma
+                                               << " gif=" << curGif
+                                               << " gsw=" << curGs
+                                               << " vif=" << curVif
+                                               << std::endl);
+
+                // GOW-Port: estado de cada hilo del EE (cada 600 marcas, ~10 s).
+                if ((tick % 600) == 0)
+                {
+                    for (const auto &thread : eeSnapshot.threads)
                     {
-                        lastWatch = tick;
-                        auto wdbg = [&](uint32_t va) -> uint32_t {
-                            try { return m_memory.read32(va); } catch (...) { return 0xDEADDEADu; }
-                        };
-                        if (m_eeScheduler) std::cerr << "[watch] ckpt calls=" << m_eeScheduler->checkpointCalls() << " hits=" << m_eeScheduler->checkpointHits() << std::endl;
-                        if (R5900Context *live = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr)
-                            std::cerr << "[watch] livepc=0x" << std::hex << live->pc << std::dec << std::endl;
-                        std::cerr << "[watch] *0x65CCC=" << std::hex << wdbg(0x065CCCu)
-                                  << " cli0+0=" << wdbg(0x00849C40u) << " cli0+36=" << wdbg(0x00849C78u)
-                                  << " 84BDE0=" << wdbg(0x0084BDE0u) << " 84BF00=" << wdbg(0x0084BF00u)
-                                  << std::dec << std::endl;
+                        RUNTIME_LOG("[run:thread] id=" << thread.id
+                                                       << " status=" << static_cast<int>(thread.status)
+                                                       << " wait=" << static_cast<int>(thread.waitReason)
+                                                       << " waitId=" << thread.waitId
+                                                       << " prio=" << thread.currentPriority
+                                                       << " pc=0x" << std::hex << thread.pc
+                                                       << " ra=0x" << thread.ra
+                                                       << " sp=0x" << thread.sp
+                                                       << " entry=0x" << thread.entry << std::dec
+                                                       << (thread.id == eeSnapshot.runningThreadId ? " (corriendo)" : "")
+                                                       << std::endl);
                     }
                 }
-                for (const auto &thread : eeSnapshot.threads)
-                {
-                    std::cerr << "[thread] id=" << thread.id
-                              << " pc=0x" << std::hex << thread.pc
-                              << " ra=0x" << thread.ra
-                              << " sp=0x" << thread.sp
-                              << " status=" << static_cast<int>(thread.status)
-                              << " wait=" << static_cast<int>(thread.waitReason)
-                              << " waitId=" << thread.waitId
-                              << " wakeupCount=" << thread.wakeupCount
-                              << std::dec << std::endl;
-                }
-
             }
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        {
+            ps2_perf::Scope perf(ps2_perf::Bucket::Upload);
+            UploadFrame(frameTex, this, presentWidth, presentHeight);
+        }
 
         BeginDrawing();
         ClearBackground(BLACK);
@@ -2777,7 +2581,12 @@ void PS2Runtime::run()
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
-        EndDrawing();
+        {
+            ps2_perf::Scope perf(ps2_perf::Bucket::HostWait);
+            EndDrawing();
+        }
+        if (ps2_perf::countFrames()) ps2_perf::hostFrames.fetch_add(1, std::memory_order_relaxed);
+        ps2_perf::report();
 
         if (WindowShouldClose())
         {

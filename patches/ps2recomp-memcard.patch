@@ -1,0 +1,344 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_cpu.cpp b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+index 5240e8b..5dcc524 100644
+--- a/ps2xIOP/src/emulator/core/iop_cpu.cpp
++++ b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+@@ -356,7 +356,9 @@ namespace ps2x::iop::detail
+         {
+             const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
+             const uint32_t memory = m_memory.load32(address & ~3u);
+-            const uint32_t old = cpu.gpr[rt];
++            // GOW-Port: LWL/LWR seguidas sobre el mismo registro combinan con el valor que aún está en el
++            // hueco de retardo de carga (como el R3000). mc2_d copia así las especificaciones de la tarjeta.
++            const uint32_t old = cpu.pendingLoad && cpu.pendingLoadReg == rt ? cpu.pendingLoadValue : cpu.gpr[rt];
+             static constexpr uint32_t masks[4] = {0x00FFFFFFu, 0x0000FFFFu, 0x000000FFu, 0x00000000u};
+             static constexpr uint32_t shifts[4] = {24u, 16u, 8u, 0u};
+             load(rt, (old & masks[address & 3u]) | (memory << shifts[address & 3u]));
+@@ -377,7 +379,7 @@ namespace ps2x::iop::detail
+         {
+             const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
+             const uint32_t memory = m_memory.load32(address & ~3u);
+-            const uint32_t old = cpu.gpr[rt];
++            const uint32_t old = cpu.pendingLoad && cpu.pendingLoadReg == rt ? cpu.pendingLoadValue : cpu.gpr[rt];
+             static constexpr uint32_t masks[4] = {0x00000000u, 0xFF000000u, 0xFFFF0000u, 0xFFFFFF00u};
+             static constexpr uint32_t shifts[4] = {0u, 8u, 16u, 24u};
+             load(rt, (old & masks[address & 3u]) | (memory >> shifts[address & 3u]));
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 804bd21..b32d214 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -641,7 +641,32 @@ namespace ps2x::iop::detail
+                 cpu.yielded = true;
+             }
+             else
+-                setV0(-418);
++            {
++                // GOW-Port: sin hilo actual (servidor RPC) se esperaba en falso con KE_EVF_COND. mc2_d manda los
++                // comandos de la memory card desde el servidor RPC de dbcman y sio2man espera el fin de la
++                // transferencia con WaitEventFlag: leía la respuesta antes de que llegara y daba la tarjeta por
++                // ausente. Ahora corren los demás hilos hasta que se cumple la condición (como WaitSema).
++                const int id = event->second.id;
++                const auto satisfied = [this, id, bits, mode]
++                {
++                    const auto current = m_eventFlags.find(id);
++                    return current == m_eventFlags.end() || eventSatisfied(current->second, bits, mode);
++                };
++                const bool ready = m_outsideThreadWait && m_outsideThreadWait(satisfied);
++                const auto current = m_eventFlags.find(id);
++                if (ready && current != m_eventFlags.end())
++                {
++                    if (cpu.gpr[7] != 0u)
++                        m_memory.write32(cpu.gpr[7], current->second.bits);
++                    if ((mode & 0x10u) != 0u)
++                        current->second.bits = 0u;
++                    setV0(0);
++                }
++                else
++                {
++                    setV0(static_cast<uint32_t>(-418));
++                }
++            }
+             return true;
+         }
+         case 13:
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index ad58fb4..f114770 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -10,6 +10,7 @@
+ #include <array>
+ #include <cctype>
+ #include <cstring>
++#include <ctime>
+ #include <filesystem>
+ #include <limits>
+ #include <string>
+@@ -280,6 +281,30 @@ namespace ps2x::iop::detail
+                 cpu.gpr[2] = kCdvdReadyComplete;
+                 return true;
+ 
++            case 24: // GOW-Port: sceCdReadClock(clock): reloj en BCD. mc2_d lo usa para la fecha de las partidas
++            {           // (sin él salía "??? 95, 2000"). El reloj de la PS2 va en hora de Japón (UTC+9); el juego
++                        // le resta 9 h y suma la zona horaria de la configuración (la del host).
++                if (a0 == 0u)
++                {
++                    cpu.gpr[2] = 0u;
++                    return true;
++                }
++                const std::time_t now = std::time(nullptr) + 9 * 60 * 60;
++                std::tm local{};
++#ifdef _WIN32
++                gmtime_s(&local, &now);
++#else
++                gmtime_r(&now, &local);
++#endif
++                const auto bcd = [](int value) { return static_cast<uint8_t>(((value / 10) << 4) | (value % 10)); };
++                const uint8_t clock[8] = {0u, bcd(local.tm_sec), bcd(local.tm_min), bcd(local.tm_hour), 0u,
++                                          bcd(local.tm_mday), bcd(local.tm_mon + 1), bcd((local.tm_year + 1900) % 100)};
++                for (uint32_t i = 0; i < 8u; ++i)
++                    memory.write8(a0 + i, clock[i]);
++                cpu.gpr[2] = 1u;
++                return true;
++            }
++
+             case 28: // sceCdStatus
+                 cpu.gpr[2] = kCdvdStatusPause;
+                 return true;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index fcfec39..3911d71 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -90,6 +90,7 @@ namespace ps2x::iop::detail
+             uint32_t gp = 0;
+         };
+ 
++        static constexpr uint64_t kSifDmaCompletionCycles = 2000u; // GOW-Port
+         struct ScheduledGuestCallback
+         {
+             uint32_t function = 0u;
+@@ -377,9 +378,13 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "sifman"))
+             {
+-                return rpc.dispatchSifManImport(call.ordinal, cpu)
+-                           ? ImportDisposition::Handled
+-                           : ImportDisposition::Missing;
++                const bool handled = rpc.dispatchSifManImport(call.ordinal, cpu);
++                // GOW-Port: dbcman envía al EE con sceSifSetDmaIntr y espera su callback de fin de DMA.
++                IopRpcBridge::DmaCompletionCallback callback{};
++                if (rpc.takeDmaCompletionCallback(callback))
++                    pendingGuestCallbacks.emplace(totalCycles + kSifDmaCompletionCycles,
++                                                  ScheduledGuestCallback{callback.function, callback.gp, callback.argument});
++                return handled ? ImportDisposition::Handled : ImportDisposition::Missing;
+             }
+             if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
+                 return ImportDisposition::Handled;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index 18605b1..a2e5636 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -44,6 +44,7 @@ namespace ps2x::iop::detail
+             setV0(0u);
+             return true;
+         case 7: // sceSifSetDma
++        case 32: // GOW-Port: sceSifSetDmaIntr(dmat, count, func, data): igual, y llama a func(data) al terminar
+         {
+             constexpr uint32_t kDescriptorSize = 16u;
+             constexpr uint32_t kMaxDescriptors = 32u;
+@@ -129,6 +130,8 @@ namespace ps2x::iop::detail
+                 }
+             }
+ 
++            if (ordinal == 32u && cpu.gpr[6] != 0u)
++                m_dmaCallback = {cpu.gpr[6], cpu.gpr[7], cpu.gpr[28]};
+             const uint32_t dmaId = m_nextDmaId++;
+             if (m_nextDmaId == 0u || m_nextDmaId > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
+             {
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index 57abc7e..81360dd 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -59,6 +59,21 @@ namespace ps2x::iop::detail
+         void removeServersInRange(uint32_t base, uint32_t size);
+ 
+         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
++        // GOW-Port: callback de fin de sceSifSetDmaIntr (sifman 32) pendiente de programar.
++        struct DmaCompletionCallback
++        {
++            uint32_t function = 0;
++            uint32_t argument = 0;
++            uint32_t gp = 0;
++        };
++        [[nodiscard]] bool takeDmaCompletionCallback(DmaCompletionCallback &callback) noexcept
++        {
++            if (m_dmaCallback.function == 0u)
++                return false;
++            callback = m_dmaCallback;
++            m_dmaCallback = {};
++            return true;
++        }
+         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
+ 
+     private:
+@@ -77,6 +92,7 @@ namespace ps2x::iop::detail
+         IopHost &m_host;
+         IopMemory &m_memory;
+         IopKernel &m_kernel;
++        DmaCompletionCallback m_dmaCallback{};
+         std::unordered_map<uint32_t, RpcServer> m_servers;
+         uint32_t m_nextDmaId = 1u;
+         bool m_sifInitialized = false;
+diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
+index aabcbb3..4be26c5 100644
+--- a/ps2xTest/src/ps2_iop_tests.cpp
++++ b/ps2xTest/src/ps2_iop_tests.cpp
+@@ -1,7 +1,9 @@
+ #include "MiniTest.h"
+ #include "ps2x/iop/ps2_path.h"
+ #include "../../ps2xIOP/tests/iop_compat_test_support.h"
++#include "../../ps2xIOP/src/emulator/core/iop_cpu.h"
+ #include "../../ps2xIOP/src/emulator/core/iop_kernel.h"
++#include "../../ps2xIOP/src/emulator/imports/iop_cdvd.h"
+ #include "../../ps2xIOP/src/emulator/core/iop_memory.h"
+ #include "../../ps2xIOP/src/emulator/services/iop_rpc.h"
+ 
+@@ -133,6 +135,140 @@ void register_ps2_iop_tests()
+             t.Equals(memory.read32(kReceiveData + 0x18u), 64u, "receive data should record the size");
+         });
+ 
++        // GOW-Port: sio2man espera el fin de cada transferencia de la memory card con WaitEventFlag, y mc2_d
++        // la pide desde el servidor RPC de dbcman, sin hilo actual.
++        tc.Run("WaitEventFlag outside a thread waits for the flag instead of failing", [](TestCase &t)
++        {
++            using namespace ps2x::iop::detail;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            kernel.reset();
++            constexpr uint32_t kDescriptor = 0x2000u;
++            constexpr uint32_t kResult = 0x2040u;
++            memory.write32(kDescriptor + 0u, 0u);
++            memory.write32(kDescriptor + 4u, 0u);
++            memory.write32(kDescriptor + 8u, 0u);
++            IopCpuState create{};
++            create.gpr[4] = kDescriptor;
++            t.IsTrue(kernel.dispatchEventImport(4u, create), "CreateEventFlag should be handled");
++            const uint32_t id = create.gpr[2];
++
++            IopCpuState wait{};
++            wait.gpr[4] = id;
++            wait.gpr[5] = 0x1000u;
++            wait.gpr[6] = 0x10u; // WEF_AND | WEF_CLEAR
++            wait.gpr[7] = kResult;
++            t.IsTrue(kernel.dispatchEventImport(10u, wait), "WaitEventFlag should be handled");
++            t.Equals(static_cast<int32_t>(wait.gpr[2]), -418, "without anyone to set it, the wait must fail");
++
++            kernel.setOutsideThreadWait([&](const std::function<bool()> &ready)
++            {
++                IopCpuState set{};
++                set.gpr[4] = id;
++                set.gpr[5] = 0x1000u; // la interrupcion del SIO2 marca el fin
++                (void)kernel.dispatchEventImport(6u, set);
++                return ready();
++            });
++            wait.gpr[2] = 0xFFFFFFFFu;
++            t.IsTrue(kernel.dispatchEventImport(10u, wait), "WaitEventFlag should be handled");
++            t.Equals(wait.gpr[2], 0u, "WaitEventFlag should succeed once the flag is set");
++            t.Equals(memory.read32(kResult), 0x1000u, "the satisfied bits should be reported");
++            IopCpuState poll{};
++            poll.gpr[4] = id;
++            poll.gpr[5] = 0x1000u;
++            t.IsTrue(kernel.dispatchEventImport(11u, poll), "PollEventFlag should be handled");
++            t.Equals(static_cast<int32_t>(poll.gpr[2]), -418, "WEF_CLEAR should have cleared the flag");
++        });
++
++        // GOW-Port: dbcman contesta al EE con sceSifSetDmaIntr y espera su callback para enviar lo siguiente.
++        tc.Run("sceSifSetDmaIntr copies to the EE and queues its completion callback", [](TestCase &t)
++        {
++            using namespace ps2x::iop::detail;
++            iop_test::Host host;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            kernel.reset();
++            IopRpcBridge rpc(host, memory, kernel);
++            rpc.reset();
++            constexpr uint32_t kSource = 0x30000u;
++            constexpr uint32_t kDescriptor = 0x30100u;
++            constexpr uint32_t kEeDestination = 0x1800u;
++            uint8_t payload[32];
++            for (uint32_t i = 0; i < 32u; ++i)
++                payload[i] = static_cast<uint8_t>(0x60u + i);
++            t.IsTrue(memory.writeRam(kSource, payload, sizeof(payload)), "payload should be written");
++            const uint32_t descriptor[4] = {kSource, kEeDestination, static_cast<uint32_t>(sizeof(payload)), 0u};
++            t.IsTrue(memory.writeRam(kDescriptor, descriptor, sizeof(descriptor)), "descriptor should be written");
++
++            IopCpuState cpu{};
++            cpu.gpr[4] = kDescriptor;
++            cpu.gpr[5] = 1u;
++            cpu.gpr[6] = 0x112F4u; // callback
++            cpu.gpr[7] = 0x55u;    // argumento
++            cpu.gpr[28] = 0x9000u; // gp
++            t.IsTrue(rpc.dispatchSifManImport(32u, cpu), "sifman:32 should be handled");
++            t.IsTrue(cpu.gpr[2] != 0u, "sceSifSetDmaIntr should return a DMA id");
++            uint8_t copied[32]{};
++            t.IsTrue(host.readGuest(kEeDestination, copied, sizeof(copied)), "EE destination should be readable");
++            t.IsTrue(std::memcmp(copied, payload, sizeof(payload)) == 0, "the payload should reach EE memory");
++            IopRpcBridge::DmaCompletionCallback callback{};
++            t.IsTrue(rpc.takeDmaCompletionCallback(callback), "the completion callback should be queued");
++            t.Equals(callback.function, 0x112F4u, "callback function");
++            t.Equals(callback.argument, 0x55u, "callback argument");
++            t.Equals(callback.gp, 0x9000u, "callback gp");
++            t.IsFalse(rpc.takeDmaCompletionCallback(callback), "the callback should be taken once");
++        });
++
++        // GOW-Port: mc2_d copia las especificaciones de la tarjeta con LWL/LWR seguidas sobre el mismo registro.
++        tc.Run("IOP LWR merges with the LWL still in the load delay slot", [](TestCase &t)
++        {
++            using namespace ps2x::iop::detail;
++            IopMemory memory;
++            IopCpuCore core(memory);
++            constexpr uint32_t kCode = 0x40000u;
++            constexpr uint32_t kData = 0x40100u;
++            const uint8_t bytes[8] = {0x10u, 0x11u, 0x12u, 0x13u, 0x14u, 0x15u, 0x16u, 0x17u};
++            t.IsTrue(memory.writeRam(kData, bytes, sizeof(bytes)), "data should be written");
++            const uint32_t code[3] = {
++                (0x22u << 26) | (5u << 21) | (8u << 16) | 6u, // lwl t0, 6(a1): palabra sin alinear en kData+3
++                (0x26u << 26) | (5u << 21) | (8u << 16) | 3u, // lwr t0, 3(a1)
++                0u,                                           // nop
++            };
++            t.IsTrue(memory.writeRam(kCode, code, sizeof(code)), "code should be written");
++            IopCpuState cpu{};
++            cpu.pc = kCode;
++            cpu.gpr[5] = kData;
++            cpu.gpr[8] = 0xAAAAAAAAu;
++            for (int i = 0; i < 3; ++i)
++                (void)core.executeInstruction(cpu);
++            t.Equals(cpu.gpr[8], 0x16151413u, "the unaligned word should be assembled from both halves");
++        });
++
++        // GOW-Port: mc2_d pone la fecha de las partidas con sceCdReadClock del IOP.
++        tc.Run("IOP sceCdReadClock writes a valid BCD clock", [](TestCase &t)
++        {
++            using namespace ps2x::iop::detail;
++            iop_test::Host host;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            kernel.reset();
++            IopCdvd cdvd(host, memory, kernel);
++            cdvd.reset();
++            constexpr uint32_t kClock = 0x2400u;
++            IopCpuState cpu{};
++            cpu.gpr[4] = kClock;
++            t.IsTrue(cdvd.dispatchImport(24u, cpu), "cdvdman:24 should be handled");
++            t.Equals(cpu.gpr[2], 1u, "sceCdReadClock should succeed");
++            const auto value = [&](uint32_t offset)
++            {
++                const uint8_t b = memory.read8(kClock + offset);
++                return static_cast<uint32_t>((b >> 4) * 10u + (b & 0xFu));
++            };
++            t.IsTrue(value(1) < 60u && value(2) < 60u && value(3) < 24u, "time fields should be valid BCD");
++            t.IsTrue(value(5) >= 1u && value(5) <= 31u, "day should be valid");
++            t.IsTrue(value(6) >= 1u && value(6) <= 12u, "month should be valid");
++        });
++
+         tc.Run("unknown SID remains unhandled without a loaded IRX", [](TestCase &t)
+         {
+             iop_test::Host host;

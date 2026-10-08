@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "runtime/gs/gs_backend.h"
+#include "runtime/gs/ps2_gif_arbiter.h" // GOW-Port: conservar el origen de cada flujo GIF.
 
 struct GSDebugSnapshot
 {
@@ -106,14 +107,16 @@ public:
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 
-    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
-    bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes, GifPathId path = GifPathId::Path1);
+    bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes, GifPathId path = GifPathId::Path1);
+    bool hasPendingGIFPacket(GifPathId path) const; // GOW-Port: los atajos DMA no pueden saltarse un flujo pendiente.
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
                            uint64_t trxreg,
                            uint64_t trxdir,
                            const uint8_t *data,
-                           uint32_t sizeBytes);
+                           uint32_t sizeBytes,
+                           uint64_t setupGifTag = 0u); // GOW-Port: efectos del setup validado por DMA.
     void writeRegister(uint8_t regAddr, uint64_t value);
 
     const uint8_t *lockDisplaySnapshot(uint32_t &outSize);
@@ -183,6 +186,18 @@ private:
     mutable std::recursive_mutex m_stateMutex;
     mutable std::mutex m_backendLifetimeMutex;
     mutable std::mutex m_presentationMutex;
+
+    // GOW-Port: cursor acotado por PATH, sin almacenar paquetes ni payloads completos.
+    struct GifInputState
+    {
+        std::array<uint8_t, 16> partial{};
+        std::array<uint8_t, 16> regs{};
+        uint32_t partialBytes = 0u, registersLeft = 0u, imageBytes = 0u, paddingBytes = 0u;
+        uint32_t nreg = 0u, regIndex = 0u;
+        uint8_t format = 0u;
+        bool pending() const { return partialBytes || registersLeft || imageBytes || paddingBytes; }
+    };
+    std::array<GifInputState, 4> m_gifInput{};
 
     GSContext m_ctx[2];
     GSPrimReg m_prim{};

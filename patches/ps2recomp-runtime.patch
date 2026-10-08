@@ -1,0 +1,1120 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index f8d3e44..c97ddd5 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -28,6 +28,7 @@ add_library(ps2_iop STATIC
+     src/modules/dbcman.cpp
+     src/modules/libsd.cpp
+     src/modules/mcserv.cpp
++    src/modules/gow_stub_services.cpp
+ )
+ 
+ target_compile_features(ps2_iop PUBLIC cxx_std_20)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..a5b7f7a 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -67,6 +67,14 @@ namespace ps2x::iop::detail
+         void terminateThreadsInRange(uint32_t base, uint32_t size);
+ 
+         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
++        // GOW-Port: hay algun hilo listo para ejecutar (lo usa IopRpcBridge tras cada RPC).
++        [[nodiscard]] bool hasReadyThread() const noexcept
++        {
++            for (const auto &[id, thread] : m_threads)
++                if (thread.state == IopThreadState::Ready)
++                    return true;
++            return false;
++        }
+ 
+     private:
+         struct Semaphore
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..a8d7493 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -22,7 +22,10 @@ namespace ps2x::iop::detail
+         static constexpr uint32_t Spu2End = 0x1FA00000u;
+         static constexpr uint32_t SifBase = 0x1D000000u;
+         static constexpr uint32_t SifEnd = 0x1D001000u;
+-        static constexpr uint32_t HeapBase = 0x00120000u;
++        // GOW-Port: el heap empezaba en 0x120000 (832 KB hasta HeapLimit) y SMPD_IOP.IRX de God of War
++        // reserva un bloque de 0x11ADF8 bytes. En un IOP real el heap empieza tras los modulos cargados
++        // (los de GoW terminan hacia 0x56000), asi que lo bajamos a 0x70000 (1.5 MB).
++        static constexpr uint32_t HeapBase = 0x00070000u;
+         static constexpr uint32_t HeapLimit = 0x001F0000u;
+ 
+         struct Allocation
+diff --git a/ps2xIOP/src/emulator/imports/iop_format.h b/ps2xIOP/src/emulator/imports/iop_format.h
+new file mode 100644
+index 0000000..3a26c2e
+--- /dev/null
++++ b/ps2xIOP/src/emulator/imports/iop_format.h
+@@ -0,0 +1,126 @@
++#pragma once
++
++// GOW-Port: formateo estilo printf para sysclib sprintf/vsprintf y stdio printf del IOP.
++// Antes, sprintf copiaba el formato literal: SMPD_IOP.IRX de God of War hace sprintf(buf, "%s.wad", nombre)
++// para buscar sus recursos y acababa buscando "%S.WAD".
++
++#include "../core/iop_memory.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <functional>
++#include <string>
++
++namespace ps2x::iop::detail
++{
++    // nextArg devuelve la siguiente palabra de 32 bits de la lista de argumentos variables
++    // (o32: a1..a3 o a2..a3 y despues la pila desde sp+16; en vsprintf, la memoria apuntada por va_list).
++    inline std::string formatGuestString(const IopMemory &memory, uint32_t formatAddress,
++                                         const std::function<uint32_t()> &nextArg, size_t limit = 4096u)
++    {
++        const std::string format = memory.readString(formatAddress, limit);
++        std::string out;
++        out.reserve(format.size() + 32u);
++        for (size_t i = 0; i < format.size(); ++i)
++        {
++            const char c = format[i];
++            if (c != '%')
++            {
++                out += c;
++                continue;
++            }
++            const size_t start = i++;
++            if (i >= format.size())
++            {
++                out += '%';
++                break;
++            }
++            if (format[i] == '%')
++            {
++                out += '%';
++                continue;
++            }
++
++            std::string spec = "%";
++            while (i < format.size() && (format[i] == '-' || format[i] == '+' || format[i] == ' ' ||
++                                         format[i] == '#' || format[i] == '0'))
++                spec += format[i++];
++            if (i < format.size() && format[i] == '*')
++            {
++                spec += std::to_string(static_cast<int32_t>(nextArg()));
++                ++i;
++            }
++            while (i < format.size() && format[i] >= '0' && format[i] <= '9')
++                spec += format[i++];
++            if (i < format.size() && format[i] == '.')
++            {
++                spec += format[i++];
++                if (i < format.size() && format[i] == '*')
++                {
++                    spec += std::to_string(static_cast<int32_t>(nextArg()));
++                    ++i;
++                }
++                while (i < format.size() && format[i] >= '0' && format[i] <= '9')
++                    spec += format[i++];
++            }
++            int longCount = 0;
++            while (i < format.size() && (format[i] == 'l' || format[i] == 'h' || format[i] == 'q' || format[i] == 'L'))
++            {
++                if (format[i] == 'l' || format[i] == 'q' || format[i] == 'L')
++                    ++longCount;
++                ++i;
++            }
++            if (i >= format.size())
++            {
++                out += format.substr(start);
++                break;
++            }
++
++            const char conversion = format[i];
++            char buffer[512];
++            buffer[0] = '\0';
++            switch (conversion)
++            {
++            case 'd':
++            case 'i':
++            {
++                long long value = static_cast<int32_t>(nextArg());
++                if (longCount >= 2)
++                    value = static_cast<long long>((static_cast<uint64_t>(nextArg()) << 32) | static_cast<uint32_t>(value));
++                std::snprintf(buffer, sizeof(buffer), (spec + "lld").c_str(), value);
++                break;
++            }
++            case 'u':
++            case 'x':
++            case 'X':
++            case 'o':
++            {
++                unsigned long long value = nextArg();
++                if (longCount >= 2)
++                    value |= static_cast<unsigned long long>(nextArg()) << 32;
++                std::snprintf(buffer, sizeof(buffer), (spec + "ll" + conversion).c_str(), value);
++                break;
++            }
++            case 'p':
++                std::snprintf(buffer, sizeof(buffer), "0x%08x", nextArg());
++                break;
++            case 'c':
++                std::snprintf(buffer, sizeof(buffer), (spec + "c").c_str(), static_cast<int>(nextArg() & 0xFFu));
++                break;
++            case 's':
++            {
++                const uint32_t address = nextArg();
++                const std::string text = address ? memory.readString(address, limit) : std::string("(null)");
++                std::snprintf(buffer, sizeof(buffer), (spec + "s").c_str(), text.c_str());
++                break;
++            }
++            default:
++                // Conversion desconocida: se deja tal cual.
++                out += format.substr(start, i - start + 1u);
++                continue;
++            }
++            out += buffer;
++        }
++        return out;
++    }
++}
+diff --git a/ps2xIOP/src/emulator/imports/iop_stdio.cpp b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+index eed2b61..d221431 100644
+--- a/ps2xIOP/src/emulator/imports/iop_stdio.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_memory.h"
++#include "iop_format.h"
+ #include "ps2x/iop/iop_host.h"
+ 
+ #include <string>
+@@ -30,9 +31,24 @@ namespace ps2x::iop::detail
+ 
+         switch (ordinal)
+         {
+-        case 4: // printf
+-            logString("[IOP printf] ", a0);
++        case 4: // printf(fmt, ...): argumentos en a1..a3 y despues en la pila desde sp+16 (o32)
++        {
++            uint32_t argIndex = 0u;
++            const std::function<uint32_t()> nextArg = [&]() -> uint32_t
++            {
++                const uint32_t index = argIndex++;
++                if (index < 3u)
++                    return cpu.gpr[5u + index];
++                return m_memory.read32(cpu.gpr[29] + 16u + (index - 3u) * 4u);
++            };
++            std::string text = formatGuestString(m_memory, a0, nextArg, 2048u);
++            const size_t length = text.size();
++            while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
++                text.pop_back();
++            m_host.log(LogLevel::Info, std::string("[IOP printf] ") + text);
++            setV0(static_cast<uint32_t>(length));
+             return true;
++        }
+         case 5: // getchar
+         case 10:
+             setV0(0xFFFFFFFFu);
+diff --git a/ps2xIOP/src/emulator/imports/iop_sysclib.cpp b/ps2xIOP/src/emulator/imports/iop_sysclib.cpp
+index 0517478..79609fe 100644
+--- a/ps2xIOP/src/emulator/imports/iop_sysclib.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_sysclib.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_memory.h"
++#include "iop_format.h"
+ 
+ #include <cctype>
+ #include <cstdlib>
+@@ -124,15 +125,30 @@ namespace ps2x::iop::detail
+         case 18: // prnt
+             setV0(0);
+             return true;
+-        case 19: // sprintf: preserve useful literal formats even before full vararg formatting.
+-        case 42: // vsprintf fallback: copy format literal.
++        case 19: // sprintf(buf, fmt, ...): argumentos en a2, a3 y despues en la pila desde sp+16 (o32)
++        case 42: // vsprintf(buf, fmt, va_list)
+         {
+-            const std::string format = m_memory.readString(a1, 4096u);
+-            for (size_t i = 0; i <= format.size(); ++i)
++            uint32_t argIndex = 0u;
++            uint32_t vaPointer = a2;
++            const std::function<uint32_t()> nextArg = [&]() -> uint32_t
+             {
+-                m_memory.write8(a0 + static_cast<uint32_t>(i), i < format.size() ? static_cast<uint8_t>(format[i]) : 0u);
+-            }
+-            setV0(static_cast<uint32_t>(format.size()));
++                if (ordinal == 42u)
++                {
++                    const uint32_t value = m_memory.read32(vaPointer);
++                    vaPointer += 4u;
++                    return value;
++                }
++                const uint32_t index = argIndex++;
++                if (index == 0u)
++                    return cpu.gpr[6];
++                if (index == 1u)
++                    return cpu.gpr[7];
++                return m_memory.read32(cpu.gpr[29] + 16u + (index - 2u) * 4u);
++            };
++            const std::string text = formatGuestString(m_memory, a1, nextArg);
++            for (size_t i = 0; i <= text.size(); ++i)
++                m_memory.write8(a0 + static_cast<uint32_t>(i), i < text.size() ? static_cast<uint8_t>(text[i]) : 0u);
++            setV0(static_cast<uint32_t>(text.size()));
+             return true;
+         }
+         case 20:
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..df79786 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -18,12 +18,15 @@
+ #include "iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cctype>
+ #include <map>
+ #include <optional>
+ #include <span>
+ #include <sstream>
++#include <string>
+ #include <utility>
++#include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -245,6 +248,40 @@ namespace ps2x::iop::detail
+                 cpu.gpr[2] = value;
+             };
+ 
++            // GOW-Port: traza opcional de llamadas a importaciones (PS2X_IOP_TRACE=<numero de llamadas>).
++            static const long traceLimit = []
++            {
++                const char *v = std::getenv("PS2X_IOP_TRACE");
++                return v ? std::strtol(v, nullptr, 10) : 0L;
++            }();
++            // PS2X_IOP_TRACE_EVERY=<n>: muestreo, una de cada n llamadas (para ver progreso sin frenar).
++            static const long traceEvery = []
++            {
++                const char *v = std::getenv("PS2X_IOP_TRACE_EVERY");
++                return v ? std::strtol(v, nullptr, 10) : 0L;
++            }();
++            // PS2X_IOP_TRACE_NOCLIB=1: no trazar sysclib (memcpy/strncmp...), que es la mayor parte del volumen.
++            static const bool traceNoClib = std::getenv("PS2X_IOP_TRACE_NOCLIB") != nullptr;
++            static long traceCount = 0;
++            static long callCount = 0;
++            ++callCount;
++            const bool traceSkip = traceNoClib && iequals(call.library, "sysclib");
++            // PS2X_IOP_TRACE_FROM=<n>: la traza de PS2X_IOP_TRACE empieza en la llamada n.
++            static const long traceFrom = []
++            {
++                const char *v = std::getenv("PS2X_IOP_TRACE_FROM");
++                return v ? std::strtol(v, nullptr, 10) : 0L;
++            }();
++            if (!traceSkip && ((callCount >= traceFrom && traceCount < traceLimit) || (traceEvery > 0 && callCount % traceEvery == 0)))
++            {
++                ++traceCount;
++                std::ostringstream trace;
++                trace << "[IOP:trace] #" << std::dec << callCount << " " << call.library << ':' << std::dec << call.ordinal << std::hex
++                      << " a0=0x" << cpu.gpr[4] << " a1=0x" << cpu.gpr[5] << " a2=0x" << cpu.gpr[6]
++                      << " a3=0x" << cpu.gpr[7] << " ra=0x" << cpu.gpr[31];
++                log(LogLevel::Info, trace.str());
++            }
++
+             if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
+                 return ImportDisposition::Handled;
+ 
+@@ -390,6 +427,21 @@ namespace ps2x::iop::detail
+                 return !cpu.stopped;
+             }
+ 
++            // GOW-Port: muestreo del PC del IOP (PS2X_IOP_PC_EVERY=<instrucciones>).
++            static const unsigned long long pcEvery = []
++            {
++                const char *v = std::getenv("PS2X_IOP_PC_EVERY");
++                return v ? std::strtoull(v, nullptr, 10) : 0ULL;
++            }();
++            if (pcEvery != 0ULL && totalInstructions % pcEvery == 0ULL)
++            {
++                std::ostringstream out;
++                out << "[IOP:pc] instr=" << std::dec << totalInstructions << std::hex << " pc=0x" << cpu.pc
++                    << " ra=0x" << cpu.gpr[31] << " sp=0x" << cpu.gpr[29] << " v0=0x" << cpu.gpr[2]
++                    << " a0=0x" << cpu.gpr[4];
++                log(LogLevel::Info, out.str());
++            }
++
+             const bool running = cpuCore.executeInstruction(cpu);
+             schedulePendingDma();
+             ++totalInstructions;
+@@ -456,9 +508,30 @@ namespace ps2x::iop::detail
+             }
+             cpu.gpr[31] = kCallReturnSentinel;
+             runCpu(cpu, budget);
++            if (!cpu.stopped && !cpu.yielded)
++            {
++                // GOW-Port: avisar en vez de abandonar la llamada en silencio.
++                std::ostringstream out;
++                out << "[IOP] guest call 0x" << std::hex << address << " exceeded its budget of " << std::dec << budget
++                    << " instructions (pc=0x" << std::hex << cpu.pc << ")";
++                log(LogLevel::Warning, out.str());
++            }
+             return cpu.gpr[2];
+         }
+ 
++        void runReadyThreads(uint64_t maxCycles) override
++        {
++            // Solo desde fuera de la ejecucion del IOP (una RPC del EE), y sin reentrar.
++            if (activeCpu != nullptr || settlingThreads)
++                return;
++            settlingThreads = true;
++            const uint64_t start = totalCycles;
++            while (kernel.hasReadyThread() && totalCycles - start < maxCycles)
++                runCycles(kDefaultSlice * 16u);
++            settlingThreads = false;
++        }
++        bool settlingThreads = false;
++
+         uint32_t executeGuestFunction(uint32_t address,
+                                       uint32_t a0,
+                                       uint32_t a1,
+@@ -566,6 +639,14 @@ namespace ps2x::iop::detail
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+                     {
++                        // GOW-Port: con PS2X_IOP_PC_EVERY, avisar de vez en cuando si el IOP esta ocioso.
++                        static unsigned long long idleCount = 0ULL;
++                        if (std::getenv("PS2X_IOP_PC_EVERY") && (++idleCount % 200000ULL) == 1ULL)
++                        {
++                            std::ostringstream out;
++                            out << "[IOP:idle] sin hilos listos (veces=" << idleCount << ") instr=" << totalInstructions;
++                            log(LogLevel::Info, out.str());
++                        }
+                         uint64_t nextWake = kernel.nextWakeCycle(target);
+                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                             nextWake = std::min(nextWake, completionCycle);
+@@ -614,17 +695,44 @@ namespace ps2x::iop::detail
+             module.entry = loaded.entry;
+             module.gp = loaded.gp;
+ 
+-            uint32_t args = 0u;
++            // GOW-Port: como el loadcore real, el modulo arranca con start(argc, argv): argv[0] es la ruta del
++            // modulo y los argumentos vienen separados por '\0' ("rpc_priority=64\0..."). Antes se pasaba
++            // (tamano en bytes, puntero al texto) y 989snd leia el texto como punteros ("989snd Error: cause 7").
++            std::vector<std::string> argStrings;
++            argStrings.push_back(module.path);
+             if (arguments && argumentSize)
+             {
+-                args = allocate(argumentSize + 1u, 16u);
+-                if (args)
++                const char *text = static_cast<const char *>(arguments);
++                size_t begin = 0u;
++                for (size_t i = 0u; i <= argumentSize; ++i)
++                {
++                    if (i == argumentSize || text[i] == '\0')
++                    {
++                        if (i > begin)
++                            argStrings.emplace_back(text + begin, i - begin);
++                        begin = i + 1u;
++                    }
++                }
++            }
++            uint32_t stringBytes = 0u;
++            for (const std::string &value : argStrings)
++                stringBytes += static_cast<uint32_t>(value.size()) + 1u;
++            const uint32_t pointerBytes = static_cast<uint32_t>(argStrings.size() + 1u) * 4u;
++            const uint32_t args = allocate(pointerBytes + stringBytes, 16u);
++            const uint32_t argc = static_cast<uint32_t>(argStrings.size());
++            if (args)
++            {
++                uint32_t cursor = args + pointerBytes;
++                for (size_t i = 0u; i < argStrings.size(); ++i)
+                 {
+-                    writeRam(args, arguments, argumentSize);
+-                    write8(args + argumentSize, 0u);
++                    memory.write32(args + static_cast<uint32_t>(i) * 4u, cursor);
++                    writeRam(cursor, argStrings[i].data(), static_cast<uint32_t>(argStrings[i].size()));
++                    write8(cursor + static_cast<uint32_t>(argStrings[i].size()), 0u);
++                    cursor += static_cast<uint32_t>(argStrings[i].size()) + 1u;
+                 }
++                memory.write32(args + pointerBytes - 4u, 0u);
+             }
+-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
++            const uint32_t startResult = callFunction(module.entry, args ? argc : 0u, args, 0u, 0u, module.gp);
+             if (args)
+                 freeAllocation(args);
+             module.resident = startResult == 0u || startResult == 2u;
+diff --git a/ps2xIOP/src/emulator/iop_emulator_const.h b/ps2xIOP/src/emulator/iop_emulator_const.h
+index 7004597..7a7b687 100644
+--- a/ps2xIOP/src/emulator/iop_emulator_const.h
++++ b/ps2xIOP/src/emulator/iop_emulator_const.h
+@@ -10,6 +10,8 @@ constexpr uint64_t kIopClockHz = 36'864'000ull;
+ constexpr uint64_t kVblankPeriodCycles = (kIopClockHz * 1001ull + 30'000ull) / 60'000ull;
+ constexpr uint64_t kVblankEndPhaseCycles = kVblankPeriodCycles / 16ull;
+ constexpr uint32_t kDefaultSlice = 256u;
+-constexpr uint32_t kMaxCallInstructions = 2'000'000u;
++// GOW-Port: era 2'000'000. La inicializacion del plugin smpd de God of War (llamada desde el servidor RPC
++// de 989snd) recorre todo GODOFWAR.TOC y necesita bastante mas; al agotarse, la llamada se cortaba en silencio.
++constexpr uint32_t kMaxCallInstructions = 400'000'000u;
+ constexpr uint32_t kModuleLoadBase = 0x00010000u;
+ constexpr uint32_t kStackGuardBytes = 64u;
+\ No newline at end of file
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..46b82e5 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -6,6 +6,8 @@
+ #include "ps2x/iop/iop_host.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <sstream>
+ #include <array>
+ #include <cstring>
+ #include <limits>
+@@ -13,6 +15,9 @@
+ 
+ namespace ps2x::iop::detail
+ {
++    // GOW-Port: tope de ciclos del IOP que se dejan correr tras cada RPC (~0.1 s a 36.864 MHz).
++    constexpr uint64_t kRpcSettleCycles = 4000000u;
++
+     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
+         : m_host(host), m_memory(memory), m_kernel(kernel)
+     {
+@@ -101,10 +106,23 @@ namespace ps2x::iop::detail
+                 }
+             }
+ 
++            // GOW-Port: PS2X_IOP_TRACE_DMA=1 registra cada transferencia IOP -> EE (origen, destino, tamano, datos).
++            static const bool traceDma = std::getenv("PS2X_IOP_TRACE_DMA") != nullptr;
+             for (uint32_t i = 0u; i < pendingCount; ++i)
+             {
+                 const PendingTransfer &transfer = pending[i];
+-                if (!m_memory.readRam(transfer.source, scratch.data(), transfer.size) || !m_host.writeGuest(transfer.destination, scratch.data(), transfer.size))
++                const bool readOk = m_memory.readRam(transfer.source, scratch.data(), transfer.size);
++                const bool writeOk = readOk && m_host.writeGuest(transfer.destination, scratch.data(), transfer.size);
++                if (traceDma)
++                {
++                    std::ostringstream out;
++                    out << "[IOP:sifdma] src=0x" << std::hex << transfer.source << " dst=0x" << transfer.destination
++                        << " size=0x" << transfer.size << " read=" << readOk << " write=" << writeOk << " bytes=";
++                    for (uint32_t b = 0u; b < std::min<uint32_t>(16u, transfer.size); ++b)
++                        out << ' ' << static_cast<uint32_t>(scratch[b]);
++                    m_host.log(LogLevel::Info, out.str());
++                }
++                if (!writeOk)
+                 {
+                     setV0(0u);
+                     return true;
+@@ -298,6 +316,10 @@ namespace ps2x::iop::detail
+                                                                request.send.size,
+                                                                0u,
+                                                                server.gp);
++        // GOW-Port: en el IOP real, si el servidor despierta a un hilo de mas prioridad (smpd: su hilo lector),
++        // ese hilo se ejecuta antes de que el hilo RPC conteste. Sin esto, smpd tomaba el destino de la lectura
++        // de la peticion siguiente y los datos acababan en el bufer equivocado.
++        executor.runReadyThreads(kRpcSettleCycles);
+         if (returnPointer == 0u)
+             returnPointer = server.buffer;
+         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index a4286ba..57abc7e 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -38,6 +38,12 @@ namespace ps2x::iop::detail
+         {
+             return executeGuestFunction(address, a0, a1, a2, a3, gp);
+         }
++        // GOW-Port: deja correr a los hilos del IOP que esten listos (p. ej. despertados por un servidor RPC),
++        // como haria la expulsion por prioridad del IOP real antes de que el hilo RPC conteste.
++        virtual void runReadyThreads(uint64_t maxCycles)
++        {
++            (void)maxCycles;
++        }
+     };
+ 
+     class IopRpcBridge
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b498155..fa4be18 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -23,6 +23,7 @@ namespace ps2x::iop
+             coreServices.emplace_back(detail::createMcservService(host));
+             coreServices.emplace_back(detail::createDbcmanService(host));
+             coreServices.emplace_back(detail::createLibSdService(host));
++            coreServices.emplace_back(detail::createGow989SndService(host));
+             refreshServiceModuleKeys();
+             rebuildRoutes();
+         }
+diff --git a/ps2xIOP/src/module_factories.h b/ps2xIOP/src/module_factories.h
+index f0da295..57f6847 100644
+--- a/ps2xIOP/src/module_factories.h
++++ b/ps2xIOP/src/module_factories.h
+@@ -7,4 +7,5 @@ namespace ps2x::iop::detail
+     std::unique_ptr<IopService> createDbcmanService(IopHost &host);
+     std::unique_ptr<IopService> createLibSdService(IopHost &host);
+     std::unique_ptr<IopService> createMcservService(IopHost &host);
++    std::unique_ptr<IopService> createGow989SndService(IopHost &host);
+ }
+diff --git a/ps2xIOP/src/modules/dbcman.cpp b/ps2xIOP/src/modules/dbcman.cpp
+index c698a34..b040523 100644
+--- a/ps2xIOP/src/modules/dbcman.cpp
++++ b/ps2xIOP/src/modules/dbcman.cpp
+@@ -6,6 +6,8 @@
+ #include <mutex>
+ #include <sstream>
+ #include <string>
++#include <vector>
++#include <algorithm>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -54,6 +56,30 @@ namespace ps2x::iop::detail
+                 RpcResult result;
+                 if (request.sid != kDbcManSid)
+                 {
++                    // GOW-Port: servidores secundarios de dbcman (puertos/sockets del DualShock).
++                    // Responden con un buffer en cero para que libdbc pueda enlazarse y seguir.
++                    if (request.sid == 0x8000131cu || request.sid == 0x8000131eu || request.sid == 0x8000131fu)
++                    {
++                        result.handled = true;
++                        result.resultAddress = request.receive.address;
++                        if (request.receive.address != 0u && request.receive.size != 0u)
++                        {
++                            std::vector<uint32_t> zeros(std::min<uint32_t>(request.receive.size / 4u, 256u), 0u);
++                            (void)writeRpcWords(m_host, request.receive, zeros);
++                        }
++                        bool shouldLog = false;
++                        {
++                            std::lock_guard<std::mutex> lock(m_mutex);
++                            if (m_unknownRpcLogCount < kMaxUnknownRpcLogs) { ++m_unknownRpcLogCount; shouldLog = true; }
++                        }
++                        if (shouldLog)
++                        {
++                            std::ostringstream message;
++                            message << "[DBCMAN:sub] sid=0x" << std::hex << request.sid << " rpc=0x" << request.function
++                                    << " sendSize=0x" << request.send.size << " recvSize=0x" << request.receive.size;
++                            m_host.log(LogLevel::Info, message.str());
++                        }
++                    }
+                     return result;
+                 }
+ 
+@@ -120,7 +146,7 @@ namespace ps2x::iop::detail
+             }
+ 
+         private:
+-            inline static constexpr std::array<uint32_t, 1> kSids{kDbcManSid};
++            inline static constexpr std::array<uint32_t, 4> kSids{kDbcManSid, 0x8000131cu, 0x8000131eu, 0x8000131fu};
+             inline static constexpr std::array<std::string_view, 3> kModuleAliases{"dbcman", "dbcm", "dbcmserv"};
+ 
+             IopHost &m_host;
+diff --git a/ps2xIOP/src/modules/gow_stub_services.cpp b/ps2xIOP/src/modules/gow_stub_services.cpp
+new file mode 100644
+index 0000000..dd0c0db
+--- /dev/null
++++ b/ps2xIOP/src/modules/gow_stub_services.cpp
+@@ -0,0 +1,88 @@
++// GOW-Port: servicios IOP "mudos" para modulos que God of War carga y que el runtime
++// todavia no simula. Aceptan el enlace RPC y responden con un buffer en cero, para que
++// el juego no se quede esperando. No reproducen sonido ni guardan nada todavia.
++#include "module_factories.h"
++#include "rpc_reply.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <vector>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        template <size_t NSids, size_t NAliases>
++        class SilentService final : public IopService
++        {
++        public:
++            SilentService(IopHost &host, std::string_view name, uint32_t fill,
++                          std::array<uint32_t, NSids> sids,
++                          std::array<std::string_view, NAliases> aliases)
++                : m_host(host), m_name(name), m_fill(fill), m_sids(sids), m_aliases(aliases) {}
++
++            std::string_view name() const override { return m_name; }
++            std::span<const uint32_t> sids() const override { return m_sids; }
++            std::span<const std::string_view> moduleAliases() const override { return m_aliases; }
++            void reset() override { std::lock_guard<std::mutex> l(m_mutex); m_logs = 0; m_calls = 0; }
++
++            RpcResult handleRpc(const RpcRequest &request) override
++            {
++                RpcResult result;
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                if (request.receive.address != 0u && request.receive.size != 0u)
++                {
++                    std::vector<uint32_t> zeros(std::min<uint32_t>(request.receive.size / 4u, 1024u), 0u);
++                    // 989snd: la primera y la ultima palabra son marcas de "terminado" (-1);
++                    // las del medio son el resultado del comando (0 = OK / handle valido).
++                    if (m_fill != 0u && !zeros.empty()) { zeros.front() = m_fill; zeros.back() = m_fill; }
++                    (void)writeRpcWords(m_host, request.receive, zeros);
++                }
++                bool log = false;
++                {
++                    std::lock_guard<std::mutex> l(m_mutex);
++                    ++m_calls;
++                    if (m_logs < 24u) { ++m_logs; log = true; }
++                }
++                if (log)
++                {
++                    std::ostringstream m;
++                    m << "[" << m_name << ":silent] sid=0x" << std::hex << request.sid
++                      << " rpc=0x" << request.function << " sendSize=0x" << request.send.size
++                      << " recvSize=0x" << request.receive.size;
++                    m_host.log(LogLevel::Info, m.str());
++                }
++                return result;
++            }
++
++            void appendDebugMetrics(std::vector<DebugMetric> &metrics) const override
++            {
++                std::lock_guard<std::mutex> l(m_mutex);
++                metrics.push_back({"calls", m_calls, false});
++            }
++
++        private:
++            IopHost &m_host;
++            std::string_view m_name;
++            uint32_t m_fill;
++            std::array<uint32_t, NSids> m_sids;
++            std::array<std::string_view, NAliases> m_aliases;
++            mutable std::mutex m_mutex;
++            uint32_t m_logs = 0;
++            uint64_t m_calls = 0;
++        };
++    }
++
++    // Motor de sonido 989snd de Sony (989nomid.irx).
++    std::unique_ptr<IopService> createGow989SndService(IopHost &host)
++    {
++        return std::make_unique<SilentService<2, 3>>(host, "989snd", 0xFFFFFFFFu, // el driver marca "comando terminado" escribiendo -1
++            std::array<uint32_t, 2>{0x00123456u, 0x00123457u},
++            std::array<std::string_view, 3>{"989nomid", "989snd", "989err"});
++    }
++}
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..7d7ebc6 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -383,7 +383,10 @@ public:
+     uint32_t guestHeapBase() const;
+     uint32_t guestHeapEnd() const;
+     uint32_t guestHeapLimit() const;
+-    uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
++    uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment);
++    // GOW-Port: las pilas de interrupciones/callbacks se reservan desde lo alto de la RAM hacia abajo; este
++    // limite las mantiene por debajo de la pila del hilo principal (que SetupThread coloca tambien arriba).
++    void limitAsyncCallbackStackTop(uint32_t top);
+ 
+     void drainCompletedDmacHandlers(uint8_t *rdram);
+ 
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..c8a77c8 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -383,6 +383,8 @@ private:
+     void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
+     void applyPendingPreemption();
+     void processPendingEvents();
++    // GOW-Port: interrupcion INTC 0 (GS) en el flanco de subida de CSR.SIGNAL/FINISH no enmascarados en IMR.
++    void pollGsInterrupt();
+     void processDueDeadlines();
+     void processEvent(const EeEvent &event);
+     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..a3cba9e 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1638,8 +1638,10 @@ void EeScheduler::makeRunning(GuestThread &item)
+     renewTimeSlice();
+ }
+ 
++void gowDumpBranchRing(const char *why);
+ void EeScheduler::makeDormant(GuestThread &item)
+ {
++    { static int n = 0; if (item.id == 1 && n++ < 1) gowDumpBranchRing("main thread dormant"); }
+     removeReady(item);
+     removeFromWaitObject(item);
+     item.status = EeThreadStatus::Dormant;
+@@ -1740,6 +1742,31 @@ void EeScheduler::applyPendingPreemption()
+     m_timeSliceExpired = false;
+ }
+ 
++namespace
++{
++    // GOW-Port: estado del flanco de la interrupcion del GS (solo se usa en el hilo ejecutor). Se guarda
++    // aqui y no en EeScheduler para no cambiar el tamano de la clase.
++    uint32_t g_gsIrqLatched = 0u;
++}
++
++void EeScheduler::pollGsInterrupt()
++{
++    // GOW-Port: el runtime marcaba CSR.FINISH/SIGNAL pero nunca lanzaba la interrupcion del GS (INTC 0).
++    // God of War espera el fin de cada cadena DMA con un manejador de esa interrupcion
++    // (vid::WaitForDMAComplete se queda esperando una bandera que solo pone ese manejador).
++    // IMR: bit 8 = SIGMSK, bit 9 = FINISHMSK (1 = enmascarada). El manejador borra el bit escribiendo CSR.
++    auto &gs = m_runtime.memory().gs();
++    const uint32_t csr = static_cast<uint32_t>(gs.csr.load(std::memory_order_acquire)) & 0x3u;
++    const uint32_t masked = static_cast<uint32_t>(gs.imr >> 8) & 0x3u;
++    const uint32_t active = csr & ~masked;
++    const uint32_t rising = active & ~g_gsIrqLatched;
++    g_gsIrqLatched = active;
++    if (rising != 0u)
++    {
++        dispatchIrq(false, 0u);
++    }
++}
++
+ void EeScheduler::processPendingEvents()
+ {
+     assertExecutor();
+@@ -1753,6 +1780,7 @@ void EeScheduler::processPendingEvents()
+             dispatchIrq(false, 9u + timer);
+         }
+     }
++    pollGsInterrupt();
+     std::deque<EeEvent> pending;
+     {
+         std::lock_guard lock(m_eventMutex);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..4a4aafd 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -531,6 +531,19 @@ namespace ps2_syscalls
+         }
+ 
+         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
++
++        // GOW-Port: reservar la pila del hilo principal para que las pilas de interrupciones (que se toman
++        // desde lo alto de la RAM) no la pisen. Sin esto, cada interrupcion machacaba los marcos mas
++        // antiguos del hilo principal y este acababa saltando a basura (God of War: pc=0xF82).
++        if (runtime)
++        {
++            const uint32_t reserved = std::max<uint32_t>(stackSize, 0x10000u);
++            const uint32_t low = std::min(sp, initialStack != 0u ? initialStack : sp);
++            if (low > reserved)
++            {
++                runtime->limitAsyncCallbackStackTop(low - reserved);
++            }
++        }
+         setReturnU32(ctx, sp);
+     }
+ 
+@@ -571,7 +584,7 @@ namespace ps2_syscalls
+                           << std::dec << std::endl;
+             });
+ 
+-            setReturnU32(ctx, runtime->guestHeapBase());
++            setReturnU32(ctx, heapBase); // GOW-Port: el juego recibe su propio heap
+             return;
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..5a70830 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -7,6 +7,11 @@
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "ps2_log.h"
+ #include <atomic>
++#include <chrono>
++#include <cstdlib>
++#include <map>
++#include <string>
++#include <vector>
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+@@ -708,10 +713,142 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+     return result;
+ }
+ 
++namespace
++{
++    // GOW-Port: diagnostico del GS por variables de entorno.
++    //   PS2X_GS_DIAG=1            resumen cada 3 s de los estados de textura usados por las primitivas.
++    //   PS2X_GS_DUMP_SECONDS=a,b  volcado de la VRAM a gs_vram_<s>.bin a los a, b... segundos de la primera primitiva.
++    struct GsDiagState
++    {
++        bool enabled = std::getenv("PS2X_GS_DIAG") != nullptr;
++        std::vector<int> dumpSeconds;
++        size_t nextDump = 0u;
++        std::chrono::steady_clock::time_point start{};
++        std::chrono::steady_clock::time_point lastReport{};
++        std::map<std::string, uint64_t> textureStates;
++        std::map<uint64_t, GSTex0Reg> textures; // tbp0/psm/cbp -> TEX0, para decodificar en el volcado
++        uint64_t prims = 0u;
++        GsDiagState()
++        {
++            if (const char *v = std::getenv("PS2X_GS_DUMP_SECONDS"))
++            {
++                std::string text(v);
++                size_t pos = 0u;
++                while (pos < text.size())
++                {
++                    const size_t comma = text.find(',', pos);
++                    dumpSeconds.push_back(std::atoi(text.substr(pos, comma - pos).c_str()));
++                    if (comma == std::string::npos)
++                        break;
++                    pos = comma + 1u;
++                }
++            }
++        }
++    };
++
++    GsDiagState &gsDiag()
++    {
++        static GsDiagState state;
++        return state;
++    }
++}
++
+ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+ {
+     const GSDrawState &state = batch.state;
+     const auto &ctx = state.context;
++    {
++        GsDiagState &diag = gsDiag();
++        if (diag.enabled || !diag.dumpSeconds.empty())
++        {
++            const auto now = std::chrono::steady_clock::now();
++            if (diag.start == std::chrono::steady_clock::time_point{})
++                diag.start = diag.lastReport = now;
++            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - diag.start).count();
++            if (diag.enabled)
++            {
++                ++diag.prims;
++                if (state.prim.tme)
++                {
++                    char key[320];
++                    std::snprintf(key, sizeof(key),
++                                  "type=%u tbp0=%u tbw=%u psm=0x%x tw=%u th=%u tcc=%u tfx=%u cbp=%u cpsm=0x%x csm=%u csa=%u "
++                                  "texa=(%u,%u,%u) clamp=0x%llx abe=%u alpha=0x%llx test=0x%llx fst=%u fbp=%u fpsm=0x%x",
++                                  static_cast<unsigned>(state.prim.type), ctx.tex0.tbp0, static_cast<unsigned>(ctx.tex0.tbw),
++                                  static_cast<unsigned>(ctx.tex0.psm), static_cast<unsigned>(ctx.tex0.tw), static_cast<unsigned>(ctx.tex0.th),
++                                  static_cast<unsigned>(ctx.tex0.tcc), static_cast<unsigned>(ctx.tex0.tfx), ctx.tex0.cbp,
++                                  static_cast<unsigned>(ctx.tex0.cpsm), static_cast<unsigned>(ctx.tex0.csm), static_cast<unsigned>(ctx.tex0.csa),
++                                  static_cast<unsigned>(state.texa.ta0), static_cast<unsigned>(state.texa.aem), static_cast<unsigned>(state.texa.ta1),
++                                  static_cast<unsigned long long>(ctx.clamp), static_cast<unsigned>(state.prim.abe),
++                                  static_cast<unsigned long long>(ctx.alpha), static_cast<unsigned long long>(ctx.test),
++                                  static_cast<unsigned>(state.prim.fst), ctx.frame.fbp, static_cast<unsigned>(ctx.frame.psm));
++                    ++diag.textureStates[key];
++                    const uint64_t texKey = (static_cast<uint64_t>(ctx.tex0.tbp0) << 32) |
++                                            (static_cast<uint64_t>(ctx.tex0.psm) << 24) | ctx.tex0.cbp;
++                    diag.textures[texKey] = ctx.tex0;
++                }
++                if (now - diag.lastReport >= std::chrono::seconds(3))
++                {
++                    std::cerr << "[gs:diag] t=" << elapsed << "s prims=" << diag.prims << " estados de textura:" << std::endl;
++                    for (const auto &[key, count] : diag.textureStates)
++                        std::cerr << "[gs:diag]   " << count << " x " << key << std::endl;
++                    diag.textureStates.clear();
++                    diag.prims = 0u;
++                    diag.lastReport = now;
++                }
++            }
++            if (diag.nextDump < diag.dumpSeconds.size() && elapsed >= diag.dumpSeconds[diag.nextDump])
++            {
++                const std::string name = "gs_vram_" + std::to_string(diag.dumpSeconds[diag.nextDump]) + ".bin";
++                std::ofstream file(name, std::ios::binary);
++                if (m_vram && file)
++                    file.write(reinterpret_cast<const char *>(m_vram), static_cast<std::streamsize>(m_vramSize));
++                std::cerr << "[gs:diag] VRAM volcada en " << name << " (" << m_vramSize << " bytes)" << std::endl;
++                // Decodificar con las lecturas del propio runtime cada textura indexada vista.
++                for (const auto &[texKey, tex0] : diag.textures)
++                {
++                    const bool four = isFourBitIndexedPsm(tex0.psm);
++                    const bool eight = isEightBitIndexedPsm(tex0.psm);
++                    if (!four && !eight)
++                        continue;
++                    const uint32_t w = 1u << std::min<uint32_t>(tex0.tw, 10u);
++                    const uint32_t h = 1u << std::min<uint32_t>(tex0.th, 10u);
++                    const uint32_t entries = four ? 16u : 256u;
++                    std::vector<uint32_t> palette(entries, 0u);
++                    for (uint32_t e = 0; e < entries; ++e)
++                    {
++                        uint32_t sx = e & 0x0Fu, sy = e >> 4u;
++                        if (tex0.csm == 0u && !four)
++                        {
++                            const uint32_t si = swizzleClutIndexCSM1(e);
++                            sx = si & 0x0Fu;
++                            sy = si >> 4u;
++                        }
++                        palette[e] = ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, 1u, sx, sy);
++                    }
++                    const std::string base = "tex_" + std::to_string(diag.dumpSeconds[diag.nextDump]) + "s_" + std::to_string(tex0.tbp0);
++                    std::ofstream idx(base + "_idx.pgm", std::ios::binary);
++                    std::ofstream rgb(base + "_rgb.ppm", std::ios::binary);
++                    idx << "P5\n" << w << " " << h << "\n255\n";
++                    rgb << "P6\n" << w << " " << h << "\n255\n";
++                    for (uint32_t y = 0; y < h; ++y)
++                        for (uint32_t x = 0; x < w; ++x)
++                        {
++                            const uint32_t index = ReadTextureVramUnlocked(tex0.psm, tex0.tbp0, tex0.tbw, x, y) & (four ? 0x0Fu : 0xFFu);
++                            idx.put(static_cast<char>(four ? index * 17u : index));
++                            const uint32_t c = palette[index];
++                            const uint32_t a = std::min<uint32_t>((c >> 24) & 0xFFu, 0x80u);
++                            const uint32_t bg = (((x >> 3) ^ (y >> 3)) & 1u) ? 96u : 48u;
++                            for (int sh = 0; sh < 24; sh += 8)
++                                rgb.put(static_cast<char>((((c >> sh) & 0xFFu) * a + bg * (0x80u - a)) / 0x80u));
++                        }
++                    std::cerr << "[gs:diag]   textura " << base << " psm=0x" << std::hex << static_cast<unsigned>(tex0.psm)
++                              << std::dec << " " << w << "x" << h << " cbp=" << tex0.cbp << std::endl;
++                }
++                ++diag.nextDump;
++            }
++        }
++    }
+     PS2_IF_AGRESSIVE_LOGS({
+         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
+         if (primitiveIndex < 64u)
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 5658928..ea9171b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -4,8 +4,10 @@
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <sstream>
+@@ -1526,6 +1528,32 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+ 
+ void GS::vertexKick(bool drawing)
+ {
++    // GOW-Port: PS2X_GS_TRACE_TBP=<tbp0> registra los vertices que llegan con esa textura activa.
++    {
++        static const long traceTbp = []
++        {
++            const char *v = std::getenv("PS2X_GS_TRACE_TBP");
++            return v ? std::strtol(v, nullptr, 10) : -1L;
++        }();
++        static int traced = 0;
++        // PS2X_GS_TRACE_AFTER=<segundos>: empezar la traza pasados esos segundos desde el primer vertice.
++        static const long traceAfter = []
++        {
++            const char *v = std::getenv("PS2X_GS_TRACE_AFTER");
++            return v ? std::strtol(v, nullptr, 10) : 0L;
++        }();
++        static const auto traceStart = std::chrono::steady_clock::now();
++        const GSContext &tc = m_ctx[m_prim.ctxt ? 1 : 0];
++        if (traceTbp >= 0 && m_prim.tme && static_cast<long>(tc.tex0.tbp0) == traceTbp && traced < 400 &&
++            std::chrono::steady_clock::now() - traceStart >= std::chrono::seconds(traceAfter))
++        {
++            ++traced;
++            const GSVertex &v = m_vtxQueue[m_vtxCount % kMaxVerts];
++            std::cerr << "[gs:trace] prim=" << static_cast<unsigned>(m_prim.type) << " draw=" << drawing
++                      << " cnt=" << m_vtxCount << " xy=(" << v.x << "," << v.y << ") stq=(" << v.s << "," << v.t
++                      << "," << v.q << ") uv=(" << (v.u >> 4) << "," << (v.v >> 4) << ")" << std::endl;
++        }
++    }
+     ++m_vtxCount;
+     ++m_vtxIndex;
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..b505b2d 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1342,6 +1342,19 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+     }
+ }
+ 
++// GOW-Port branch trace ring
++struct GowBranchRec { uint32_t src, dst, ra, kind; };
++GowBranchRec g_gowRing[256]; std::atomic<uint32_t> g_gowRingPos{0};
++void gowDumpBranchRing(const char *why)
++{
++    uint32_t pos = g_gowRingPos.load();
++    std::fprintf(stderr, "[gow-trace] %s, last branches (oldest first):\n", why);
++    for (uint32_t i = 0; i < 256; ++i) {
++        const GowBranchRec &r = g_gowRing[(pos + i) & 255u];
++        if (r.src == 0 && r.dst == 0) continue;
++        std::fprintf(stderr, "  src=%08x dst=%08x ra=%08x kind=%u\n", r.src, r.dst, r.ra, r.kind);
++    }
++}
+ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      uint32_t targetPc,
+@@ -1350,6 +1363,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      GuestBranchKind kind,
+                                      const char *debugName)
+ {
++    { uint32_t k = g_gowRingPos.fetch_add(1) & 255u; g_gowRing[k] = {sourcePc, targetPc, ctx ? (uint32_t)_mm_cvtsi128_si32(ctx->r[31]) : 0u, (uint32_t)kind}; }
++
+     ctx->pc = targetPc;
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+ 
+@@ -1638,6 +1653,10 @@ uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
+ 
+ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+ {
++    // GOW-Port: el heap privado del runtime vive en 0x000A0000-0x000FF000 (memoria libre
++    // bajo el ELF) para no pisar el heap propio del juego, que empieza al final del .bss.
++    guestBase = 0x000A0000u;
++    guestLimit = 0x000FF000u;
+     uint32_t base = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
+     uint32_t limit = clampGuestHeapLimit(guestLimit);
+     if (base == 0u)
+@@ -1975,6 +1994,18 @@ uint32_t PS2Runtime::guestHeapLimit() const
+     return m_guestHeapConfigured ? m_guestHeapLimit : m_guestHeapSuggestedBase;
+ }
+ 
++void PS2Runtime::limitAsyncCallbackStackTop(uint32_t top)
++{
++    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
++    top &= ~(kGuestHeapDefaultAlignment - 1u);
++    if (top > m_asyncCallbackStackFloor && top < m_asyncCallbackStackTop)
++    {
++        m_asyncCallbackStackTop = top;
++    }
++    std::cerr << "[stack] pilas de interrupciones por debajo de 0x" << std::hex << m_asyncCallbackStackTop
++              << " (suelo 0x" << m_asyncCallbackStackFloor << ")" << std::dec << std::endl;
++}
++
+ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment)
+ {
+     if (size == 0u)
+@@ -2418,6 +2449,24 @@ void PS2Runtime::run()
+                                                << " vif=" << curVif
+                                                << std::endl);
+ 
++                // GOW-Port: estado de cada hilo del EE (cada 600 marcas, ~10 s).
++                if ((tick % 600) == 0)
++                {
++                    for (const auto &thread : eeSnapshot.threads)
++                    {
++                        RUNTIME_LOG("[run:thread] id=" << thread.id
++                                                       << " status=" << static_cast<int>(thread.status)
++                                                       << " wait=" << static_cast<int>(thread.waitReason)
++                                                       << " waitId=" << thread.waitId
++                                                       << " prio=" << thread.currentPriority
++                                                       << " pc=0x" << std::hex << thread.pc
++                                                       << " ra=0x" << thread.ra
++                                                       << " sp=0x" << thread.sp
++                                                       << " entry=0x" << thread.entry << std::dec
++                                                       << (thread.id == eeSnapshot.runningThreadId ? " (corriendo)" : "")
++                                                       << std::endl);
++                    }
++                }
+             }
+         });
+         uint32_t presentWidth = FB_WIDTH;

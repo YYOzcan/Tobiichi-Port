@@ -1,0 +1,673 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -9,6 +9,7 @@
+ #include <vector>
+ 
+ #include "runtime/gs/gs_backend.h"
++#include "runtime/gs/ps2_gif_arbiter.h" // GOW-Port: conservar el origen de cada flujo GIF.
+ 
+ struct GSDebugSnapshot
+ {
+@@ -106,8 +107,9 @@
+     void reset();
+     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
+ 
+-    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+-    bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
++    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes, GifPathId path = GifPathId::Path1);
++    bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes, GifPathId path = GifPathId::Path1);
++    bool hasPendingGIFPacket(GifPathId path) const; // GOW-Port: los atajos DMA no pueden saltarse un flujo pendiente.
+     void uploadImageNative(uint64_t bitbltbuf,
+                            uint64_t trxpos,
+                            uint64_t trxreg,
+@@ -184,6 +186,18 @@
+     mutable std::mutex m_backendLifetimeMutex;
+     mutable std::mutex m_presentationMutex;
+ 
++    // GOW-Port: cursor acotado por PATH, sin almacenar paquetes ni payloads completos.
++    struct GifInputState
++    {
++        std::array<uint8_t, 16> partial{};
++        std::array<uint8_t, 16> regs{};
++        uint32_t partialBytes = 0u, registersLeft = 0u, imageBytes = 0u, paddingBytes = 0u;
++        uint32_t nreg = 0u, regIndex = 0u;
++        uint8_t format = 0u;
++        bool pending() const { return partialBytes || registersLeft || imageBytes || paddingBytes; }
++    };
++    std::array<GifInputState, 4> m_gifInput{};
++
+     GSContext m_ctx[2];
+     GSPrimReg m_prim{};
+     GSPrimReg m_primRegister{};
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+--- a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+@@ -24,11 +24,15 @@
+ {
+ public:
+     using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t)>;
++    // GOW-Port: identificar el flujo sin romper los callbacks existentes de dos argumentos.
++    using ProcessPathPacketFn = std::function<void(GifPathId, const uint8_t *, uint32_t)>;
+ 
+     GifArbiter() = default;
+     explicit GifArbiter(ProcessPacketFn processFn);
+ 
+-    void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
++    void setProcessPacketFn(ProcessPacketFn fn);
++    void setProcessPathPacketFn(ProcessPathPacketFn fn) { m_processFn = std::move(fn); }
++    void reset() { m_queue.clear(); }
+ 
+     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
+ 
+@@ -36,7 +40,7 @@
+     bool empty() const { return m_queue.empty(); }
+ 
+ private:
+-    ProcessPacketFn m_processFn;
++    ProcessPathPacketFn m_processFn;
+     std::vector<GifArbiterPacket> m_queue;
+ 
+     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -407,7 +407,6 @@
+     uint8_t *m_vu1Code = nullptr;
+     uint8_t *m_vu1Data = nullptr;
+     bool m_path3Masked = false;
+-    uint32_t m_vif1PendingPath2ImageQwc = 0u;
+     // GOW-Port: DIRECT fragmentado es distinto de una IMAGE entre comandos DIRECT completos.
+     uint32_t m_vif1DirectBytesRemaining = 0u;
+     bool m_vif1DirectHl = false;
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -131,6 +131,7 @@
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     std::memset(m_ctx, 0, sizeof(m_ctx));
++    m_gifInput = {}; // GOW-Port: reset tambien descarta etiquetas/registros incompletos.
+     m_prim = {};
+     m_primRegister = {};
+     m_prmodeRegister = {};
+@@ -643,19 +644,29 @@
+     return true;
+ }
+ 
+-void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
++// GOW-Port: los atajos nativos solo son validos al comienzo de una etiqueta de este PATH.
++bool GS::hasPendingGIFPacket(GifPathId path) const
++{
++    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const size_t index = static_cast<size_t>(path);
++    return index == 0u || index >= m_gifInput.size() || m_gifInput[index].pending();
++}
++
++void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, GifPathId path)
+ {
+     ps2_perf::Scope perf(ps2_perf::Bucket::Gs); // GOW-Port: incluye rasterizado y transferencias GIF.
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+-    if (!data || sizeBytes < 16 || !m_backend)
++    const size_t pathIndex = static_cast<size_t>(path);
++    if (!data || !sizeBytes || !m_backend || pathIndex == 0u || pathIndex >= m_gifInput.size())
+         return;
+ 
+-    if (tryProcessNativeImageUploadPacket(data, sizeBytes))
++    auto &input = m_gifInput[pathIndex];
++    if (!input.pending() && tryProcessNativeImageUploadPacket(data, sizeBytes))
+         return;
+ 
+     PS2_IF_AGRESSIVE_LOGS({
+         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
+-        if (packetIndex < 48u)
++        if (packetIndex < 48u && sizeBytes >= 16u)
+         {
+             const uint64_t tagLo = loadLE64(data);
+             const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+@@ -674,81 +685,91 @@
+         }
+     });
+ 
+-    uint32_t offset = 0;
+-    while (offset + 16 <= sizeBytes)
+-    {
+-        uint64_t tagLo = loadLE64(data + offset);
+-        uint64_t tagHi = loadLE64(data + offset + 8);
+-        offset += 16;
+-
+-        uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFF);
+-        uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3);
+-        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
+-        if (nreg == 0)
+-            nreg = 16;
+-
+-        recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
+-
+-        // GOW-Port: NLOOP=0 no emite registros; conserva PRIM, la cola de vertices y Q.
+-        if (nloop == 0u)
++    // GOW-Port: como maximo se retienen 15 bytes por PATH, mas el cursor de la etiqueta.
++    // No reiniciar Q/PRE ni perder el indice de registro al llegar otro fragmento.
++    uint32_t offset = 0u;
++    while (offset < sizeBytes)
++    {
++        if (input.imageBytes && !input.partialBytes && sizeBytes - offset >= 16u)
++        {
++            // Mantener las subidas contiguas grandes; no llamar al backend por cada quadword.
++            const uint32_t bytes = std::min(input.imageBytes, sizeBytes - offset) & ~15u;
++            processImageData(data + offset, bytes);
++            input.imageBytes -= bytes;
++            offset += bytes;
+             continue;
+-        m_curQ = 1.0f;
+-        // GOW-Port: PRE/PRIM solo tienen efecto en PACKED, no en REGLIST ni IMAGE.
+-        bool pre = flg == GIF_FMT_PACKED && ((tagLo >> 46) & 1) != 0;
+-        if (pre)
+-        {
+-            writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
+-        }
+-
+-        uint8_t regs[16];
+-        for (uint32_t i = 0; i < nreg; ++i)
+-            regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
+-
+-        if (flg == GIF_FMT_PACKED)
+-        {
+-            for (uint32_t loop = 0; loop < nloop; ++loop)
++        }
++        if (!input.registersLeft && input.paddingBytes)
++        {
++            const uint32_t bytes = std::min(input.paddingBytes, sizeBytes - offset);
++            input.paddingBytes -= bytes;
++            offset += bytes;
++            continue;
++        }
++
++        const bool header = !input.registersLeft && !input.imageBytes;
++        const uint32_t unitBytes = !header && input.format == GIF_FMT_REGLIST ? 8u : 16u;
++        const uint8_t *unit = nullptr;
++        if (!input.partialBytes && sizeBytes - offset >= unitBytes)
++        {
++            unit = data + offset;
++            offset += unitBytes;
++        }
++        else
++        {
++            const uint32_t bytes = std::min(unitBytes - input.partialBytes, sizeBytes - offset);
++            std::memcpy(input.partial.data() + input.partialBytes, data + offset, bytes);
++            input.partialBytes += bytes;
++            offset += bytes;
++            if (input.partialBytes < unitBytes) break;
++            unit = input.partial.data();
++            input.partialBytes = 0u;
++        }
++
++        if (header)
++        {
++            const uint64_t tagLo = loadLE64(unit), tagHi = loadLE64(unit + 8u);
++            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
++            input.format = static_cast<uint8_t>((tagLo >> 58u) & 0x3u);
++            input.nreg = static_cast<uint32_t>((tagLo >> 60u) & 0xFu);
++            if (!input.nreg) input.nreg = 16u;
++            input.regIndex = 0u;
++            recordGifTagDebugEventUnlocked(sizeBytes, nloop, input.format, input.nreg);
++            if (!nloop) continue; // NLOOP=0 conserva PRIM, vertices y Q.
++            m_curQ = 1.0f;
++            if (input.format == GIF_FMT_PACKED && ((tagLo >> 46u) & 1u))
++                writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47u) & 0x7FFu);
++            for (uint32_t i = 0u; i < input.nreg; ++i)
++                input.regs[i] = static_cast<uint8_t>((tagHi >> (i * 4u)) & 0xFu);
++            if (input.format == GIF_FMT_PACKED || input.format == GIF_FMT_REGLIST)
+             {
+-                for (uint32_t r = 0; r < nreg; ++r)
+-                {
+-                    if (offset + 16 > sizeBytes)
+-                        return;
+-                    uint64_t lo = loadLE64(data + offset);
+-                    uint64_t hi = loadLE64(data + offset + 8);
+-                    offset += 16;
+-                    writeRegisterPacked(regs[r], lo, hi);
+-                }
++                input.registersLeft = nloop * input.nreg;
++                input.paddingBytes = input.format == GIF_FMT_REGLIST && (input.registersLeft & 1u) ? 8u : 0u;
+             }
+-        }
+-        else if (flg == GIF_FMT_REGLIST)
+-        {
+-            for (uint32_t loop = 0; loop < nloop; ++loop)
+-            {
+-                for (uint32_t r = 0; r < nreg; ++r)
+-                {
+-                    if (offset + 8 > sizeBytes)
+-                        return;
+-                    writeRegisterUnlocked(regs[r], loadLE64(data + offset));
+-                    offset += 8;
+-                }
+-            }
+-            if ((nloop * nreg) & 1)
+-                offset += 8;
+-        }
+-        else if (flg == GIF_FMT_IMAGE)
+-        {
+-            uint32_t imageBytes = nloop * 16;
+-            if (offset + imageBytes > sizeBytes)
+-                imageBytes = sizeBytes - offset;
+-            processImageData(data + offset, imageBytes);
+-            offset += imageBytes;
+-        }
+-    }
+-}
+-
+-bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
++            else if (input.format == GIF_FMT_IMAGE)
++                input.imageBytes = nloop * 16u;
++        }
++        else if (input.imageBytes)
++        {
++            processImageData(unit, 16u);
++            input.imageBytes -= 16u;
++        }
++        else
++        {
++            if (input.format == GIF_FMT_PACKED)
++                writeRegisterPacked(input.regs[input.regIndex], loadLE64(unit), loadLE64(unit + 8u));
++            else
++                writeRegisterUnlocked(input.regs[input.regIndex], loadLE64(unit));
++            if (++input.regIndex == input.nreg) input.regIndex = 0u;
++            --input.registersLeft;
++        }
++    }
++}
++
++bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes, GifPathId path)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+-    if (!data || sizeBytes < 16u || !m_backend)
++    if (!data || sizeBytes < 16u || !m_backend || hasPendingGIFPacket(path))
+         return false;
+ 
+     if (!validatePackedGifPacket(data, sizeBytes))
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -3,8 +3,15 @@
+ #include <cstring>
+ 
+ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+-    : m_processFn(std::move(processFn))
+ {
++    setProcessPacketFn(std::move(processFn));
++}
++
++// GOW-Port: compatibilidad con clientes que no necesitan el identificador del PATH.
++void GifArbiter::setProcessPacketFn(ProcessPacketFn fn)
++{
++    if (!fn) { m_processFn = {}; return; }
++    m_processFn = [fn = std::move(fn)](GifPathId, const uint8_t *data, uint32_t size) { fn(data, size); };
+ }
+ 
+ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -58,7 +65,7 @@
+         {
+             auto &pkt = m_queue[i];
+             if (!pkt.data.empty())
+-                m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++                m_processFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+         size_t path2 = path2Begin, path3 = path2End;
+         while (path2 < path2End || path3 < count)
+@@ -69,7 +76,7 @@
+                 (path3 == count || !m_queue[path2].path2DirectHl || !m_queue[path3].path3Image);
+             auto &pkt = m_queue[takePath2 ? path2++ : path3++];
+             if (!pkt.data.empty())
+-                m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++                m_processFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+         // GOW-Port: conservar los paquetes que el callback haya añadido; se procesan en otra tanda.
+         m_queue.erase(m_queue.begin(), m_queue.begin() + count);
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -329,7 +329,6 @@
+     m_codeRegions.clear();
+     m_path3Masked = false;
+     m_path3MaskedFifo.clear();
+-    m_vif1PendingPath2ImageQwc = 0u;
+     // GOW-Port: descartar cualquier DIRECT incompleto al inicializar VIF1.
+     m_vif1DirectBytesRemaining = 0u;
+     m_vif1DirectHl = false;
+@@ -1232,7 +1231,6 @@
+             {
+                 const bool wasPath3Masked = m_path3Masked;
+                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
+-                m_vif1PendingPath2ImageQwc = 0u;
+                 // GOW-Port: FBRST también descarta la carga DIRECT pendiente y su prioridad.
+                 m_vif1DirectBytesRemaining = 0u;
+                 m_vif1DirectHl = false;
+@@ -2013,7 +2011,8 @@
+     static constexpr uint32_t D_STAT = 0x1000E010u;
+     static constexpr uint32_t D_CTRL = 0x1000E000u;
+ 
+-    if (!m_rdram || !m_gsVRAM || m_path3Masked)
++    // GOW-Port: una etiqueta/payload pendiente debe completarse por el parser PATH3.
++    if (!m_rdram || !m_gsVRAM || m_path3Masked || gs.hasPendingGIFPacket(GifPathId::Path3))
+         return false;
+     if (m_gifArbiter && !m_gifArbiter->empty())
+         return false;
+@@ -2253,7 +2252,7 @@
+     const uint8_t *payload = nullptr;
+     if (!resolveContiguous(tadr + 16u, payloadBytes, payload))
+         return false;
+-    if (!gs.processNativePackedGIFPacket(payload, payloadBytes))
++    if (!gs.processNativePackedGIFPacket(payload, payloadBytes, GifPathId::Path3))
+         return false;
+ 
+     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -724,8 +724,10 @@
+     }
+ 
+     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+-                                    { m_gs.processGIFPacket(data, size); });
++    // GOW-Port: cada flujo conserva su cursor GIF, incluso cuando otro PATH lo interrumpe.
++    m_gifArbiter.reset();
++    m_gifArbiter.setProcessPathPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
++                                    { m_gs.processGIFPacket(data, size, path); });
+     m_memory.setGifArbiter(&m_gifArbiter);
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -30,61 +30,6 @@
+     VIF_DIRECTHL = 0x51,
+ };
+ 
+-namespace
+-{
+-    constexpr uint8_t kGifFmtImage = 2u;
+-
+-    uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
+-    {
+-        if (!data || sizeBytes < 16u)
+-            return 0u;
+-
+-        uint32_t offset = 0u;
+-        while (offset + 16u <= sizeBytes)
+-        {
+-            uint64_t tagLo = 0u;
+-            std::memcpy(&tagLo, data + offset, sizeof(tagLo));
+-            offset += 16u;
+-
+-            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+-            const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
+-            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+-            if (nreg == 0u)
+-                nreg = 16u;
+-
+-            uint64_t payloadBytes = 0u;
+-            if (flg == 0u) // PACKED
+-            {
+-                payloadBytes = static_cast<uint64_t>(nloop) * nreg * 16ull;
+-            }
+-            else if (flg == 1u) // REGLIST, padded to a quadword
+-            {
+-                payloadBytes = static_cast<uint64_t>(nloop) * nreg * 8ull;
+-                payloadBytes = (payloadBytes + 15ull) & ~15ull;
+-            }
+-            else if (flg == kGifFmtImage)
+-            {
+-                payloadBytes = static_cast<uint64_t>(nloop) * 16ull;
+-                const uint64_t availableBytes = sizeBytes - offset;
+-                if (payloadBytes > availableBytes)
+-                {
+-                    return static_cast<uint32_t>((payloadBytes - availableBytes) / 16ull);
+-                }
+-            }
+-            else
+-            {
+-                return 0u;
+-            }
+-
+-            if (payloadBytes > static_cast<uint64_t>(sizeBytes - offset))
+-                return 0u;
+-            offset += static_cast<uint32_t>(payloadBytes);
+-        }
+-
+-        return 0u;
+-    }
+-}
+-
+ void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
+@@ -299,31 +244,11 @@
+     processVIF1Data(m_rdram + srcPhys, sizeBytes);
+ }
+ 
+-// GOW-Port: el GS recibe una carga DIRECT completa; IMAGE puede continuar en otro DIRECT.
++// GOW-Port: enviar los bytes originales; el cursor GIF por PATH conserva PACKED/REGLIST/IMAGE.
++// No anteponer otra etiqueta IMAGE a un payload que ya continua una etiqueta abierta.
+ void PS2Memory::submitVif1DirectPayload(const uint8_t *data, uint32_t sizeBytes, bool directHl)
+ {
+-    const uint32_t qwCount = sizeBytes / 16u;
+-    uint32_t imageQw = 0u;
+-    if (m_vif1PendingPath2ImageQwc != 0u)
+-    {
+-        imageQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, qwCount);
+-        std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(imageQw) * 16u, 0u);
+-        const uint64_t imageTag =
+-            static_cast<uint64_t>(imageQw & 0x7FFFu) |
+-            ((m_vif1PendingPath2ImageQwc == imageQw) ? (1ull << 15) : 0ull) |
+-            (static_cast<uint64_t>(kGifFmtImage) << 58);
+-        std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+-        std::memcpy(imagePacket.data() + 16u, data, static_cast<size_t>(imageQw) * 16u);
+-        submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, directHl);
+-        m_vif1PendingPath2ImageQwc -= imageQw;
+-    }
+-    if (imageQw < qwCount)
+-    {
+-        const uint8_t *packets = data + imageQw * 16u;
+-        const uint32_t packetBytes = sizeBytes - imageQw * 16u;
+-        submitGifPacket(GifPathId::Path2, packets, packetBytes, true, directHl);
+-        m_vif1PendingPath2ImageQwc = pendingGifImageQwc(packets, packetBytes);
+-    }
++    submitGifPacket(GifPathId::Path2, data, sizeBytes, true, directHl);
+ }
+ 
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -239,6 +239,136 @@
+ void register_ps2_gs_backend_tests()
+ {
+     MiniTest::Case("GOW GS backends", [](TestCase &t) {
++        // GOW-Port: continuidad GIF entre envios, incluidos cortes dentro de etiquetas y registros.
++        t.Run("PACKED GIF resumes A+D registers across every byte split", [](TestCase &t) {
++            const uint64_t packet[]={2ull|(1ull<<15)|(1ull<<46)|(uint64_t(GS_PRIM_SPRITE)<<47)|(1ull<<60),0xeull,
++                                     7ull,GS_REG_COLCLAMP,1ull,GS_REG_DTHE};
++            const auto *bytes=reinterpret_cast<const uint8_t *>(packet);
++            bool complete=true;
++            for(uint32_t cut=0;cut<=sizeof(packet);++cut)
++            {
++                std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
++                gs.writeRegister(GS_REG_PRIM,GS_PRIM_TRIANGLE);
++                gs.processGIFPacket(bytes,cut); gs.processGIFPacket(bytes+cut,uint32_t(sizeof(packet))-cut);
++                const auto s=gs.getDebugSnapshot();
++                complete &= s.colclamp==7u && s.dthe==1u && s.prim.type==GS_PRIM_SPRITE;
++            }
++            t.IsTrue(complete,"A+D y PRE conservan su significado para todos los cortes, sin nuevas etiquetas ficticias");
++        });
++        t.Run("PACKED GIF resumes register cursor and ST Q across fragments", [](TestCase &t) {
++            const uint64_t packet[]={1ull|(1ull<<15)|(1ull<<46)|(3ull<<60),0x512ull,
++                0x402000003fc00000ull,0x40000000ull,
++                0x0000002200000011ull,0x0000008000000033ull,
++                0x0000001000000010ull,1ull};
++            const auto *bytes=reinterpret_cast<const uint8_t *>(packet);
++            bool complete=true;
++            for(uint32_t cut=0;cut<=sizeof(packet);++cut)
++            {
++                Recording r; std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
++                gs.setRasterBackend(std::make_unique<Recorder>(r));
++                gs.processGIFPacket(bytes,cut); gs.processGIFPacket(bytes+cut,uint32_t(sizeof(packet))-cut);
++                complete &= r.draws.size()==1u;
++                if(r.draws.size()==1u)
++                {
++                    const auto &v=r.draws[0].vertices[0];
++                    complete &= v.s==1.5f && v.t==2.5f && v.q==2.0f && v.r==0x11u && v.g==0x22u && v.b==0x33u;
++                }
++            }
++            t.IsTrue(complete,"El cursor ST/RGBAQ/XYZ y Q sobreviven sin repetir PRE ni reiniciar Q");
++        });
++        t.Run("REGLIST GIF preserves odd padding and the following tag across fragments", [](TestCase &t) {
++            const uint64_t packet[]={1ull|(1ull<<15)|(uint64_t(GIF_FMT_REGLIST)<<58)|(3ull<<60),0x760ull,
++                uint64_t(GS_PRIM_TRIANGLE),11ull,22ull,0xffffffffffffffffull,
++                1ull|(1ull<<15)|(1ull<<60),0xeull,7ull,GS_REG_COLCLAMP};
++            const auto *bytes=reinterpret_cast<const uint8_t *>(packet);
++            bool complete=true;
++            for(uint32_t cut=0;cut<=sizeof(packet);++cut)
++            {
++                std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
++                gs.processGIFPacket(bytes,cut); gs.processGIFPacket(bytes+cut,uint32_t(sizeof(packet))-cut);
++                const auto s=gs.getDebugSnapshot();
++                complete &= s.prim.type==GS_PRIM_TRIANGLE && s.ctx[0].tex0.tbp0==11u && s.ctx[1].tex0.tbp0==22u && s.colclamp==7u;
++            }
++            t.IsTrue(complete,"Los tres registros, su padding de ocho bytes y la etiqueta siguiente permanecen separados");
++        });
++        t.Run("IMAGE GIF preserves payload bytes and the following tag across fragments", [](TestCase &t) {
++            const uint64_t packet[]={2ull|(1ull<<15)|(uint64_t(GIF_FMT_IMAGE)<<58),0ull,
++                0x8044556680112233ull,0x80aabbcc80778899ull,0x8033221180665544ull,0x8099887780ccbbaaull,
++                1ull|(1ull<<15)|(1ull<<60),0xeull,7ull,GS_REG_COLCLAMP};
++            const auto *bytes=reinterpret_cast<const uint8_t *>(packet);
++            bool complete=true;
++            for(uint32_t cut=0;cut<=sizeof(packet);++cut)
++            {
++                Recording r; std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
++                gs.setRasterBackend(std::make_unique<Recorder>(r));
++                gs.writeRegister(GS_REG_BITBLTBUF,(96ull<<32)|(1ull<<48));
++                gs.writeRegister(GS_REG_TRXREG,8ull|(1ull<<32)); gs.writeRegister(GS_REG_TRXDIR,0);
++                gs.processGIFPacket(bytes,cut); gs.processGIFPacket(bytes+cut,uint32_t(sizeof(packet))-cut);
++                complete &= r.uploaded.size()==32u && gs.getDebugSnapshot().colclamp==7u;
++                if(r.uploaded.size()==32u) complete &= std::memcmp(r.uploaded.data(),bytes+16u,32u)==0;
++            }
++            t.IsTrue(complete,"IMAGE no interpreta el siguiente fragmento de pixeles como otra etiqueta");
++        });
++        t.Run("GS reset discards partial GIF input before the next packet", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
++            const uint64_t partial[]={2ull|(1ull<<60),0xeull,5ull,GS_REG_COLCLAMP};
++            gs.processGIFPacket(reinterpret_cast<const uint8_t *>(partial),sizeof(partial));
++            t.IsTrue(gs.hasPendingGIFPacket(GifPathId::Path1),"La etiqueta conserva su segundo registro pendiente");
++            gs.reset();
++            t.IsTrue(!gs.hasPendingGIFPacket(GifPathId::Path1),"Reset limpia el cursor");
++            const uint64_t next[]={1ull|(1ull<<15)|(1ull<<60),0xeull,1ull,GS_REG_DTHE};
++            gs.processGIFPacket(reinterpret_cast<const uint8_t *>(next),sizeof(next));
++            t.Equals(gs.getDebugSnapshot().dthe,1ull,"Reset elimina la etiqueta incompleta anterior");
++        });
++        t.Run("GIF preserves independent PACKED and REGLIST cursors on interleaved paths", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
++            const uint64_t path2[]={2ull|(1ull<<60),0xeull,7ull,GS_REG_COLCLAMP};
++            gs.processGIFPacket(reinterpret_cast<const uint8_t *>(path2),sizeof(path2),GifPathId::Path2);
++            const uint64_t path3[]={1ull|(uint64_t(GIF_FMT_REGLIST)<<58)|(3ull<<60),0x760ull,uint64_t(GS_PRIM_TRIANGLE)};
++            gs.processGIFPacket(reinterpret_cast<const uint8_t *>(path3),sizeof(path3),GifPathId::Path3);
++            const uint64_t path1[]={1ull|(1ull<<15)|(1ull<<60),0xeull,2ull,GS_REG_DTHE};
++            gs.processGIFPacket(reinterpret_cast<const uint8_t *>(path1),sizeof(path1),GifPathId::Path1);
++            const uint64_t end2[]={1ull,GS_REG_DTHE},end3[]={11ull,22ull,0xffffffffffffffffull};
++            gs.processGIFPacket(reinterpret_cast<const uint8_t *>(end2),sizeof(end2),GifPathId::Path2);
++            gs.processGIFPacket(reinterpret_cast<const uint8_t *>(end3),sizeof(end3),GifPathId::Path3);
++            const auto s=gs.getDebugSnapshot();
++            t.IsTrue(s.colclamp==7u && s.dthe==1u && s.ctx[0].tex0.tbp0==11u && s.ctx[1].tex0.tbp0==22u,
++                     "Los registros globales se aplican en orden, sin compartir el cursor del parser");
++            for(const auto path : {GifPathId::Path1,GifPathId::Path2,GifPathId::Path3})
++                t.IsTrue(!gs.hasPendingGIFPacket(path),"Los tres PATH terminan sus etiquetas");
++        });
++        t.Run("native PACKED shortcut cannot bypass a pending GIF tag on its path", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
++            const uint64_t partial[]={2ull|(1ull<<60),0xeull,7ull,GS_REG_COLCLAMP};
++            gs.processGIFPacket(reinterpret_cast<const uint8_t *>(partial),sizeof(partial),GifPathId::Path3);
++            const uint64_t packet[]={1ull|(1ull<<15)|(1ull<<60),0xeull,1ull,GS_REG_DTHE};
++            t.IsTrue(!gs.processNativePackedGIFPacket(reinterpret_cast<const uint8_t *>(packet),sizeof(packet),GifPathId::Path3),
++                     "El atajo devuelve false sin consumir el fragmento ni alterar registros");
++            t.Equals(gs.nativePackedGIFPacketCount(),uint64_t(0),"No contar un atajo rechazado");
++            t.IsTrue(gs.processNativePackedGIFPacket(reinterpret_cast<const uint8_t *>(packet),sizeof(packet),GifPathId::Path1),
++                     "Otro PATH completo puede usar el atajo");
++            const uint64_t end[]={2ull,GS_REG_DTHE};
++            gs.processGIFPacket(reinterpret_cast<const uint8_t *>(end),sizeof(end),GifPathId::Path3);
++            t.Equals(gs.getDebugSnapshot().dthe,2ull,"La continuacion real PATH3 sigue intacta");
++            t.IsTrue(gs.processNativePackedGIFPacket(reinterpret_cast<const uint8_t *>(packet),sizeof(packet),GifPathId::Path3),
++                     "El mismo PATH puede usar el atajo despues de completar su etiqueta");
++            t.Equals(gs.getDebugSnapshot().dthe,1ull,"El paquete nativo posterior se procesa");
++        });
++        t.Run("GIF NREG zero retains all sixteen register slots across fragments", [](TestCase &t) {
++            std::vector<uint64_t> packet={1ull|(1ull<<15),0xefffffffffffffffull};
++            for(unsigned i=0;i<15u;++i) {packet.push_back(0u);packet.push_back(0u);}
++            packet.push_back(7u);packet.push_back(GS_REG_COLCLAMP);
++            const auto *bytes=reinterpret_cast<const uint8_t *>(packet.data());
++            const uint32_t size=uint32_t(packet.size()*8u);
++            bool complete=true;
++            for(uint32_t cut=0;cut<=size;++cut)
++            {
++                std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
++                gs.processGIFPacket(bytes,cut);gs.processGIFPacket(bytes+cut,size-cut);
++                complete &= gs.getDebugSnapshot().colclamp==7u && !gs.hasPendingGIFPacket(GifPathId::Path1);
++            }
++            t.IsTrue(complete,"NREG=0 significa dieciseis, incluido el ultimo A+D");
++        });
+         // GOW-Port: etiquetas vacias y PRE no deben cambiar la geometria que sigue.
+         t.Run("empty GIFtags ignore PRE in generic and native PACKED paths", [](TestCase &t) {
+             std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -2282,6 +2282,33 @@
+             t.IsTrue(imageOk, "the next DIRECT payload should continue the PATH2 image upload");
+         });
+ 
++        // GOW-Port: una etiqueta PACKED tambien puede cruzar varios comandos DIRECT/HL.
++        tc.Run("VIF1 DIRECT preserves a PACKED tag across separate commands and MARK", [](TestCase &t)
++        {
++            PS2Memory mem; t.IsTrue(mem.initialize(),"Inicializar memoria");
++            GS gs; gs.init(mem.getGSVRAM(),static_cast<uint32_t>(PS2_GS_VRAM_SIZE),&mem.gs());
++            GifArbiter arbiter;
++            std::vector<GifPathId> paths;
++            arbiter.setProcessPathPacketFn([&](GifPathId path,const uint8_t *data,uint32_t size) {
++                paths.push_back(path); gs.processGIFPacket(data,size,path);
++            });
++            mem.setGifArbiter(&arbiter);
++            const uint64_t gif[]={2ull|(1ull<<15)|(1ull<<60),0xeull,7ull,GS_REG_COLCLAMP,1ull,GS_REG_DTHE};
++            for(uint32_t i=0u;i<3u;++i)
++            {
++                std::vector<uint8_t> command(12u,0u);
++                appendU32(command,makeVifCmd(i==1u ? 0x51u : 0x50u,0u,1u));
++                const auto *payload=reinterpret_cast<const uint8_t *>(gif)+i*16u;
++                command.insert(command.end(),payload,payload+16u);
++                appendU32(command,makeVifCmd(0x07u,0u,0x1234u+i));
++                mem.processVIF1Data(command.data(),static_cast<uint32_t>(command.size()));
++            }
++            t.Equals(gs.getDebugSnapshot().colclamp,7ull,"Primer A+D sigue al header enviado por otro DIRECT");
++            t.Equals(gs.getDebugSnapshot().dthe,1ull,"Segundo A+D sigue al DIRECTHL");
++            t.Equals(mem.vif1_regs.mark,0x1236u,"Los MARK intermedios no pasan al GIF");
++            t.IsTrue(paths==std::vector<GifPathId>({GifPathId::Path2,GifPathId::Path2,GifPathId::Path2}),"El arbiter conserva PATH2");
++        });
++
+         tc.Run("VIF1 DIRECT finds an image continuation after packed setup", [](TestCase &t)
+         {
+             PS2Memory mem;
+@@ -2393,8 +2420,12 @@
+                         t.Equals(static_cast<uint32_t>(mem.getGSVRAM()[off + c]), 0xD0u + x * 4u + c,
+                                  "only the subsequent DIRECT payload supplies image pixels");
+                 }
+-                t.IsTrue(!delivered.empty() && delivered.back() == followingTag,
+-                         "GIF tag following the image must be submitted intact");
++                // GOW-Port: el frontend conserva la IMAGE; DIRECT entrega su payload sin etiquetas sinteticas.
++                std::vector<uint8_t> expected(16u);
++                for (uint32_t i = 0u; i < 16u; ++i) expected[i] = static_cast<uint8_t>(0xD0u + i);
++                expected.insert(expected.end(), followingTag.begin(), followingTag.end());
++                t.IsTrue(delivered.size() == 2u && delivered.back() == expected,
++                         "la continuacion IMAGE y la siguiente etiqueta deben conservar exactamente sus bytes originales");
+             }
+         });
+ 

@@ -38,6 +38,12 @@ namespace ps2x::iop::detail
         {
             return executeGuestFunction(address, a0, a1, a2, a3, gp);
         }
+        // GOW-Port: deja correr a los hilos del IOP que esten listos (p. ej. despertados por un servidor RPC),
+        // como haria la expulsion por prioridad del IOP real antes de que el hilo RPC conteste.
+        virtual void runReadyThreads(uint64_t maxCycles)
+        {
+            (void)maxCycles;
+        }
     };
 
     class IopRpcBridge
@@ -53,6 +59,21 @@ namespace ps2x::iop::detail
         void removeServersInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
+        // GOW-Port: callback de fin de sceSifSetDmaIntr (sifman 32) pendiente de programar.
+        struct DmaCompletionCallback
+        {
+            uint32_t function = 0;
+            uint32_t argument = 0;
+            uint32_t gp = 0;
+        };
+        [[nodiscard]] bool takeDmaCompletionCallback(DmaCompletionCallback &callback) noexcept
+        {
+            if (m_dmaCallback.function == 0u)
+                return false;
+            callback = m_dmaCallback;
+            m_dmaCallback = {};
+            return true;
+        }
         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
 
     private:
@@ -71,6 +92,7 @@ namespace ps2x::iop::detail
         IopHost &m_host;
         IopMemory &m_memory;
         IopKernel &m_kernel;
+        DmaCompletionCallback m_dmaCallback{};
         std::unordered_map<uint32_t, RpcServer> m_servers;
         uint32_t m_nextDmaId = 1u;
         bool m_sifInitialized = false;

@@ -6,6 +6,7 @@ namespace ps2_stubs
 {
     void resetMpegStubState();
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr);
+    bool mpegWaitingForSequenceHeaderForTesting(uint32_t mpegAddr); // GOW-Port
     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);
     void notifyMpegCdStreamEof(PS2Runtime *runtime = nullptr);

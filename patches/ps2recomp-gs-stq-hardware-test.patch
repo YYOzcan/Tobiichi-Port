@@ -1,0 +1,24 @@
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -601,6 +601,11 @@
+         const float limits[]={-2-e,-1-e,-0.5f-e,-0.25f-e,-0.0625f-e,-e,-2*e,0,e,
+             0.0625f-e,0.0625f+e,0.5f-e,0.5f,0.5f+e,1-e,1+e};
+         bool observedHardware=false;
++        // GOW-Port: el compilador de shaders es asincrono. Repetir las matrices
++        // con todos sus oraculos hasta observar hardware, con un plazo acotado;
++        // un fallback compute correcto no satisface esta comprobacion.
++        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(12);
++        do {
+         for(bool triangle:{false,true}) for(float q:{1.0f,2.0f})
+             for(unsigned mode:{_MM_ROUND_NEAREST,_MM_ROUND_TOWARD_ZERO,_MM_ROUND_UP,_MM_ROUND_DOWN}) {
+                 _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
+@@ -651,6 +656,8 @@
+                     if(!hardware)t.IsTrue(after.tiles>statsBefore.tiles,"La ruta compute se ejecuta sin fallback CPU");
+                 }
+             }
++        if(gpu && hardware && !observedHardware)std::this_thread::sleep_for(std::chrono::milliseconds(20));
++        } while(gpu && hardware && !observedHardware && std::chrono::steady_clock::now()<deadline);
+         if(gpu && hardware)t.IsTrue(observedHardware,"Al menos una matriz se rasteriza en hardware sin tiles compute");
+     }
+ 

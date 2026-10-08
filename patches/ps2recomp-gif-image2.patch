@@ -1,0 +1,141 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_types.h b/ps2xRuntime/include/runtime/gs/gs_types.h
+--- a/ps2xRuntime/include/runtime/gs/gs_types.h
++++ b/ps2xRuntime/include/runtime/gs/gs_types.h
+@@ -38,7 +38,9 @@
+     GIF_FMT_PACKED = 0,
+     GIF_FMT_REGLIST = 1,
+     GIF_FMT_IMAGE = 2,
+-    GIF_FMT_DISABLED = 3,
++    // GOW-Port: compatibilidad IMAGE2, como GSState::Transfer de PCSX2 (32ac6e2).
++    GIF_FMT_IMAGE2 = 3,
++    GIF_FMT_DISABLED = GIF_FMT_IMAGE2, // conservar el nombre publico anterior
+ };
+ 
+ enum GSRegId : uint8_t
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -746,7 +746,8 @@
+                 input.registersLeft = nloop * input.nreg;
+                 input.paddingBytes = input.format == GIF_FMT_REGLIST && (input.registersLeft & 1u) ? 8u : 0u;
+             }
+-            else if (input.format == GIF_FMT_IMAGE)
++            // GOW-Port: IMAGE2 consume tambien su payload, sin aplicar PRE.
++            else if (input.format == GIF_FMT_IMAGE || input.format == GIF_FMT_IMAGE2)
+                 input.imageBytes = nloop * 16u;
+         }
+         else if (input.imageBytes)
+@@ -893,7 +894,7 @@
+     const uint64_t imageTagLo = loadLE64(data + offset);
+     const uint8_t imageFlg = static_cast<uint8_t>((imageTagLo >> 58u) & 0x3u);
+     const uint32_t imageNloop = static_cast<uint32_t>(imageTagLo & 0x7FFFu);
+-    if (imageFlg != GIF_FMT_IMAGE || imageNloop == 0u)
++    if ((imageFlg != GIF_FMT_IMAGE && imageFlg != GIF_FMT_IMAGE2) || imageNloop == 0u)
+         return false;
+ 
+     offset += 16u;
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -25,7 +25,7 @@
+     {
+         if (input.payloadBytes)
+         {
+-            containsImage |= input.format == 2u;
++            containsImage |= input.format >= 2u; // GOW-Port: IMAGE e IMAGE2.
+             const uint32_t bytes = std::min(input.payloadBytes, sizeBytes - offset);
+             input.payloadBytes -= bytes;
+             offset += bytes;
+@@ -58,7 +58,7 @@
+             input.payloadBytes = ((loops * nreg + 1u) / 2u) * 16u;
+         else
+             input.payloadBytes = loops * 16u;
+-        containsImage |= input.format == 2u && loops != 0u;
++        containsImage |= input.format >= 2u && loops != 0u;
+     }
+     return containsImage;
+ }
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -309,6 +309,51 @@
+             }
+             t.IsTrue(complete,"IMAGE no interpreta el siguiente fragmento de pixeles como otra etiqueta");
+         });
++        // GOW-Port: FLG=3 se transfiere como IMAGE2, sin tratar sus pixels como etiquetas.
++        t.Run("IMAGE2 retains bytes PRE and the following tag across all fragments", [](TestCase &t) {
++            const uint64_t packet[]={2ull|(1ull<<15)|(1ull<<46)|(uint64_t(GS_PRIM_SPRITE)<<47)|(3ull<<58),0ull,
++                0x8044556680112233ull,0x80aabbcc80778899ull,0x8033221180665544ull,0x8099887780ccbbaaull,
++                1ull|(1ull<<15)|(1ull<<60),0xeull,7ull,GS_REG_COLCLAMP};
++            const auto *bytes=reinterpret_cast<const uint8_t *>(packet);
++            bool complete=true;
++            for(uint32_t cut=0;cut<=sizeof(packet);++cut)
++            {
++                Recording r; std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
++                gs.setRasterBackend(std::make_unique<Recorder>(r));
++                gs.writeRegister(GS_REG_PRIM,GS_PRIM_TRIANGLE);
++                gs.writeRegister(GS_REG_BITBLTBUF,(96ull<<32)|(1ull<<48));
++                gs.writeRegister(GS_REG_TRXREG,8ull|(1ull<<32)); gs.writeRegister(GS_REG_TRXDIR,0);
++                gs.processGIFPacket(bytes,cut,GifPathId::Path3);
++                gs.processGIFPacket(bytes+cut,uint32_t(sizeof(packet))-cut,GifPathId::Path3);
++                const auto s=gs.getDebugSnapshot();
++                complete &= r.uploaded.size()==32u && s.colclamp==7u && s.prim.type==GS_PRIM_TRIANGLE &&
++                            !gs.hasPendingGIFPacket(GifPathId::Path3);
++                if(r.uploaded.size()==32u) complete &= std::memcmp(r.uploaded.data(),bytes+16u,32u)==0;
++            }
++            t.IsTrue(complete,"IMAGE2 conserva pixels, ignora PRE y llega a la etiqueta siguiente en todos los cortes");
++        });
++        t.Run("native IMAGE2 upload preserves CPU pixels and setup PRE", [](TestCase &t) {
++            for(const bool recorder : {false,true})
++            {
++                Recording r; std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
++                if(recorder) gs.setRasterBackend(std::make_unique<Recorder>(r));
++                const uint64_t packet[]={4ull|(1ull<<60)|(1ull<<46)|(uint64_t(GS_PRIM_SPRITE)<<47),0xeull,
++                    (96ull<<32)|(1ull<<48),GS_REG_BITBLTBUF,
++                    0ull,GS_REG_TRXPOS,4ull|(1ull<<32),GS_REG_TRXREG,0ull,GS_REG_TRXDIR,
++                    1ull|(1ull<<15)|(1ull<<46)|(3ull<<58),0ull,
++                    0x8044556680112233ull,0x80aabbcc80778899ull};
++                gs.processGIFPacket(reinterpret_cast<const uint8_t *>(packet),sizeof(packet),GifPathId::Path3);
++                t.Equals(gs.nativeImageUploadCount(),uint64_t(1),"IMAGE2 usa el atajo completo validado");
++                t.Equals(gs.getDebugSnapshot().prim.type,uint8_t(GS_PRIM_SPRITE),"PRE del setup aplica; PRE de IMAGE2 no");
++                if(recorder)
++                    t.IsTrue(r.uploaded.size()==16u && std::memcmp(r.uploaded.data(),packet+12,16)==0,
++                             "El backend recibe los pixels originales");
++                else
++                    for(uint32_t x=0;x<4u;++x)
++                        t.Equals(GSMem::ReadCT32(vram.data(),96u,1u,x,0u),reinterpret_cast<const uint32_t *>(packet+12)[x],
++                                 "El renderer CPU conserva cada pixel IMAGE2");
++            }
++        });
+         t.Run("GS reset discards partial GIF input before the next packet", [](TestCase &t) {
+             std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
+             const uint64_t partial[]={2ull|(1ull<<60),0xeull,5ull,GS_REG_COLCLAMP};
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -2820,6 +2820,25 @@
+                      "reset evita interpretar la nueva etiqueta como pixels de la transferencia antigua");
+         });
+ 
++        tc.Run("GIF arbiter recognizes IMAGE2 tags and their raw continuations", [](TestCase &t)
++        {
++            std::vector<GifPathId> order;
++            GifArbiter arbiter;
++            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
++            std::vector<uint8_t> image;
++            appendU64(image, makeGifTag(1u, 3u, 0u)); appendU64(image, 0ull);
++            const std::vector<uint8_t> empty(16u, 0u);
++            arbiter.submit(GifPathId::Path3, image.data(), static_cast<uint32_t>(image.size()));
++            arbiter.submit(GifPathId::Path2, empty.data(), static_cast<uint32_t>(empty.size()), true);
++            arbiter.drain();
++            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path3,GifPathId::Path2},"IMAGE2 comparte la prioridad de IMAGE");
++            order.clear();
++            arbiter.submit(GifPathId::Path2, empty.data(), static_cast<uint32_t>(empty.size()), true);
++            arbiter.submit(GifPathId::Path3, empty.data(), static_cast<uint32_t>(empty.size()));
++            arbiter.drain();
++            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path3,GifPathId::Path2},"El payload IMAGE2 tampoco se decodifica como etiqueta");
++        });
++
+         tc.Run("unaligned accesses throw", [](TestCase &t)
+         {
+             PS2Memory mem;

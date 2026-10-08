@@ -1,0 +1,89 @@
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
+@@ -6,6 +6,7 @@
+ {
+     void resetMpegStubState();
+     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr);
++    bool mpegWaitingForSequenceHeaderForTesting(uint32_t mpegAddr); // GOW-Port
+     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
+     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);
+     void notifyMpegCdStreamEof(PS2Runtime *runtime = nullptr);
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1772,6 +1772,13 @@
+         resetMpegStubStateUnlocked();
+     }
+ 
++    // GOW-Port: estado del decodificador para las pruebas (¿falta la cabecera de secuencia?).
++    bool mpegWaitingForSequenceHeaderForTesting(uint32_t mpegAddr)
++    {
++        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++        return getPlaybackState(mpegAddr).waitingForVideoSequenceHeader;
++    }
++
+     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr)
+     {
+         constexpr int kTestFrameWidth = 16;
+@@ -2013,7 +2020,16 @@
+ 
+         {
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+-            getPlaybackState(param_1) = makeFreshPlaybackState();
++            // GOW-Port: God of War demultiplexa el primer bloque del PSS (con la cabecera de secuencia)
++            // antes de sceMpegCreate. Reiniciar aquí descartaba esa cabecera; como el vídeo no la repite,
++            // el decodificador esperaba para siempre y el juego se quedaba en sceMpegGetPicture.
++            // Se conserva la entrada ya demultiplexada del flujo en curso.
++            MpegPlaybackState &existing = getPlaybackState(param_1);
++            const bool keepPendingInput = existing.sawInput && !existing.streamEnded && !existing.decoderFailed &&
++                                          existing.picturesServed == 0u &&
++                                          existing.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
++            if (!keepPendingInput)
++                existing = makeFreshPlaybackState();
+         }
+ 
+         const uint32_t puVar4 = uVar3 + 0x108u;
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -849,6 +849,42 @@
+             runtime.requestStop();
+         });
+ 
++        // GOW-Port: God of War demultiplexa el primer bloque (con la cabecera de secuencia) antes de
++        // sceMpegCreate; reiniciar el estado ahí dejaba el decodificador esperando una cabecera que no vuelve.
++        tc.Run("sceMpegCreate keeps a sequence header demuxed before it", [](TestCase &t)
++        {
++            PS2Runtime runtime;
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++            ps2_stubs::resetMpegStubState();
++            constexpr uint32_t kMpegAddr = 0x00123000u;
++            constexpr uint32_t kPacketAddr = 0x00128000u;
++            const std::vector<uint8_t> payload = {0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u};
++            const uint16_t packetLen = static_cast<uint16_t>(payload.size() + 3u);
++            std::vector<uint8_t> packet = {0x00u, 0x00u, 0x01u, 0xE0u, static_cast<uint8_t>(packetLen >> 8u),
++                                           static_cast<uint8_t>(packetLen & 0xFFu), 0x80u, 0x00u, 0x00u};
++            packet.insert(packet.end(), payload.begin(), payload.end());
++            std::memcpy(rdram.data() + kPacketAddr, packet.data(), packet.size());
++
++            R5900Context demuxCtx{};
++            setRegU32(demuxCtx, 4, kMpegAddr);
++            setRegU32(demuxCtx, 5, kPacketAddr);
++            setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
++            setRegU32(demuxCtx, 7, 0u);
++            setRegU32(demuxCtx, 8, 0xFFFFFFFFu);
++            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
++            t.IsTrue(!ps2_stubs::mpegWaitingForSequenceHeaderForTesting(kMpegAddr),
++                     "the demuxed sequence header should be seen");
++
++            R5900Context createCtx{};
++            setRegU32(createCtx, 4, kMpegAddr);
++            setRegU32(createCtx, 5, 0x00130000u);
++            setRegU32(createCtx, 6, 0x2000u);
++            ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, &runtime);
++            t.IsTrue(!ps2_stubs::mpegWaitingForSequenceHeaderForTesting(kMpegAddr),
++                     "sceMpegCreate should keep the sequence header of the stream already being demuxed");
++            runtime.requestStop();
++        });
++
+         tc.Run("sceMpegGetPicture blocks as a typed scheduler wait and resumes on EOF", [](TestCase &t)
+         {
+             PS2Runtime runtime;

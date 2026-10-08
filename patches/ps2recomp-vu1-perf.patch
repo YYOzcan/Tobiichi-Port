@@ -1,0 +1,253 @@
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -2,6 +2,7 @@
+ #define PS2_VU1_H
+ 
+ #include <array>
++#include <cstring>
+ #include <cstdint>
+ 
+ class GS;
+@@ -216,6 +217,9 @@
+     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
+     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
+     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
++    // GOW-Port: bits de las entradas válidas de cada cola; commitReadyPipelines solo recorre esas
++    // entradas (antes recorría las 48 en cada ciclo, ~30 % del tiempo de VU1).
++    uint32_t m_flagPending = 0u, m_storePending = 0u, m_vfPending = 0u, m_viPending = 0u, m_accPending = 0u;
+     XgkickPipeline m_xgkick{};
+     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
+     std::array<uint64_t, 16> m_viReady{};
+@@ -287,7 +291,19 @@
+     void markPairWrites(const DecodedInstructionPair &decoded);
+     bool pipelinesPending() const;
+ 
+-    float normalizeOperand(float value) const;
++    // GOW-Port: en línea; se llama varias veces por instrucción (~9 % del tiempo de VU1 como llamada).
++    float normalizeOperand(float value) const
++    {
++        uint32_t bits = 0;
++        std::memcpy(&bits, &value, sizeof(bits));
++        const uint32_t exponent = (bits >> 23) & 0xFFu;
++        if (exponent == 0u)
++            bits &= 0x80000000u;
++        else if (exponent == 0xFFu)
++            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++        std::memcpy(&value, &bits, sizeof(value));
++        return value;
++    }
+     float normalizeResult(float value, uint32_t &laneFlags) const;
+     uint32_t microAddressMask() const;
+     int32_t readBranchVi(uint8_t reg) const;
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2_vu1_detail.h"
+ 
+ #include <algorithm>
++#include <bit>
+ #include <atomic>
+ #include <cfenv>
+ #include <cmath>
+@@ -91,6 +92,7 @@
+     m_vfWritePipeline = {};
+     m_viWritePipeline = {};
+     m_accWritePipeline = {};
++    m_flagPending = m_storePending = m_vfPending = m_viPending = m_accPending = 0u;
+     m_xgkick = {};
+     m_vfReady = {};
+     m_viReady = {};
+@@ -124,23 +126,6 @@
+     return normalizeOperand(vf[bc & 3u]);
+ }
+ 
+-float VU1Interpreter::normalizeOperand(float value) const
+-{
+-    uint32_t bits = 0;
+-    std::memcpy(&bits, &value, sizeof(bits));
+-    const uint32_t exponent = (bits >> 23) & 0xFFu;
+-    if (exponent == 0u)
+-    {
+-        bits &= 0x80000000u;
+-    }
+-    else if (exponent == 0xFFu)
+-    {
+-        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+-    }
+-    std::memcpy(&value, &bits, sizeof(value));
+-    return value;
+-}
+-
+ float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
+ {
+     uint32_t bits = 0;
+@@ -551,6 +536,7 @@
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    m_flagPending |= 1u << static_cast<uint32_t>(entry - m_flagPipeline.data());
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -590,6 +576,7 @@
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_flagPending |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -609,6 +596,7 @@
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_flagPending |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -633,6 +621,7 @@
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_flagPending |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -678,6 +667,7 @@
+         {
+             store.valid = true;
+             store.readyCycle = m_cycle + 1u;
++            m_storePending |= 1u << static_cast<uint32_t>(&store - m_storePipeline.data());
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -699,6 +689,7 @@
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_vfPending |= 1u << static_cast<uint32_t>(&write - m_vfWritePipeline.data());
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -725,6 +716,7 @@
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_viPending |= 1u << static_cast<uint32_t>(&write - m_viWritePipeline.data());
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -746,6 +738,7 @@
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_accPending |= 1u << static_cast<uint32_t>(&write - m_accWritePipeline.data());
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -762,10 +755,13 @@
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
+-    for (FlagPipelineEntry &entry : m_flagPipeline)
++    for (uint32_t pending = m_flagPending; pending != 0u; pending &= pending - 1u)
+     {
++        const uint32_t index = static_cast<uint32_t>(std::countr_zero(pending));
++        FlagPipelineEntry &entry = m_flagPipeline[index];
+         if (!entry.valid || entry.readyCycle > m_cycle)
+             continue;
++        m_flagPending &= ~(1u << index);
+ 
+         if (entry.writesMac)
+             m_state.mac = entry.mac;
+@@ -800,10 +796,13 @@
+         }
+     }
+ 
+-    for (PendingStore &store : m_storePipeline)
++    for (uint32_t pending = m_storePending; pending != 0u; pending &= pending - 1u)
+     {
++        const uint32_t index = static_cast<uint32_t>(std::countr_zero(pending));
++        PendingStore &store = m_storePipeline[index];
+         if (!store.valid || store.readyCycle > m_cycle)
+             continue;
++        m_storePending &= ~(1u << index);
+         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+         {
+             uint32_t oldWords[4]{};
+@@ -818,10 +817,13 @@
+         store = {};
+     }
+ 
+-    for (PendingVfWrite &write : m_vfWritePipeline)
++    for (uint32_t pending = m_vfPending; pending != 0u; pending &= pending - 1u)
+     {
++        const uint32_t index = static_cast<uint32_t>(std::countr_zero(pending));
++        PendingVfWrite &write = m_vfWritePipeline[index];
+         if (!write.valid || write.readyCycle > m_cycle)
+             continue;
++        m_vfPending &= ~(1u << index);
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -833,19 +835,25 @@
+         write = {};
+     }
+ 
+-    for (PendingViWrite &write : m_viWritePipeline)
++    for (uint32_t pending = m_viPending; pending != 0u; pending &= pending - 1u)
+     {
++        const uint32_t index = static_cast<uint32_t>(std::countr_zero(pending));
++        PendingViWrite &write = m_viWritePipeline[index];
+         if (!write.valid || write.readyCycle > m_cycle)
+             continue;
++        m_viPending &= ~(1u << index);
+         if (m_viLatestWrite[write.reg] == write.sequence)
+             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+         write = {};
+     }
+ 
+-    for (PendingAccWrite &write : m_accWritePipeline)
++    for (uint32_t pending = m_accPending; pending != 0u; pending &= pending - 1u)
+     {
++        const uint32_t index = static_cast<uint32_t>(std::countr_zero(pending));
++        PendingAccWrite &write = m_accWritePipeline[index];
+         if (!write.valid || write.readyCycle > m_cycle)
+             continue;
++        m_accPending &= ~(1u << index);
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -1054,23 +1062,16 @@
+             continue;
+         for (uint32_t index = 0; index < usage->vfReadCount; ++index)
+         {
++            // GOW-Port: recorrer solo los bits activos (bit 3 = x ... bit 0 = w).
+             const VfAccess &access = usage->vfRead[index];
+-            for (uint32_t component = 0; component < 4u; ++component)
+-            {
+-                if ((access.lanes & laneForComponent(component)) != 0u)
+-                    ready = std::max(ready, m_vfReady[access.reg][component]);
+-            }
+-        }
+-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-        {
+-            if ((usage->viRead & (1u << reg)) != 0u)
+-                ready = std::max(ready, m_viReady[reg]);
+-        }
+-        for (uint32_t component = 0; component < 4u; ++component)
+-        {
+-            if ((usage->accRead & laneForComponent(component)) != 0u)
+-                ready = std::max(ready, m_accReady[component]);
+-        }
++            const auto &vfReady = m_vfReady[access.reg];
++            for (uint32_t lanes = access.lanes & 0xFu; lanes != 0u; lanes &= lanes - 1u)
++                ready = std::max(ready, vfReady[3u - static_cast<uint32_t>(std::countr_zero(lanes))]);
++        }
++        for (uint32_t regs = usage->viRead & 0xFFFEu; regs != 0u; regs &= regs - 1u)
++            ready = std::max(ready, m_viReady[static_cast<uint32_t>(std::countr_zero(regs))]);
++        for (uint32_t lanes = usage->accRead & 0xFu; lanes != 0u; lanes &= lanes - 1u)
++            ready = std::max(ready, m_accReady[3u - static_cast<uint32_t>(std::countr_zero(lanes))]);
+     }
+ 
+     if (decoded.lowerUsage.pipeline == PipelineFdiv && m_fdiv.valid)

@@ -1,0 +1,29 @@
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -27,6 +27,7 @@
+ #include <thread>
+ #include <unordered_map>
+ #include <sstream>
++#include <cstdio>
+ #include <cstdlib>
+ 
+ #if !defined(PLATFORM_VITA)
+@@ -45,6 +46,18 @@
+         size_t produced = 0u;
+         if (ps2x::iop::IopSubsystem *source = g_spu2AudioSource.load(std::memory_order_acquire))
+             produced = source->drainAudio(out, frames, kSpu2MaxLatencyFrames);
++        // GOW-Port: GOW_AUDIO_PCM=<archivo> guarda las muestras emuladas (s16le, estéreo, 48 kHz) sin los
++        // silencios de relleno, para comprobar el audio aunque la emulación vaya más lenta que el tiempo real.
++        static std::FILE *pcm = []() -> std::FILE *
++        {
++            const char *path = std::getenv("GOW_AUDIO_PCM");
++            return path ? std::fopen(path, "wb") : nullptr;
++        }();
++        if (pcm && produced != 0u)
++        {
++            std::fwrite(out, sizeof(int16_t) * 2u, produced, pcm);
++            std::fflush(pcm);
++        }
+         std::fill(out + produced * 2u, out + static_cast<size_t>(frames) * 2u, int16_t{0}); // sin datos: silencio
+     }
+ 

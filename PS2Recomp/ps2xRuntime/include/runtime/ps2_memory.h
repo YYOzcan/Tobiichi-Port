@@ -407,8 +407,11 @@ public:
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
-    uint32_t m_vif1PendingPath2ImageQwc = 0u;
-    bool m_vif1PendingPath2DirectHl = false;
+    // GOW-Port: DIRECT fragmentado es distinto de una IMAGE entre comandos DIRECT completos.
+    uint32_t m_vif1DirectBytesRemaining = 0u;
+    bool m_vif1DirectHl = false;
+    std::vector<uint8_t> m_vif1DirectPayload; // como máximo 65536 QW (1 MiB)
+    void submitVif1DirectPayload(const uint8_t *data, uint32_t sizeBytes, bool directHl);
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer
@@ -449,7 +452,11 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    // GOW-Port: GIF_STAT en m_ioRegisters (los elementos de unordered_map no se mueven; solo clear() lo
+    // invalida). advanceEeTimers lo usa ~1,5 millones de veces por segundo.
+    uint32_t *m_gifStatSlot = nullptr;
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+    bool processScratchpadChain(uint32_t channelBase, uint32_t chcr); // GOW-Port
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);
 };

@@ -1,0 +1,138 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1318,7 +1318,12 @@
+ 
+     if (!state.linearFilter)
+     {
+-        return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
++        // GOW-Port: STQ pasa por 16.16 antes de elegir el texel (PCSX2 v2.8.2 SW).
++        // Truncar directo a entero pierde negativos; floor directo falla cerca de cero.
++        const float fixedU = std::trunc(texUf * 65536.0f);
++        const float fixedV = std::trunc(texVf * 65536.0f);
++        return samplePoint(static_cast<int>(std::floor(fixedU / 65536.0f)),
++                           static_cast<int>(std::floor(fixedV / 65536.0f)));
+     }
+ 
+     const float sampleU = texUf - 0.5f;
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+@@ -475,7 +475,12 @@
+         texVf = tt * invQ * texH;
+     }
+     if ((flags & F_LINEAR) == 0u)
+-        return samplePoint(s, int(texUf), int(texVf));
++    {
++        // GOW-Port: conversion 16.16 y eleccion signed del texel, igual que CPU.
++        precise float fixedU = trunc(texUf * 65536.0);
++        precise float fixedV = trunc(texVf * 65536.0);
++        return samplePoint(s, int(floor(fixedU / 65536.0)), int(floor(fixedV / 65536.0)));
++    }
+ 
+     precise float sampleU = texUf - 0.5;
+     precise float sampleV = texVf - 0.5;
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -142,6 +142,66 @@
+             }
+             t.IsTrue(hash==0xfdde85267aad850dull,"RGBA completo coincide con el oraculo externo para FST/STQ y las 256 fracciones UV");
+         }
++    }
++
++
++    // GOW-Port: dos oraculos RGBA de PCSX2 v2.8.2 SW, texels procedurales 4x4.
++    // Negativos: SHA256 9d1cc63a5a081dbe2e59c8117fadcd6bd8ae49c87b9a08dc60dcb326239d8c81.
++    // Limites 16.16: SHA256 119eae34f160a97fa9991d028d8a7f514d739f77d1e73f429bd7d854dad22bdc.
++    void nearestReference(TestCase &t,GSRasterBackend &backend)
++    {
++        struct Restore {unsigned csr=_mm_getcsr();~Restore(){_mm_setcsr(csr);}} restore;
++        _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++        for(unsigned y=0;y<4;++y) for(unsigned x=0;x<4;++x) {
++            const unsigned i=y*4+x;
++            backend.WriteVram(GS_PSM_CT32,8192,8,x,y,
++                (17u*i<<24)|((231u-13u*i)<<16)|((19u+11u*i)<<8)|(7u+15u*i));
++        }
++        const float limits[]={-2.0f,-1.75f,-1.0f,-0.75f,-0.25f,-1.0f/16,-1.0f/256,
++            -1.0f/65536,-1.0f/131072,-1.0f/1048576,0,1.0f/1048576,1.0f/16,0.25f,0.75f,1.0f};
++        for(unsigned fixture=0;fixture<2;++fixture) for(bool triangle:{false,true}) for(float q:{1.0f,2.0f})
++            for(unsigned mode:{_MM_ROUND_NEAREST,_MM_ROUND_TOWARD_ZERO,_MM_ROUND_UP,_MM_ROUND_DOWN}) {
++                _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++                GSPrimitiveBatch b{};b.vertexCount=triangle?3:2;
++                b.state.prim.type=triangle?GS_PRIM_TRIANGLE:GS_PRIM_SPRITE;b.state.prim.tme=true;
++                b.state.textureWidth=b.state.textureHeight=4;b.state.colclamp=1;
++                auto &c=b.state.context;c.frame.fbw=8;c.scissor={0,15,0,15};
++                c.zbuf.zbp=104;c.zbuf.psm=GS_PSM_Z24;c.zbuf.zmask=true;c.test=0x30000;
++                c.tex0.tbp0=8192;c.tex0.tbw=8;c.tex0.tw=c.tex0.th=2;c.tex0.tcc=1;c.tex0.tfx=1;
++                backend.ClearFramebuffer(c,0);
++                const unsigned before=(restore.csr & ~_MM_ROUND_MASK)|mode;_mm_setcsr(before);
++                for(unsigned y=0;y<16;++y) for(unsigned x=0;x<16;++x) {
++                    const float u=fixture?limits[x]:float(int(x)-8)/4.0f;
++                    const float v=fixture?limits[y]:float(int(y)-8)/4.0f;
++                    for(auto &vertex:b.vertices) {
++                        vertex.r=vertex.g=vertex.b=vertex.a=128;vertex.z=7;
++                        vertex.s=u*q/4.0f;vertex.t=v*q/4.0f;vertex.q=q;
++                    }
++                    if(triangle) {
++                        b.vertices[0].x=float(x)-0.25f;b.vertices[0].y=float(y)-0.25f;
++                        b.vertices[1].x=float(x)+0.75f;b.vertices[1].y=float(y)-0.25f;
++                        b.vertices[2].x=float(x)-0.25f;b.vertices[2].y=float(y)+0.75f;
++                    } else {
++                        b.vertices[0].x=float(x);b.vertices[0].y=float(y);
++                        b.vertices[1].x=float(x+1);b.vertices[1].y=float(y+1);
++                    }
++                    backend.Submit(b);
++                }
++                backend.Sync(GSSyncReason::Finish);
++                const unsigned controls=_MM_ROUND_MASK|_MM_MASK_MASK|_MM_FLUSH_ZERO_MASK|0x40u;
++                t.IsTrue((_mm_getcsr()&controls)==(before&controls),"Nearest conserva los controles SSE del productor");
++                _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++                std::vector<uint8_t> actual;backend.SnapshotVram(actual);
++                if(actual.size()!=GSSwizzle::kMemorySize){t.Fail("VRAM completa requerida");return;}
++                uint64_t hash=14695981039346656037ull;
++                const auto &format=GSSwizzle::GetFormat(GS_PSM_CT32);
++                for(unsigned y=0;y<16;++y) for(unsigned x=0;x<16;++x) {
++                    const auto p=GSSwizzle::Locate(format,0,8,x,y);
++                    for(unsigned channel=0;channel<4;++channel) hash=(hash^actual[p.byte+channel])*1099511628211ull;
++                }
++                const uint64_t expected=fixture?0xed8981a5d009360dull:0xbbed71858c292ba5ull;
++                t.IsTrue(hash==expected,"RGBA coincide con la referencia externa: negativos y limites 16.16 en sprites/triangulos");
++            }
+     }
+ 
+     struct Recording
+@@ -661,6 +721,15 @@
+             std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSThreadedBackend backend(std::make_unique<GSCpuBackend>());
+             backend.Initialize(vram.data(),uint32_t(vram.size()));bilinearReference(t,backend);
+         });
++
++        t.Run("CPU nearest STQ preserves negative texels and fixed-point boundaries",[](TestCase &t){
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size()));nearestReference(t,backend);
++        });
++        t.Run("Threaded CPU nearest STQ matches the external RGBA references",[](TestCase &t){
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSThreadedBackend backend(std::make_unique<GSCpuBackend>());
++            backend.Initialize(vram.data(),uint32_t(vram.size()));nearestReference(t,backend);
++        });
+         // GOW-Port: exportación CPU adaptada de SotC ac9efa0 para repetir comandos GS.
+         t.Run("CPU and threaded CPU restore an incomplete CT24 transfer",[](TestCase &t) {
+             for(bool threaded:{false,true}) {
+@@ -1214,6 +1283,17 @@
+                 }
+             });
+ 
++
++            t.Run("OpenGL nearest STQ matches negative texels and fixed-point boundaries",[](TestCase &t){
++                for(bool hardware:{false,true}) {
++                    std::vector<uint8_t> vram(GSSwizzle::kMemorySize);auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
++                    raw->SetHardwareRasterAllowed(hardware);GSThreadedBackend backend(std::move(gpu));backend.Initialize(vram.data(),uint32_t(vram.size()));
++                    if(dynamic_cast<GSGpuBackend*>(&backend.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
++                    nearestReference(t,backend);
++                    const auto stats=raw->GetStats();
++                    t.IsTrue(hardware?stats.prims>0:stats.tiles>0,"Se ejecuto la ruta OpenGL solicitada");
++                }
++            });
+             t.Run("OpenGL bilinear matches the external RGBA reference in compute and hardware",[](TestCase &t){
+                 for(bool hardware:{false,true}){
+                     std::vector<uint8_t> vram(GSSwizzle::kMemorySize);auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();

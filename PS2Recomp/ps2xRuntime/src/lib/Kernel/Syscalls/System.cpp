@@ -320,7 +320,6 @@ namespace ps2_syscalls
 
         trackSifModuleLoadExternal(moduleTag, loaded.moduleId);
         logSifModuleAction("load-buffer-emulated", loaded.moduleId, moduleTag, 1u);
-        std::cerr << "[GoW SifLoadModuleBuffer] tag=" << moduleTag << " -> id=" << loaded.moduleId << std::endl;
         setReturnS32(ctx, loaded.moduleId);
     }
 
@@ -532,6 +531,19 @@ namespace ps2_syscalls
         }
 
         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
+
+        // GOW-Port: reservar la pila del hilo principal para que las pilas de interrupciones (que se toman
+        // desde lo alto de la RAM) no la pisen. Sin esto, cada interrupcion machacaba los marcos mas
+        // antiguos del hilo principal y este acababa saltando a basura (God of War: pc=0xF82).
+        if (runtime)
+        {
+            const uint32_t reserved = std::max<uint32_t>(stackSize, 0x10000u);
+            const uint32_t low = std::min(sp, initialStack != 0u ? initialStack : sp);
+            if (low > reserved)
+            {
+                runtime->limitAsyncCallbackStackTop(low - reserved);
+            }
+        }
         setReturnU32(ctx, sp);
     }
 
@@ -560,22 +572,19 @@ namespace ps2_syscalls
 
         if (runtime)
         {
-            // Keep the runtime HLE allocator in high memory (above heapLimit),
-            // so any HLE stubs calling guestMalloc never touch the game's private heap.
-            runtime->configureGuestHeap(heapLimit, PS2_RAM_SIZE - 0x10000u);
+            runtime->configureGuestHeap(heapBase, heapLimit);
 
             PS2_IF_AGRESSIVE_LOGS({
                 std::cerr << "[SetupHeap]"
                           << " base=0x" << std::hex << heapBaseRaw
                           << " alignedBase=0x" << heapBase
                           << " size=0x" << heapSize
-                          << " gameLimit=0x" << heapLimit
-                          << " hleHeapBase=0x" << runtime->guestHeapBase()
-                          << " hleHeapEnd=0x" << runtime->guestHeapEnd()
+                          << " runtimeBase=0x" << runtime->guestHeapBase()
+                          << " runtimeEnd=0x" << runtime->guestHeapEnd()
                           << std::dec << std::endl;
             });
 
-            setReturnU32(ctx, heapBase);
+            setReturnU32(ctx, heapBase); // GOW-Port: el juego recibe su propio heap
             return;
         }
 
@@ -586,9 +595,14 @@ namespace ps2_syscalls
     void EndOfHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
+
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
-        setReturnU32(ctx, kDefaultGuestHeapEnd);
+
+        const uint32_t ret = runtime
+                                 ? runtime->guestHeapLimit()
+                                 : kDefaultGuestHeapEnd;
+
+        setReturnU32(ctx, ret);
     }
 
     void GetMemorySize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

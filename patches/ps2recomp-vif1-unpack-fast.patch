@@ -1,0 +1,19 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 592049a..5436880 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -710,6 +710,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     const uint32_t colIdx = (cyclePos > 3u) ? 3u : cyclePos;
+                     const uint32_t maskCycle = (cyclePos > 3u) ? 3u : cyclePos;
+ 
++                    // GOW-Port: sin máscara, con datos y sin sumar la fila (STMOD 0/3), cada componente es el
++                    // valor descomprimido: el bucle por componente escribiría lo mismo.
++                    if (!maskEnable && decoded && handledFormat && (!canAdd || (mode != 1u && mode != 2u)))
++                    {
++                        std::memcpy(m_vu1Data + destOff, decompressed, sizeof(decompressed));
++                        continue;
++                    }
++
+                     for (uint32_t field = 0u; field < 4u; ++field)
+                     {
+                         uint32_t maskSpec = 0u;

@@ -1,0 +1,61 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 93c252f..fb45923 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -522,6 +522,40 @@ target_link_libraries(ps2EntryRunner
+     ps2_runtime
+ )
+ 
++# GOW-Port: microcódigo de VU1 compilado. PS2X_VU1_MICROCODE_DIR es una carpeta local con micromemorias de
++# 16 KB capturadas con GOW_VU1_CAPTURA; PS2X_VU1_GENERATOR_SOURCE es tools/vu1/generar_vu1.cpp. El C++
++# generado se enlaza en el ejecutable y el despachador lo usa en lugar del intérprete para los pares que
++# coinciden. Son datos del juego: se generan en la carpeta de compilación y no se publican.
++set(PS2X_VU1_MICROCODE_DIR "" CACHE PATH "Micromemorias de VU1 capturadas (vacío: solo intérprete)")
++set(PS2X_VU1_GENERATOR_SOURCE "" CACHE FILEPATH "Generador de C++ para VU1 (tools/vu1/generar_vu1.cpp)")
++if(PS2X_VU1_MICROCODE_DIR AND PS2X_VU1_GENERATOR_SOURCE AND NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
++    file(GLOB PS2X_VU1_IMAGES CONFIGURE_DEPENDS "${PS2X_VU1_MICROCODE_DIR}/*.bin")
++    if(PS2X_VU1_IMAGES)
++        add_executable(ps2x_vu1_generator "${PS2X_VU1_GENERATOR_SOURCE}")
++        target_link_libraries(ps2x_vu1_generator PRIVATE ps2_runtime)
++        set(PS2X_VU1_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/vu1_generado")
++        set(PS2X_VU1_GENERATED_PARTS)
++        foreach(part RANGE 0 12)
++            list(APPEND PS2X_VU1_GENERATED_PARTS "${PS2X_VU1_GENERATED_DIR}/programa${part}.cpp")
++        endforeach()
++        add_custom_command(OUTPUT ${PS2X_VU1_GENERATED_PARTS}
++            COMMAND "${CMAKE_COMMAND}" -E make_directory "${PS2X_VU1_GENERATED_DIR}"
++            COMMAND "$<TARGET_FILE:ps2x_vu1_generator>" "${PS2X_VU1_GENERATED_DIR}" ${PS2X_VU1_IMAGES}
++            DEPENDS ps2x_vu1_generator ${PS2X_VU1_IMAGES}
++            VERBATIM)
++        target_sources(ps2EntryRunner PRIVATE ${PS2X_VU1_GENERATED_PARTS})
++        set_source_files_properties(${PS2X_VU1_GENERATED_PARTS} PROPERTIES
++            SKIP_UNITY_BUILD_INCLUSION ON
++            SKIP_PRECOMPILE_HEADERS ON)
++        target_include_directories(ps2EntryRunner PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
++        if(MSVC)
++            set_source_files_properties(${PS2X_VU1_GENERATED_PARTS} PROPERTIES COMPILE_OPTIONS "/bigobj")
++        endif()
++        list(LENGTH PS2X_VU1_IMAGES PS2X_VU1_IMAGE_COUNT)
++        message(STATUS "VU1 compilada: ${PS2X_VU1_IMAGE_COUNT} micromemorias en ${PS2X_VU1_MICROCODE_DIR}")
++    endif()
++endif()
++
+ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+     target_sources(ps2EntryRunner PRIVATE
+         src/lib/ps2_debug_panel.cpp
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index cf3fb05..8a86e8b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -555,6 +555,11 @@ PS2Runtime::PS2Runtime()
+         const char *queues = std::getenv("GOW_VU1_COLAS");
+         m_vu1.setDirectRegisterWrites(!(queues && std::strcmp(queues, "1") == 0));
+     }
++    // GOW-Port: GOW_VU1_SIN_COMPILAR=1 usa siempre el intérprete aunque haya microcódigo compilado enlazado.
++    {
++        const char *noCompiled = std::getenv("GOW_VU1_SIN_COMPILAR");
++        m_vu1.setCompiledProgramsEnabled(!(noCompiled && std::strcmp(noCompiled, "1") == 0));
++    }
+ 
+     // Assign rather than memset: R5900Context's constructor zeroes itself and
+     // then applies the COP0 reset values, which a memset here would discard.

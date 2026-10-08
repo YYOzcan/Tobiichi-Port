@@ -166,7 +166,20 @@ namespace
         }
     }
 
+    void testGuestBranchCheckpointHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        runtime->eeScheduler().requestStop();
+        if (runtime->eeCheckpointDue()) return;
+        ctx->pc = 0u;
+    }
+
     std::atomic<uint32_t> gGuestJumpTargetCount{0u};
+
+    void testGuestBranchSelfTailJumpHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setRegU32(*ctx, 29, 0x00001F00u);
+        runtime->dispatchGuestBranch(rdram, ctx, 0x3600u, 0x3610u, 0u, PS2Runtime::GuestBranchKind::DirectJump, "test-j");
+    }
 
     void testGuestJumpTargetHandler(uint8_t *, R5900Context *, PS2Runtime *)
     {
@@ -220,6 +233,57 @@ namespace
         gIpuInitResult.store(getRegS32(*ctx, 2), std::memory_order_release);
         ctx->pc = 0u;
         runtime->requestStop();
+    }
+
+    // GOW-Port: sceMpegCbNodata. El callback produce un fotograma en su llamada numero gNodataProduceOnCall.
+    constexpr uint32_t kNodataMainPc = 0x00125200u;
+    constexpr uint32_t kNodataResumePc = 0x00125210u;
+    constexpr uint32_t kNodataCallbackPc = 0x00125220u;
+    constexpr uint32_t kNodataVsyncPc = 0x00125230u;
+    constexpr uint32_t kNodataHandle = 0x00124400u;
+    constexpr uint32_t kNodataImage = 0x00132000u;
+    constexpr uint32_t kNodataUserData = 0xCAFE0001u;
+    std::atomic<uint32_t> gNodataCalls{0u};
+    std::atomic<uint32_t> gNodataProduceOnCall{1u};
+    std::atomic<uint32_t> gNodataSeenMpeg{0u};
+    std::atomic<uint32_t> gNodataSeenType{0xFFFFFFFFu};
+    std::atomic<uint32_t> gNodataSeenUserData{0u};
+    std::atomic<int32_t> gNodataResult{-999};
+
+    void testNodataMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setRegU32(*ctx, 4, kNodataHandle);
+        setRegU32(*ctx, 5, kNodataImage);
+        ctx->pc = kNodataResumePc;
+        ps2_stubs::sceMpegGetPicture(rdram, ctx, runtime);
+    }
+
+    void testNodataResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gNodataResult.store(static_cast<int32_t>(::getRegU32(ctx, 2)), std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void testNodataCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        const uint32_t call = gNodataCalls.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+        gNodataSeenMpeg.store(::getRegU32(ctx, 4), std::memory_order_release);
+        gNodataSeenType.store(Ps2FastRead32(rdram, ::getRegU32(ctx, 5)), std::memory_order_release);
+        gNodataSeenUserData.store(::getRegU32(ctx, 6), std::memory_order_release);
+        if (call == gNodataProduceOnCall.load(std::memory_order_acquire))
+        {
+            ps2_stubs::enqueueMpegDecodedFrameForTesting(kNodataHandle);
+        }
+        setRegU32(*ctx, 2, 1u);
+        ctx->pc = ::getRegU32(ctx, 31);
+    }
+
+    void testNodataVsync(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Simula el siguiente VSync mientras GetPicture espera tras un callback sin datos.
+        runtime->eeScheduler().completeVSync(runtime->eeScheduler().currentVSyncTick() + 1u);
+        ctx->pc = 0u;
     }
 
     void testMpegWaitMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -404,6 +468,45 @@ void register_ps2_runtime_expansion_tests()
                      "unchanged callee PC should be converted to call fallthrough");
             t.Equals(::getRegU32(&ctx, 2), 0x00FACE42u,
                      "callee should still execute normally");
+        });
+
+        tc.Run("dispatchGuestBranch preserves a checkpoint at the callee entry", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3000u, &testGuestBranchCheckpointHandler);
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+            const bool returned = runtime.dispatchGuestBranch(nullptr, &ctx, 0x3000u, 0x2000u,
+                0x2008u, PS2Runtime::GuestBranchKind::DirectCall, "checkpoint-test");
+            t.IsFalse(returned, "a checkpoint must unwind rather than finish the call");
+            t.Equals(ctx.pc, 0x3000u, "the scheduler must resume the unfinished loop");
+        });
+
+        // GOW-Port: prueba del fork de SotC (c4c20e8).
+        tc.Run("dispatchGuestBranch call does not treat a tail jump to the callee entry as a return", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3600u, &testGuestBranchSelfTailJumpHandler);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+            setRegU32(ctx, 29, 0x00002000u);
+
+            const bool continuedInCaller = runtime.dispatchGuestBranch(
+                nullptr,
+                &ctx,
+                0x3600u,
+                0x2000u,
+                0x2008u,
+                PS2Runtime::GuestBranchKind::DirectCall,
+                "test-jal");
+
+            t.IsFalse(continuedInCaller,
+                      "a pending tail jump back to the callee entry must unwind to the dispatcher");
+            t.Equals(ctx.pc, 0x3600u,
+                     "the dispatcher should resume at the tail-jump target");
+            t.Equals(::getRegU32(&ctx, 29), 0x00001F00u,
+                     "the callee's stack pointer belongs to the pending tail call");
         });
 
         tc.Run("dispatchGuestBranch jump returns to central dispatcher without nesting", [](TestCase &t)
@@ -746,6 +849,42 @@ void register_ps2_runtime_expansion_tests()
             runtime.requestStop();
         });
 
+        // GOW-Port: God of War demultiplexa el primer bloque (con la cabecera de secuencia) antes de
+        // sceMpegCreate; reiniciar el estado ahí dejaba el decodificador esperando una cabecera que no vuelve.
+        tc.Run("sceMpegCreate keeps a sequence header demuxed before it", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kPacketAddr = 0x00128000u;
+            const std::vector<uint8_t> payload = {0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u};
+            const uint16_t packetLen = static_cast<uint16_t>(payload.size() + 3u);
+            std::vector<uint8_t> packet = {0x00u, 0x00u, 0x01u, 0xE0u, static_cast<uint8_t>(packetLen >> 8u),
+                                           static_cast<uint8_t>(packetLen & 0xFFu), 0x80u, 0x00u, 0x00u};
+            packet.insert(packet.end(), payload.begin(), payload.end());
+            std::memcpy(rdram.data() + kPacketAddr, packet.data(), packet.size());
+
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 4, kMpegAddr);
+            setRegU32(demuxCtx, 5, kPacketAddr);
+            setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
+            setRegU32(demuxCtx, 7, 0u);
+            setRegU32(demuxCtx, 8, 0xFFFFFFFFu);
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
+            t.IsTrue(!ps2_stubs::mpegWaitingForSequenceHeaderForTesting(kMpegAddr),
+                     "the demuxed sequence header should be seen");
+
+            R5900Context createCtx{};
+            setRegU32(createCtx, 4, kMpegAddr);
+            setRegU32(createCtx, 5, 0x00130000u);
+            setRegU32(createCtx, 6, 0x2000u);
+            ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, &runtime);
+            t.IsTrue(!ps2_stubs::mpegWaitingForSequenceHeaderForTesting(kMpegAddr),
+                     "sceMpegCreate should keep the sequence header of the stream already being demuxed");
+            runtime.requestStop();
+        });
+
         tc.Run("sceMpegGetPicture blocks as a typed scheduler wait and resumes on EOF", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -777,6 +916,86 @@ void register_ps2_runtime_expansion_tests()
                      "resumed GetPicture should publish the configured width");
             t.Equals(Ps2FastRead32(rdram.data(), kMpegWaitHandle + 0x04u), 240u,
                      "resumed GetPicture should publish the configured height");
+        });
+
+        tc.Run("sceMpegGetPicture invokes the sceMpegCbNodata callback before waiting", [](TestCase &t)
+        {
+            // GOW-Port: libmpeg pide datos al juego con sceMpegCbNodata; sin esta llamada GetPicture esperaba
+            // para siempre en los juegos que alimentan sceMpegDemuxPssRing desde ese callback.
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            runtime.registerFunction(kNodataMainPc, testNodataMain);
+            runtime.registerFunction(kNodataResumePc, testNodataResume);
+            runtime.registerFunction(kNodataCallbackPc, testNodataCallback);
+            gNodataCalls.store(0u, std::memory_order_release);
+            gNodataProduceOnCall.store(1u, std::memory_order_release);
+            gNodataResult.store(-999, std::memory_order_release);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kNodataHandle);
+            setRegU32(addCtx, 5, 1u); // sceMpegCbNodata
+            setRegU32(addCtx, 6, kNodataCallbackPc);
+            setRegU32(addCtx, 7, kNodataUserData);
+            ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx, &runtime);
+
+            R5900Context mainContext{};
+            mainContext.pc = kNodataMainPc;
+            EeScheduler &ee = runtime.eeScheduler();
+            ee.reset(rdram.data(), mainContext);
+            ee.run();
+
+            t.Equals(gNodataCalls.load(std::memory_order_acquire), 1u,
+                     "GetPicture should call sceMpegCbNodata once when no frame is queued");
+            t.Equals(gNodataSeenMpeg.load(std::memory_order_acquire), kNodataHandle,
+                     "the Nodata callback should receive the MPEG handle");
+            t.Equals(gNodataSeenType.load(std::memory_order_acquire), 1u,
+                     "the callback data should report sceMpegCbNodata");
+            t.Equals(gNodataSeenUserData.load(std::memory_order_acquire), kNodataUserData,
+                     "the Nodata callback should receive its registered user data");
+            t.Equals(gNodataResult.load(std::memory_order_acquire), 0,
+                     "GetPicture should return the frame produced by the callback");
+            t.Equals(Ps2FastRead32(rdram.data(), kNodataHandle + 0x08u), 0u,
+                     "the callback frame should be served as picture 0");
+        });
+
+        tc.Run("sceMpegGetPicture retries sceMpegCbNodata after a VSync when it produced no data", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            runtime.registerFunction(kNodataMainPc, testNodataMain);
+            runtime.registerFunction(kNodataResumePc, testNodataResume);
+            runtime.registerFunction(kNodataCallbackPc, testNodataCallback);
+            runtime.registerFunction(kNodataVsyncPc, testNodataVsync);
+            gNodataCalls.store(0u, std::memory_order_release);
+            gNodataProduceOnCall.store(2u, std::memory_order_release);
+            gNodataResult.store(-999, std::memory_order_release);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kNodataHandle);
+            setRegU32(addCtx, 5, 1u);
+            setRegU32(addCtx, 6, kNodataCallbackPc);
+            setRegU32(addCtx, 7, kNodataUserData);
+            ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx, &runtime);
+
+            R5900Context mainContext{};
+            mainContext.pc = kNodataMainPc;
+            EeScheduler &ee = runtime.eeScheduler();
+            ee.reset(rdram.data(), mainContext);
+            const int vsyncId = ee.createThread(EeThreadCreateParams{
+                0u, kNodataVsyncPc, 0u, 0u, 0u, 10, 0u});
+            t.IsTrue(vsyncId > 1, "VSync guest thread should be created");
+            t.Equals(ee.startThread(vsyncId, 0u, mainContext, false), 0,
+                     "VSync guest thread should become ready");
+            ee.run();
+
+            t.Equals(gNodataCalls.load(std::memory_order_acquire), 2u,
+                     "an empty Nodata callback should be retried once after the next VSync, not spun");
+            t.Equals(gNodataResult.load(std::memory_order_acquire), 0,
+                     "GetPicture should return once the retried callback produces a frame");
         });
 
         tc.Run("sceMpegGetPicture waits for new decoder output instead of duplicating the last frame", [](TestCase &t)
@@ -1295,7 +1514,8 @@ void register_ps2_runtime_expansion_tests()
             // With XYOFFSET=(1,1), vertex at (2,2) draws to pixel (1,1).
             const uint64_t xyz = (32ull) | (32ull << 16) | (0ull << 32);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            // GOW-Port: segundo extremo una unidad mas alla en cada eje: sprite de 1x1.
+            gs.writeRegister(GS_REG_XYZ2, xyz + 16ull + (16ull << 16));
 
             const uint32_t insideOff = frameOffsetBytes(1u, 1u, 1u);
             t.Equals(vram[insideOff + 0u], static_cast<uint8_t>(200u), "inside draw should write R");
@@ -1309,7 +1529,8 @@ void register_ps2_runtime_expansion_tests()
             const uint64_t scissorOutside = (3ull) | (4ull << 16) | (3ull << 32) | (4ull << 48);
             gs.writeRegister(GS_REG_SCISSOR_1, scissorOutside);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            // GOW-Port: segundo extremo una unidad mas alla en cada eje: sprite de 1x1.
+            gs.writeRegister(GS_REG_XYZ2, xyz + 16ull + (16ull << 16));
 
             bool anyWrite = false;
             for (size_t i = 0; i < 1024u; ++i)
@@ -1358,7 +1579,8 @@ void register_ps2_runtime_expansion_tests()
 
             const uint64_t xyz = (16ull) | (16ull << 16) | (0ull << 32); // pixel (1,1)
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            // GOW-Port: segundo extremo una unidad mas alla en cada eje: sprite de 1x1.
+            gs.writeRegister(GS_REG_XYZ2, xyz + 16ull + (16ull << 16));
 
             // ((200 - 40) * 64 >> 7) + 40 = 120
             t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(120u), "alpha blend should update R with FIX factor");

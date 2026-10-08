@@ -87,7 +87,7 @@ namespace ps2recomp
             case VU0_CR_CLIP:
                 return fmt::format("ctx->vu0_clip_flags = GPR_U32(ctx, {}) & 0x00FFFFFFu;", rt);
             case VU0_CR_R:
-                return fmt::format("ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(GPR_U32(ctx, {}))));", rt);
+                return fmt::format("ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(0x3F800000u | (GPR_U32(ctx, {}) & 0x007FFFFFu))));", rt);
             case VU0_CR_I:
                 return fmt::format("{{ uint32_t tmp = GPR_U32(ctx, {}); std::memcpy(&ctx->vu0_i, &tmp, sizeof(tmp)); }}", rt);
             case VU0_CR_Q:
@@ -227,7 +227,9 @@ namespace ps2recomp
                 case VU0_S2_VABS:
                 {
                     uint8_t dest_mask = inst.vectorInfo.vectorField;
-                    return fmt::format("{{ __m128 res = _mm_and_ps(ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))); "
+                    return fmt::format("{{ const __m128i bits = _mm_castps_si128(ctx->vu0_vf[{}]); "
+                                       "const __m128i denormal = _mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128()); "
+                                       "__m128 res = _mm_castsi128_ps(_mm_andnot_si128(denormal, _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)))); "
                                        "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                                        "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                                        inst.rd,

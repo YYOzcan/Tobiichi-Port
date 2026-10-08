@@ -23,9 +23,3 @@ android/app/.cxx/
 android/local.properties
 android/.gradle/ 
 .idea/
-# Geçici dosyalar
-ps2_log.txt
-*.bak*
-imgui.ini
-fix_and_build.sh
-test_hook.patch

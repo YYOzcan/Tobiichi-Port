@@ -1,0 +1,56 @@
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+index b4b4240..016d304 100644
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+@@ -2728,7 +2728,8 @@ void GSGpuBackend::Sync(GSSyncReason reason)
+         return;
+     d.flushFor(5u);
+     // GOW-Port: FINISH informa al EE solo tras completar el rasterizado en GL.
+-    if (reason == GSSyncReason::Finish)
++    static const bool finishAsync = [] { const char *v = std::getenv("GOW_GS_FINISH_ASINCRONO"); return v && v[0] == '1'; }();
++    if (reason == GSSyncReason::Finish && !finishAsync)
+         d.gl().Finish();
+     if (reason == GSSyncReason::DebugReadback && d.hostVram)
+         d.downloadVram(d.hostVram, d.hostVramSize);
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index cb30042..b53c402 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1528,7 +1528,9 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     {
+         if (m_backend)
+         {
+-            m_backend->Flush();
++            static const bool finishAsync = [] { const char *v = std::getenv("GOW_GS_FINISH_ASINCRONO"); return v && v[0] == '1'; }();
++            if (!finishAsync)
++                m_backend->Flush();
+             m_backend->Sync(GSSyncReason::Finish);
+         }
+         if (m_privRegs)
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index e1c6bee..af6bd99 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -338,8 +338,22 @@ void GSThreadedBackend::TextureFlush()
+     Enqueue(Op::TextureFlush, nullptr, 0u);
+ }
+ 
++// GOW-Port: GOW_GS_FINISH_ASINCRONO=1 (opcional, desactivado por defecto) encola FINISH en el hilo del GS
++// sin esperar ni glFinish: el EE ve el bit FINISH enseguida. Las lecturas de VRAM desde el EE ya sincronizan
++// por su cuenta (RunOnWorker) y el hilo del GS conserva el orden de los comandos.
++static bool gowFinishAsync()
++{
++    static const bool on = [] { const char *v = std::getenv("GOW_GS_FINISH_ASINCRONO"); return v && v[0] == '1'; }();
++    return on;
++}
++
+ void GSThreadedBackend::Sync(GSSyncReason reason)
+ {
++    if (reason == GSSyncReason::Finish && gowFinishAsync())
++    {
++        Enqueue(Op::Sync, &reason, sizeof(reason));
++        return;
++    }
+     if (reason == GSSyncReason::Presentation && GSSharedPresent::Active())
+         return;
+     // GOW-Port: FINISH solo se publica cuando terminaron los comandos anteriores.

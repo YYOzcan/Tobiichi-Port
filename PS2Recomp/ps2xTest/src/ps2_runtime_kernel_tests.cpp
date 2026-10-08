@@ -922,6 +922,32 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(reused, heapBase, "guestFree should make the head block reusable");
         });
 
+        tc.Run("private guest heap keeps runtime allocations out of the game's SetupHeap range", [](TestCase &t)
+        {
+            // GOW-Port: God of War gestiona su propio heap; el del runtime va a un rango fijo aparte.
+            TestEnv env;
+            env.runtime.setPrivateGuestHeap(0x000A0000u, 0x000FF000u);
+
+            setRegU32(env.ctx, 4, 0x00180010u);
+            setRegU32(env.ctx, 5, 0x00001000u);
+            t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap syscall should dispatch");
+            t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)), 0x00180010u,
+                     "SetupHeap should still return the game's heap base");
+
+            const uint32_t a = env.runtime.guestMalloc(0x100u, 16u);
+            t.IsTrue(a >= 0x000A0000u && a + 0x100u <= 0x000FF000u,
+                     "guestMalloc should allocate inside the private runtime heap");
+            t.Equals(env.runtime.guestHeapLimit(), 0x000FF000u, "the runtime heap limit should be the private one");
+
+            env.runtime.guestFree(a);
+            setRegU32(env.ctx, 4, 0x00190000u);
+            setRegU32(env.ctx, 5, 0x00002000u);
+            t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "second SetupHeap should dispatch");
+            const uint32_t b = env.runtime.guestMalloc(0x80u, 16u);
+            t.IsTrue(b >= 0x000A0000u && b + 0x80u <= 0x000FF000u,
+                     "a later SetupHeap should not move the private runtime heap");
+        });
+
         tc.Run("memalign stubs allocate aligned guest memory", [](TestCase &t)
         {
             TestEnv env;

@@ -5,8 +5,15 @@
 #include "runtime/gs/ps2_gs_psmt4.h"
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "runtime/gs/ps2_gs_memory.h"
+#include "gs_triangle_rules.h"
+#include "gs_sprite_rules.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <map>
+#include <string>
+#include <vector>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -14,11 +21,30 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <xmmintrin.h>
 
 using namespace GSInternal;
 
 namespace
 {
+    // GOW-Port: el GS es independiente del modo SSE que usa EE/VU al enviar.
+    // Mantener el redondeo habitual del rasterizador aproximado, también con hilo;
+    // no modificar FTZ/DAZ, máscaras ni el redondeo del código que nos llamó.
+    class GSCpuRoundingScope
+    {
+        const unsigned rounding = _mm_getcsr() & _MM_ROUND_MASK;
+    public:
+        GSCpuRoundingScope()
+        {
+            if (rounding != _MM_ROUND_NEAREST)
+                _mm_setcsr(_mm_getcsr() & ~_MM_ROUND_MASK);
+        }
+        ~GSCpuRoundingScope()
+        {
+            if (rounding != _MM_ROUND_NEAREST)
+                _mm_setcsr((_mm_getcsr() & ~_MM_ROUND_MASK) | rounding);
+        }
+    };
     float fabsQ(float q)
     {
         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
@@ -294,9 +320,12 @@ namespace
 
     uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
     {
-        const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
-        const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+        // GOW-Port: fracciones GS de 4 bits y truncado por etapa; oraculo PCSX2 v2.8.2 SW.
+        const uint32_t wx = std::min(uint32_t(fx * 16.0f), 15u);
+        const uint32_t wy = std::min(uint32_t(fy * 16.0f), 15u);
+        const uint32_t top = ((16u - wx) * c00 + wx * c10) >> 4;
+        const uint32_t bottom = ((16u - wx) * c01 + wx * c11) >> 4;
+        return uint8_t(((16u - wy) * top + wy * bottom) >> 4);
     }
 }
 
@@ -442,6 +471,46 @@ namespace
     }
 }
 
+// GOW-Port: exportación/importación adaptada de Taylor N. Albarnaz / LightVelox,
+// PS2Recomp sotc-port ac9efa070638ad3b3accd284de6f898d5ab271d1 (GPL-3.0).
+// Mantener la caché original y los bytes CT24 pendientes añadidos por este port.
+bool GSCpuBackend::ExportState(GSBackendState &out)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    out.clut = m_clut;
+    out.clutCbp = m_clutCbp;
+    out.cachePageBase = m_texturePageCache.PageBase();
+    std::memcpy(out.cacheBytes.data(), m_texturePageCache.Bytes(), out.cacheBytes.size());
+    out.transfer = m_transfer;
+    out.transferState = m_transferState;
+    out.upload24 = m_upload24;
+    out.localToHost = m_localToHostBuffer;
+    out.localToHostReadPos = m_localToHostReadPos;
+    return true;
+}
+
+bool GSCpuBackend::ImportState(const GSBackendState &state)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (state.upload24.size >= 3u || state.localToHostReadPos > state.localToHost.size() ||
+        (state.cachePageBase != UINT32_MAX &&
+         ((state.cachePageBase % GSMem::TexturePageCache::kPageSize) != 0u ||
+          m_vramSize < GSMem::TexturePageCache::kPageSize ||
+          state.cachePageBase > m_vramSize - GSMem::TexturePageCache::kPageSize)))
+        return false;
+    // Copiar antes de modificar el backend: una asignación fallida no lo deja a medias.
+    auto localToHost = state.localToHost;
+    m_clut = state.clut;
+    m_clutCbp = state.clutCbp;
+    m_texturePageCache.Restore(state.cachePageBase, state.cacheBytes.data());
+    m_transfer = state.transfer;
+    m_transferState = state.transferState;
+    m_upload24 = state.upload24;
+    m_localToHostBuffer = std::move(localToHost);
+    m_localToHostReadPos = static_cast<size_t>(state.localToHostReadPos);
+    return true;
+}
+
 GSCpuBackend::GSCpuBackend()
 {
     using namespace GSMem;
@@ -539,6 +608,7 @@ void GSCpuBackend::ResetUnlocked()
     m_transfer.direction = 3u;
     m_transferState = {};
     m_transferState.direction = 3u;
+    m_upload24 = {}; // GOW-Port: reset descarta la continuacion del pixel.
     m_localToHostBuffer.clear();
     m_localToHostReadPos = 0u;
 }
@@ -548,6 +618,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
         return;
+    const GSCpuRoundingScope rounding;
     DrawPrimitive(batch);
 }
 
@@ -708,10 +779,142 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
     return result;
 }
 
+namespace
+{
+    // GOW-Port: diagnostico del GS por variables de entorno.
+    //   PS2X_GS_DIAG=1            resumen cada 3 s de los estados de textura usados por las primitivas.
+    //   PS2X_GS_DUMP_SECONDS=a,b  volcado de la VRAM a gs_vram_<s>.bin a los a, b... segundos de la primera primitiva.
+    struct GsDiagState
+    {
+        bool enabled = std::getenv("PS2X_GS_DIAG") != nullptr;
+        std::vector<int> dumpSeconds;
+        size_t nextDump = 0u;
+        std::chrono::steady_clock::time_point start{};
+        std::chrono::steady_clock::time_point lastReport{};
+        std::map<std::string, uint64_t> textureStates;
+        std::map<uint64_t, GSTex0Reg> textures; // tbp0/psm/cbp -> TEX0, para decodificar en el volcado
+        uint64_t prims = 0u;
+        GsDiagState()
+        {
+            if (const char *v = std::getenv("PS2X_GS_DUMP_SECONDS"))
+            {
+                std::string text(v);
+                size_t pos = 0u;
+                while (pos < text.size())
+                {
+                    const size_t comma = text.find(',', pos);
+                    dumpSeconds.push_back(std::atoi(text.substr(pos, comma - pos).c_str()));
+                    if (comma == std::string::npos)
+                        break;
+                    pos = comma + 1u;
+                }
+            }
+        }
+    };
+
+    GsDiagState &gsDiag()
+    {
+        static GsDiagState state;
+        return state;
+    }
+}
+
 void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
+    {
+        GsDiagState &diag = gsDiag();
+        if (diag.enabled || !diag.dumpSeconds.empty())
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (diag.start == std::chrono::steady_clock::time_point{})
+                diag.start = diag.lastReport = now;
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - diag.start).count();
+            if (diag.enabled)
+            {
+                ++diag.prims;
+                if (state.prim.tme)
+                {
+                    char key[320];
+                    std::snprintf(key, sizeof(key),
+                                  "type=%u tbp0=%u tbw=%u psm=0x%x tw=%u th=%u tcc=%u tfx=%u cbp=%u cpsm=0x%x csm=%u csa=%u "
+                                  "texa=(%u,%u,%u) clamp=0x%llx abe=%u alpha=0x%llx test=0x%llx fst=%u fbp=%u fpsm=0x%x",
+                                  static_cast<unsigned>(state.prim.type), ctx.tex0.tbp0, static_cast<unsigned>(ctx.tex0.tbw),
+                                  static_cast<unsigned>(ctx.tex0.psm), static_cast<unsigned>(ctx.tex0.tw), static_cast<unsigned>(ctx.tex0.th),
+                                  static_cast<unsigned>(ctx.tex0.tcc), static_cast<unsigned>(ctx.tex0.tfx), ctx.tex0.cbp,
+                                  static_cast<unsigned>(ctx.tex0.cpsm), static_cast<unsigned>(ctx.tex0.csm), static_cast<unsigned>(ctx.tex0.csa),
+                                  static_cast<unsigned>(state.texa.ta0), static_cast<unsigned>(state.texa.aem), static_cast<unsigned>(state.texa.ta1),
+                                  static_cast<unsigned long long>(ctx.clamp), static_cast<unsigned>(state.prim.abe),
+                                  static_cast<unsigned long long>(ctx.alpha), static_cast<unsigned long long>(ctx.test),
+                                  static_cast<unsigned>(state.prim.fst), ctx.frame.fbp, static_cast<unsigned>(ctx.frame.psm));
+                    ++diag.textureStates[key];
+                    const uint64_t texKey = (static_cast<uint64_t>(ctx.tex0.tbp0) << 32) |
+                                            (static_cast<uint64_t>(ctx.tex0.psm) << 24) | ctx.tex0.cbp;
+                    diag.textures[texKey] = ctx.tex0;
+                }
+                if (now - diag.lastReport >= std::chrono::seconds(3))
+                {
+                    std::cerr << "[gs:diag] t=" << elapsed << "s prims=" << diag.prims << " estados de textura:" << std::endl;
+                    for (const auto &[key, count] : diag.textureStates)
+                        std::cerr << "[gs:diag]   " << count << " x " << key << std::endl;
+                    diag.textureStates.clear();
+                    diag.prims = 0u;
+                    diag.lastReport = now;
+                }
+            }
+            if (diag.nextDump < diag.dumpSeconds.size() && elapsed >= diag.dumpSeconds[diag.nextDump])
+            {
+                const std::string name = "gs_vram_" + std::to_string(diag.dumpSeconds[diag.nextDump]) + ".bin";
+                std::ofstream file(name, std::ios::binary);
+                if (m_vram && file)
+                    file.write(reinterpret_cast<const char *>(m_vram), static_cast<std::streamsize>(m_vramSize));
+                std::cerr << "[gs:diag] VRAM volcada en " << name << " (" << m_vramSize << " bytes)" << std::endl;
+                // Decodificar con las lecturas del propio runtime cada textura indexada vista.
+                for (const auto &[texKey, tex0] : diag.textures)
+                {
+                    const bool four = isFourBitIndexedPsm(tex0.psm);
+                    const bool eight = isEightBitIndexedPsm(tex0.psm);
+                    if (!four && !eight)
+                        continue;
+                    const uint32_t w = 1u << std::min<uint32_t>(tex0.tw, 10u);
+                    const uint32_t h = 1u << std::min<uint32_t>(tex0.th, 10u);
+                    const uint32_t entries = four ? 16u : 256u;
+                    std::vector<uint32_t> palette(entries, 0u);
+                    for (uint32_t e = 0; e < entries; ++e)
+                    {
+                        uint32_t sx = e & 0x0Fu, sy = e >> 4u;
+                        if (tex0.csm == 0u && !four)
+                        {
+                            const uint32_t si = swizzleClutIndexCSM1(e);
+                            sx = si & 0x0Fu;
+                            sy = si >> 4u;
+                        }
+                        palette[e] = ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, 1u, sx, sy);
+                    }
+                    const std::string base = "tex_" + std::to_string(diag.dumpSeconds[diag.nextDump]) + "s_" + std::to_string(tex0.tbp0);
+                    std::ofstream idx(base + "_idx.pgm", std::ios::binary);
+                    std::ofstream rgb(base + "_rgb.ppm", std::ios::binary);
+                    idx << "P5\n" << w << " " << h << "\n255\n";
+                    rgb << "P6\n" << w << " " << h << "\n255\n";
+                    for (uint32_t y = 0; y < h; ++y)
+                        for (uint32_t x = 0; x < w; ++x)
+                        {
+                            const uint32_t index = ReadTextureVramUnlocked(tex0.psm, tex0.tbp0, tex0.tbw, x, y) & (four ? 0x0Fu : 0xFFu);
+                            idx.put(static_cast<char>(four ? index * 17u : index));
+                            const uint32_t c = palette[index];
+                            const uint32_t a = std::min<uint32_t>((c >> 24) & 0xFFu, 0x80u);
+                            const uint32_t bg = (((x >> 3) ^ (y >> 3)) & 1u) ? 96u : 48u;
+                            for (int sh = 0; sh < 24; sh += 8)
+                                rgb.put(static_cast<char>((((c >> sh) & 0xFFu) * a + bg * (0x80u - a)) / 0x80u));
+                        }
+                    std::cerr << "[gs:diag]   textura " << base << " psm=0x" << std::hex << static_cast<unsigned>(tex0.psm)
+                              << std::dec << " " << w << "x" << h << " cbp=" << tex0.cbp << std::endl;
+                }
+                ++diag.nextDump;
+            }
+        }
+    }
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
         if (primitiveIndex < 64u)
@@ -1115,7 +1318,12 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
 
     if (!state.linearFilter)
     {
-        return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
+        // GOW-Port: STQ pasa por 16.16 antes de elegir el texel (PCSX2 v2.8.2 SW).
+        // Truncar directo a entero pierde negativos; floor directo falla cerca de cero.
+        const float fixedU = std::trunc(texUf * 65536.0f);
+        const float fixedV = std::trunc(texVf * 65536.0f);
+        return samplePoint(static_cast<int>(std::floor(fixedU / 65536.0f)),
+                           static_cast<int>(std::floor(fixedV / 65536.0f)));
     }
 
     const float sampleU = texUf - 0.5f;
@@ -1166,26 +1374,18 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     const GSVertex &v1 = batch.vertices[1];
     const auto &ctx = state.context;
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
-    u32 z1 = static_cast<u32>(v1.z);
-
-    if (x0 > x1)
-        std::swap(x0, x1);
-    if (y0 > y1)
-        std::swap(y0, y1);
-
-    const int unclippedX0 = x0;
-    const int unclippedY0 = y0;
-    const int spanX = std::max(1, x1 - x0);
-    const int spanY = std::max(1, y1 - y0);
-    const int unclippedX1 = unclippedX0 + spanX - 1;
-    const int unclippedY1 = unclippedY0 + spanY - 1;
+    // GOW-Port: ejes firmados de sotc-port, ac9efa070638ad3b3accd284de6f898d5ab271d1
+    // (Taylor N. Albarnaz / LightVelox), igual que OpenGL. El scissor solo recorta
+    // cobertura; no cambia el origen ni el sentido de interpolacion de UV/ST.
+    const GSSpriteAxis axisX = gsSpriteAxis(v0.x, v1.x, static_cast<float>(ctx.xyoffset.ofx) / 16.0f);
+    const GSSpriteAxis axisY = gsSpriteAxis(v0.y, v1.y, static_cast<float>(ctx.xyoffset.ofy) / 16.0f);
+    const int unclippedX0 = axisX.first;
+    const int unclippedY0 = axisY.first;
+    const int unclippedX1 = axisX.last;
+    const int unclippedY1 = axisY.last;
+    const u32 z1 = static_cast<u32>(v1.z);
+    if (unclippedX1 < unclippedX0 || unclippedY1 < unclippedY0)
+        return;
 
     // If the sprite rectangle is fully outside scissor, nothing should render.
     if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
@@ -1212,10 +1412,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
         float u0f, v0f, u1f, v1f;
         if (state.prim.fst)
         {
-            u0f = static_cast<float>(v0.u >> 4);
-            v0f = static_cast<float>(v0.v >> 4);
-            u1f = static_cast<float>(v1.u >> 4);
-            v1f = static_cast<float>(v1.v >> 4);
+            u0f = static_cast<float>(v0.u) / 16.0f;
+            v0f = static_cast<float>(v0.v) / 16.0f;
+            u1f = static_cast<float>(v1.u) / 16.0f;
+            v1f = static_cast<float>(v1.v) / 16.0f;
         }
         else
         {
@@ -1227,21 +1427,14 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
             v1f = (v1.t / q1) * static_cast<float>(texH);
         }
 
-        float spriteW = static_cast<float>(spanX);
-        float spriteH = static_cast<float>(spanY);
-        if (spriteW < 1.0f)
-            spriteW = 1.0f;
-        if (spriteH < 1.0f)
-            spriteH = 1.0f;
-
         for (int y = drawY0; y <= drawY1; ++y)
         {
-            float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+            const float ty = gsSpriteParameter(axisY, y);
             float texVf = v0f + (v1f - v0f) * ty;
 
             for (int x = drawX0; x <= drawX1; ++x)
             {
-                float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
+                const float tx = gsSpriteParameter(axisX, x);
                 float texUf = u0f + (u1f - u0f) * tx;
                 uint32_t texel = 0xFFFF00FFu;
                 if (state.prim.fst)
@@ -1283,57 +1476,46 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const GSVertex &v2 = batch.vertices[2];
     const auto &ctx = state.context;
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    float fx0 = v0.x - static_cast<float>(ofx);
-    float fy0 = v0.y - static_cast<float>(ofy);
-    float fx1 = v1.x - static_cast<float>(ofx);
-    float fy1 = v1.y - static_cast<float>(ofy);
-    float fx2 = v2.x - static_cast<float>(ofx);
-    float fy2 = v2.y - static_cast<float>(ofy);
-
-    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
-    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
-    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
-    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
-
-    minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
-    maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
-    minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
-    maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
-
-    float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
-    if (std::fabs(denom) < 0.001f)
+    // GOW-Port: mismas reglas enteras de OpenGL, adaptadas de sotc-port
+    // ac9efa070638ad3b3accd284de6f898d5ab271d1 (Taylor N. Albarnaz / LightVelox).
+    // El centro GS es (x,y), no (x+0.5,y+0.5); conservar todo XYOFFSET 12.4.
+    GSTriangleRaster triangle;
+    if (!gsTriangleSetup(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y,
+                         ctx.xyoffset.ofx, ctx.xyoffset.ofy, triangle))
         return;
-
-    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
-    const float invAbsDenom = 1.0f / std::fabs(denom);
-    constexpr float kEdgeEpsilon = 1.0e-4f;
+    const int minX = std::max(triangle.minX, static_cast<int>(ctx.scissor.x0));
+    const int maxX = std::min(triangle.maxX, static_cast<int>(ctx.scissor.x1));
+    const int minY = std::max(triangle.minY, static_cast<int>(ctx.scissor.y0));
+    const int maxY = std::min(triangle.maxY, static_cast<int>(ctx.scissor.y1));
+    if (minX > maxX || minY > maxY)
+        return;
 
     for (int y = minY; y <= maxY; ++y)
     {
-        float py = static_cast<float>(y) + 0.5f;
+        int64_t edge[3] = {gsTriangleEdge(triangle, 0, minX, y),
+                           gsTriangleEdge(triangle, 1, minX, y),
+                           gsTriangleEdge(triangle, 2, minX, y)};
         for (int x = minX; x <= maxX; ++x)
         {
-            float px = static_cast<float>(x) + 0.5f;
-
-            float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-            float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-            float w2 = 1.0f - w0 - w1;
-
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+            const int64_t e[3] = {edge[0], edge[1], edge[2]};
+            for (int i = 0; i < 3; ++i)
+                edge[i] += triangle.a[i] * 16;
+            if (!gsTriangleCovers(triangle, e))
                 continue;
-
-            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            const float w1 = gsTriangleWeight(triangle, e[1]);
+            const float w2 = gsTriangleWeight(triangle, e[2]);
+            // Conservar una Z plana de 32 bits incluso cuando los pesos se redondean.
+            const double z = v0.z + (v1.z - v0.z) * w1 + (v2.z - v0.z) * w2;
 
             uint8_t r, g, b, a;
             if (state.prim.iip)
             {
-                r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
-                g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
-                b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
-                a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+                // GOW-Port: diferencias entre vertices conservan un atributo constante
+                // incluso si los tres pesos float no suman exactamente uno (alpha 128).
+                r = clampU8(static_cast<int>(v0.r + (v1.r - v0.r) * w1 + (v2.r - v0.r) * w2));
+                g = clampU8(static_cast<int>(v0.g + (v1.g - v0.g) * w1 + (v2.g - v0.g) * w2));
+                b = clampU8(static_cast<int>(v0.b + (v1.b - v0.b) * w1 + (v2.b - v0.b) * w2));
+                a = clampU8(static_cast<int>(v0.a + (v1.a - v0.a) * w1 + (v2.a - v0.a) * w2));
             }
             else
             {
@@ -1349,20 +1531,21 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 uint16_t iu, iv;
                 if (state.prim.fst)
                 {
-                    iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
-                    iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
+                    // GOW-Port: UV 12.4 constantes no pierden un subtexel por sumar pesos.
+                    // La resta se hace con signo para admitir ejes descendentes.
+                    iu = static_cast<uint16_t>(v0.u + (v1.u - v0.u) * w1 + (v2.u - v0.u) * w2);
+                    iv = static_cast<uint16_t>(v0.v + (v1.v - v0.v) * w1 + (v2.v - v0.v) * w2);
                     is = 0.0f;
                     it = 0.0f;
                     iq = 1.0f;
                 }
                 else
                 {
-                    // The GS DDA interpolates the homogeneous S, T and Q
-                    // values. Texel coordinates are calculated from S/Q and
-                    // T/Q only after interpolation.
-                    is = v0.s * w0 + v1.s * w1 + v2.s * w2;
-                    it = v0.t * w0 + v1.t * w1 + v2.t * w2;
-                    iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
+                    // GOW-Port: conservar S/T/Q constantes; seguir interpolando valores
+                    // homogeneos y dividir S/Q y T/Q solo al muestrear la textura.
+                    is = v0.s + (v1.s - v0.s) * w1 + (v2.s - v0.s) * w2;
+                    it = v0.t + (v1.t - v0.t) * w1 + (v2.t - v0.t) * w2;
+                    iq = v0.q + (v1.q - v0.q) * w1 + (v2.q - v0.q) * w2;
                     iu = 0;
                     iv = 0;
                 }
@@ -1387,7 +1570,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 a = color.a;
             }
 
-            const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
+            // GOW-Port: F constante conserva el mismo coeficiente que una primitiva sin DDA.
+            const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * w1 + (v2.fog - v0.fog) * w2));
             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
         }
     }
@@ -1464,6 +1648,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_transfer = command;
+    m_upload24 = {}; // GOW-Port: una nueva transferencia no hereda bytes de la anterior.
     m_transferState.x = command.trxpos.dsax;
     m_transferState.y = command.trxpos.dsay;
     m_transferState.totalPixels = static_cast<uint32_t>(command.trxreg.rrw) * static_cast<uint32_t>(command.trxreg.rrh);
@@ -1480,6 +1665,20 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (!data || !sizeBytes || !m_vram || m_transferState.direction != 0u || !m_transferState.totalPixels)
+        return;
+    if (m_transfer.bitbltbuf.dpsm == GS_PSM_CT24 || m_transfer.bitbltbuf.dpsm == GS_PSM_Z24)
+        m_upload24.consume(data, sizeBytes, [&](const uint8_t *aligned, uint32_t bytes) {
+            UploadImageUnlocked(aligned, bytes);
+            return m_transferState.direction == 0u;
+        });
+    else
+        UploadImageUnlocked(data, sizeBytes);
+}
+
+// GOW-Port: el wrapper conserva el pixel parcial bajo el mismo lock que la escritura.
+void GSCpuBackend::UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes)
+{
     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
         return;
     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)

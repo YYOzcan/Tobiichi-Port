@@ -100,13 +100,7 @@ namespace ps2_stubs
             g_sifRegs[kSifRegBootStatus] = kSifBootReadyMask;
             g_sifRegs[kSifRegMainAddr] = 0u;
             g_sifRegs[kSifRegSubAddr] = 0u;
-            // MsCom is the EE/IOP reboot-done latch: guest reboot code sets it
-            // via SifSetReg(0x80000002, 1) after a successful reboot and skips
-            // the reboot dance while it reads back nonzero. The HLE IOP starts
-            // in post-reboot (fresh) state, so seed it completed: games using
-            // this protocol (e.g. Gradius boot at 0x21b974) take the fast path
-            // instead of waiting on an IOP reply this runtime never sends.
-            g_sifRegs[kSifRegMsCom] = 1u;
+            g_sifRegs[kSifRegMsCom] = 0u;
         }
 
         bool shouldTraceSifReg(uint32_t reg)
@@ -632,72 +626,6 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
-    // Raw-SIFCMD completion bridge (Gradius-style static libsifcmd boot).
-    // The game sends SIFCMD BIND (cid 0x80000009) via raw SIF0 DMA and waits on
-    // a private semaphore for the IOP reply this HLE runtime never synthesizes.
-    // When armed (per-game override), complete BINDs for HLE-bindable sids
-    // synchronously: stamp the client server-word so later CALLs route, then
-    // release the just-created waiter sema (counting semas absorb early signals).
-    void tryCompleteRawSifBind(uint8_t *rdram, PS2Runtime *runtime, const std::vector<uint8_t> &payload)
-    {
-        if (!runtime || !runtime->rawSifCompletionAssist() || payload.size() < 24u)
-            return;
-        auto rdPayload32 = [&](size_t o) -> uint32_t {
-            uint32_t v = 0;
-            if (o + 4u <= payload.size())
-                std::memcpy(&v, payload.data() + o, 4u);
-            return v;
-        };
-        if (rdPayload32(8u) != 0x80000009u)
-            return; // not BIND
-        uint32_t sid = 0u;
-        for (size_t o = 16u; o + 4u <= payload.size() && o <= 48u; o += 4u)
-        {
-            const uint32_t v = rdPayload32(o);
-            if ((v & 0xFFFF0000u) == 0x80000000u && PS2IopTransport::canBindRpc(runtime, v))
-            {
-                sid = v;
-                break;
-            }
-        }
-        if (sid == 0u)
-        {
-            std::cerr << "[SIF-BIND] no HLE-bindable sid in BIND packet" << std::endl;
-            return;
-        }
-        uint32_t client = 0u;
-        for (size_t o = 16u; o + 4u <= payload.size() && o <= 48u; o += 4u)
-        {
-            const uint32_t v = rdPayload32(o);
-            if (v == sid || v < 0x100000u)
-                continue;
-            uint8_t tmp[16] = {};
-            if (readEeRange(rdram, v, tmp, sizeof(tmp)))
-            {
-                client = v;
-                break;
-            }
-        }
-        std::cerr << "[SIF-BIND] sid=0x" << std::hex << sid
-                  << " client=0x" << client << std::dec << std::endl;
-        if (client != 0u)
-        {
-            uint32_t cur = 0u;
-            if (readEeRange(rdram, client, &cur, 4u) && cur == 0u)
-            {
-                const uint32_t token = sid; // Sony client+0 = server; stamp sid for CALL routing.
-                if (writeEeRange(rdram, client, &token, 4u))
-                    std::cerr << "[SIF-BIND] client server-word stamped" << std::endl;
-            }
-        }
-        const int sema = runtime->eeScheduler().lastCreatedSemaphoreId();
-        if (sema > 0)
-        {
-            const int rc = runtime->eeScheduler().signalSemaphore(sema, false);
-            std::cerr << "[SIF-BIND] signaled sema " << sema << " rc=" << rc << std::endl;
-        }
-    }
-
     void sceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t dmatAddr = getRegU32(ctx, 4);
@@ -727,28 +655,6 @@ namespace ps2_stubs
                           << " pc=0x" << ctx->pc
                           << " ra=0x" << getRegU32(ctx, 31)
                           << std::dec << std::endl;
-                // Raw-SIFCMD diagnosis aid: dump SIFCMD header + body head.
-                // Needed while the EE->IOP SIFCMD reply bridge is missing
-                // (e.g. Gradius BIND(sid) hangs in WaitSema with no reply).
-                {
-                    uint8_t head[80] = {};
-                    uint32_t dumpSize = size < sizeof(head) ? size : sizeof(head);
-                    if (dumpSize >= 16u && readEeRange(rdram, src, head, dumpSize))
-                    {
-                        std::cerr << "[sceSifSetDma:BIND] n=" << dumpSize << " bytes:";
-                        auto fl = std::cerr.flags();
-                        for (uint32_t b = 0; b < dumpSize; ++b)
-                        {
-                            if ((b % 16u) == 0u)
-                                std::cerr << std::endl
-                                          << "  +" << std::hex << b << ":";
-                            std::cerr << " " << std::hex << std::setw(2) << std::setfill('0')
-                                      << static_cast<uint32_t>(head[b]);
-                        }
-                        std::cerr << std::dec << std::endl;
-                        std::cerr.flags(fl);
-                    }
-                }
             }
         });
 
@@ -825,7 +731,6 @@ namespace ps2_stubs
                                                                         static_cast<uint32_t>(xfer.size),
                                                                     });
                 }
-                tryCompleteRawSifBind(rdram, runtime, payload);
             }
         }
 

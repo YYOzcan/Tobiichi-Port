@@ -55,7 +55,7 @@ namespace ps2x::iop::detail
     bool IopCpuCore::executeInstruction(IopCpuState &cpu)
     {
         const uint32_t pc = cpu.pc;
-        const uint32_t instruction = m_memory.read32(pc);
+        const uint32_t instruction = m_memory.fetch32(pc); // GOW-Port: lectura en linea
         const bool wasDelaySlot = cpu.branchPending;
         const uint32_t priorBranchTarget = cpu.branchTarget;
 
@@ -333,7 +333,7 @@ namespace ps2x::iop::detail
         case 0x24:
         {
             const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
-            const uint8_t value = m_memory.read8(address);
+            const uint8_t value = m_memory.load8(address);
             load(rt, opcode == 0x20
                          ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(value)))
                          : value);
@@ -348,15 +348,17 @@ namespace ps2x::iop::detail
                 raiseException(cpu, 4u, pc, wasDelaySlot, address);
                 break;
             }
-            const uint16_t value = m_memory.read16(address);
+            const uint16_t value = m_memory.load16(address);
             load(rt, opcode == 0x21 ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(value))) : value);
             break;
         }
         case 0x22:
         {
             const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
-            const uint32_t memory = m_memory.read32(address & ~3u);
-            const uint32_t old = cpu.gpr[rt];
+            const uint32_t memory = m_memory.load32(address & ~3u);
+            // GOW-Port: LWL/LWR seguidas sobre el mismo registro combinan con el valor que aún está en el
+            // hueco de retardo de carga (como el R3000). mc2_d copia así las especificaciones de la tarjeta.
+            const uint32_t old = cpu.pendingLoad && cpu.pendingLoadReg == rt ? cpu.pendingLoadValue : cpu.gpr[rt];
             static constexpr uint32_t masks[4] = {0x00FFFFFFu, 0x0000FFFFu, 0x000000FFu, 0x00000000u};
             static constexpr uint32_t shifts[4] = {24u, 16u, 8u, 0u};
             load(rt, (old & masks[address & 3u]) | (memory << shifts[address & 3u]));
@@ -370,21 +372,21 @@ namespace ps2x::iop::detail
                 raiseException(cpu, 4u, pc, wasDelaySlot, address);
                 break;
             }
-            load(rt, m_memory.read32(address));
+            load(rt, m_memory.load32(address));
             break;
         }
         case 0x26:
         {
             const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
-            const uint32_t memory = m_memory.read32(address & ~3u);
-            const uint32_t old = cpu.gpr[rt];
+            const uint32_t memory = m_memory.load32(address & ~3u);
+            const uint32_t old = cpu.pendingLoad && cpu.pendingLoadReg == rt ? cpu.pendingLoadValue : cpu.gpr[rt];
             static constexpr uint32_t masks[4] = {0x00000000u, 0xFF000000u, 0xFFFF0000u, 0xFFFFFF00u};
             static constexpr uint32_t shifts[4] = {0u, 8u, 16u, 24u};
             load(rt, (old & masks[address & 3u]) | (memory >> shifts[address & 3u]));
             break;
         }
         case 0x28:
-            m_memory.write8(cpu.gpr[rs] + static_cast<uint32_t>(simm), static_cast<uint8_t>(cpu.gpr[rt]));
+            m_memory.store8(cpu.gpr[rs] + static_cast<uint32_t>(simm), static_cast<uint8_t>(cpu.gpr[rt]));
             break;
         case 0x29:
         {
@@ -394,14 +396,14 @@ namespace ps2x::iop::detail
                 raiseException(cpu, 5u, pc, wasDelaySlot, address);
                 break;
             }
-            m_memory.write16(address, static_cast<uint16_t>(cpu.gpr[rt]));
+            m_memory.store16(address, static_cast<uint16_t>(cpu.gpr[rt]));
             break;
         }
         case 0x2A:
         {
             const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
             const uint32_t aligned = address & ~3u;
-            const uint32_t old = m_memory.read32(aligned);
+            const uint32_t old = m_memory.load32(aligned);
             const uint32_t value = cpu.gpr[rt];
             uint32_t result = old;
             switch (address & 3u)
@@ -419,7 +421,7 @@ namespace ps2x::iop::detail
                 result = value;
                 break;
             }
-            m_memory.write32(aligned, result);
+            m_memory.store32(aligned, result);
             break;
         }
         case 0x2B:
@@ -430,14 +432,14 @@ namespace ps2x::iop::detail
                 raiseException(cpu, 5u, pc, wasDelaySlot, address);
                 break;
             }
-            m_memory.write32(address, cpu.gpr[rt]);
+            m_memory.store32(address, cpu.gpr[rt]);
             break;
         }
         case 0x2E:
         {
             const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
             const uint32_t aligned = address & ~3u;
-            const uint32_t old = m_memory.read32(aligned);
+            const uint32_t old = m_memory.load32(aligned);
             const uint32_t value = cpu.gpr[rt];
             uint32_t result = old;
             switch (address & 3u)
@@ -455,7 +457,7 @@ namespace ps2x::iop::detail
                 result = (old & 0x00FFFFFFu) | (value << 24u);
                 break;
             }
-            m_memory.write32(aligned, result);
+            m_memory.store32(aligned, result);
             break;
         }
         default:

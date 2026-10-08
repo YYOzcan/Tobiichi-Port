@@ -1,0 +1,117 @@
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 600e907..18c22d9 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -387,6 +387,9 @@ public:
+     // GOW-Port: las pilas de interrupciones/callbacks se reservan desde lo alto de la RAM hacia abajo; este
+     // limite las mantiene por debajo de la pila del hilo principal (que SetupThread coloca tambien arriba).
+     void limitAsyncCallbackStackTop(uint32_t top);
++    // GOW-Port: rango fijo para el heap interno del runtime (guestMalloc), separado del que el juego
++    // configura con SetupHeap. Sin llamarlo, el runtime usa el heap de SetupHeap como en PS2Recomp.
++    void setPrivateGuestHeap(uint32_t base, uint32_t limit);
+ 
+     void drainCompletedDmacHandlers(uint8_t *rdram);
+ 
+@@ -516,6 +519,8 @@ private:
+     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
+     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
+     bool m_guestHeapConfigured = false;
++    uint32_t m_privateGuestHeapBase = 0u;
++    uint32_t m_privateGuestHeapLimit = 0u;
+     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
+     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index bd90dc2..f69cf4f 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1654,10 +1654,13 @@ uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
+ 
+ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+ {
+-    // GOW-Port: el heap privado del runtime vive en 0x000A0000-0x000FF000 (memoria libre
+-    // bajo el ELF) para no pisar el heap propio del juego, que empieza al final del .bss.
+-    guestBase = 0x000A0000u;
+-    guestLimit = 0x000FF000u;
++    // GOW-Port: con setPrivateGuestHeap el heap interno del runtime vive en un rango fijo (God of War:
++    // 0x000A0000-0x000FF000, memoria libre bajo el ELF) para no pisar el heap propio del juego.
++    if (m_privateGuestHeapLimit > m_privateGuestHeapBase)
++    {
++        guestBase = m_privateGuestHeapBase;
++        guestLimit = m_privateGuestHeapLimit;
++    }
+     uint32_t base = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
+     uint32_t limit = clampGuestHeapLimit(guestLimit);
+     if (base == 0u)
+@@ -1995,6 +1998,20 @@ uint32_t PS2Runtime::guestHeapLimit() const
+     return m_guestHeapConfigured ? m_guestHeapLimit : m_guestHeapSuggestedBase;
+ }
+ 
++void PS2Runtime::setPrivateGuestHeap(uint32_t base, uint32_t limit)
++{
++    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
++    m_privateGuestHeapBase = base;
++    m_privateGuestHeapLimit = limit;
++    // Si el heap ya existe y no tiene bloques en uso, se mueve ya; si no, al siguiente SetupHeap.
++    const bool inUse = std::any_of(m_guestHeapBlocks.begin(), m_guestHeapBlocks.end(),
++                                   [](const GuestHeapBlock &block) { return !block.free; });
++    if (m_guestHeapConfigured && !inUse)
++    {
++        resetGuestHeapLocked(base, limit);
++    }
++}
++
+ void PS2Runtime::limitAsyncCallbackStackTop(uint32_t top)
+ {
+     std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 63b12d9..4bfe0d0 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -922,6 +922,32 @@ void register_ps2_runtime_kernel_tests()
+             t.Equals(reused, heapBase, "guestFree should make the head block reusable");
+         });
+ 
++        tc.Run("private guest heap keeps runtime allocations out of the game's SetupHeap range", [](TestCase &t)
++        {
++            // GOW-Port: God of War gestiona su propio heap; el del runtime va a un rango fijo aparte.
++            TestEnv env;
++            env.runtime.setPrivateGuestHeap(0x000A0000u, 0x000FF000u);
++
++            setRegU32(env.ctx, 4, 0x00180010u);
++            setRegU32(env.ctx, 5, 0x00001000u);
++            t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap syscall should dispatch");
++            t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)), 0x00180010u,
++                     "SetupHeap should still return the game's heap base");
++
++            const uint32_t a = env.runtime.guestMalloc(0x100u, 16u);
++            t.IsTrue(a >= 0x000A0000u && a + 0x100u <= 0x000FF000u,
++                     "guestMalloc should allocate inside the private runtime heap");
++            t.Equals(env.runtime.guestHeapLimit(), 0x000FF000u, "the runtime heap limit should be the private one");
++
++            env.runtime.guestFree(a);
++            setRegU32(env.ctx, 4, 0x00190000u);
++            setRegU32(env.ctx, 5, 0x00002000u);
++            t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "second SetupHeap should dispatch");
++            const uint32_t b = env.runtime.guestMalloc(0x80u, 16u);
++            t.IsTrue(b >= 0x000A0000u && b + 0x80u <= 0x000FF000u,
++                     "a later SetupHeap should not move the private runtime heap");
++        });
++
+         tc.Run("memalign stubs allocate aligned guest memory", [](TestCase &t)
+         {
+             TestEnv env;
+diff --git a/ps2xTest/src/ps2_sif_dma_tests.cpp b/ps2xTest/src/ps2_sif_dma_tests.cpp
+index aace83c..9f429e8 100644
+--- a/ps2xTest/src/ps2_sif_dma_tests.cpp
++++ b/ps2xTest/src/ps2_sif_dma_tests.cpp
+@@ -200,7 +200,8 @@ void register_ps2_sif_dma_tests()
+             setRegU32(env.ctx, 4, kIopBlockSize);
+             ps2_stubs::sceSifAllocIopHeap(env.rdram.data(), &env.ctx, &env.runtime);
+             const uint32_t iopAddress = ::getRegU32(&env.ctx, 2);
+-            t.IsTrue(iopAddress >= 0x00120000u && iopAddress < 0x00200000u,
++            // GOW-Port: el heap del IOP empieza en 0x70000 (IopMemory::HeapBase), tras los modulos cargados.
++            t.IsTrue(iopAddress >= 0x00070000u && iopAddress < 0x00200000u,
+                      "sceSifAllocIopHeap should return an address in physical IOP RAM");
+             std::memset(env.rdram.data() + iopAddress, 0x5Au, payload.size());
+ 

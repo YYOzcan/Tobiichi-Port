@@ -1,0 +1,289 @@
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+--- a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+@@ -1,6 +1,7 @@
+ #ifndef PS2_GIF_ARBITER_H
+ #define PS2_GIF_ARBITER_H
+ 
++#include <array>
+ #include <cstdint>
+ #include <functional>
+ #include <vector>
+@@ -32,7 +33,7 @@
+ 
+     void setProcessPacketFn(ProcessPacketFn fn);
+     void setProcessPathPacketFn(ProcessPathPacketFn fn) { m_processFn = std::move(fn); }
+-    void reset() { m_queue.clear(); }
++    void reset() { m_queue.clear(); m_path3Input = {}; }
+ 
+     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
+ 
+@@ -43,7 +44,16 @@
+     ProcessPathPacketFn m_processFn;
+     std::vector<GifArbiterPacket> m_queue;
+ 
+-    static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
++    // GOW-Port: el primer quadword de un bloque DMA puede ser payload, no una GIFtag.
++    struct Path3InputState
++    {
++        std::array<uint8_t, 16> tag{};
++        uint32_t tagBytes = 0u;
++        uint32_t payloadBytes = 0u;
++        uint8_t format = 0u;
++    } m_path3Input;
++
++    bool trackPath3Packet(const uint8_t *data, uint32_t sizeBytes);
+     static uint8_t pathPriority(GifPathId id);
+ };
+ 
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -14,26 +14,64 @@
+     m_processFn = [fn = std::move(fn)](GifPathId, const uint8_t *data, uint32_t size) { fn(data, size); };
+ }
+ 
+-bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
++bool GifArbiter::trackPath3Packet(const uint8_t *data, uint32_t sizeBytes)
+ {
+-    if (!data || sizeBytes < 16u)
+-        return false;
++    // GOW-Port: recorrer solo las etiquetas; saltar registros, pixels y el padding REGLIST.
++    // El cursor sigue el FIFO PATH3 entre submit/drain sin retener sus payloads.
++    auto &input = m_path3Input;
++    bool containsImage = false;
++    uint32_t offset = 0u;
++    while (offset < sizeBytes)
++    {
++        if (input.payloadBytes)
++        {
++            containsImage |= input.format == 2u;
++            const uint32_t bytes = std::min(input.payloadBytes, sizeBytes - offset);
++            input.payloadBytes -= bytes;
++            offset += bytes;
++            continue;
++        }
+ 
+-    uint64_t tagLo = 0;
+-    std::memcpy(&tagLo, data, sizeof(tagLo));
+-    const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
+-    return flg == 2u;
++        const uint8_t *tag = data + offset;
++        if (input.tagBytes || sizeBytes - offset < 16u)
++        {
++            const uint32_t bytes = std::min(16u - input.tagBytes, sizeBytes - offset);
++            std::memcpy(input.tag.data() + input.tagBytes, data + offset, bytes);
++            input.tagBytes += bytes;
++            offset += bytes;
++            if (input.tagBytes < 16u) break;
++            tag = input.tag.data();
++            input.tagBytes = 0u;
++        }
++        else
++            offset += 16u;
++
++        uint64_t lo = 0u;
++        std::memcpy(&lo, tag, sizeof(lo));
++        const uint32_t loops = static_cast<uint32_t>(lo & 0x7FFFu);
++        input.format = static_cast<uint8_t>((lo >> 58u) & 3u);
++        uint32_t nreg = static_cast<uint32_t>((lo >> 60u) & 15u);
++        if (!nreg) nreg = 16u;
++        if (input.format == 0u)
++            input.payloadBytes = loops * nreg * 16u;
++        else if (input.format == 1u)
++            input.payloadBytes = ((loops * nreg + 1u) / 2u) * 16u;
++        else
++            input.payloadBytes = loops * 16u;
++        containsImage |= input.format == 2u && loops != 0u;
++    }
++    return containsImage;
+ }
+ 
+ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
+ {
+-    if (!data || sizeBytes < 16 || !m_processFn)
++    if (!data || sizeBytes < 16 || !m_processFn || pathId < GifPathId::Path1 || pathId > GifPathId::Path3)
+         return;
+ 
+     GifArbiterPacket pkt;
+     pkt.pathId = pathId;
+     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
+-    pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
++    pkt.path3Image = (pathId == GifPathId::Path3) && trackPath3Packet(data, sizeBytes);
+     pkt.data.resize(sizeBytes);
+     std::memcpy(pkt.data.data(), data, sizeBytes);
+     m_queue.push_back(std::move(pkt));
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -2452,8 +2452,9 @@
+                 delivered.clear();
+ 
+                 std::vector<uint8_t> path3;
+-                appendU64(path3, makeGifTag(0u, GIF_FMT_IMAGE, 0u));
++                appendU64(path3, makeGifTag(1u, GIF_FMT_IMAGE, 0u));
+                 appendU64(path3, 0ull);
++                appendU64(path3, 0ull); appendU64(path3, 0ull); // IMAGE no vacia
+                 arbiter.submit(GifPathId::Path3, path3.data(), static_cast<uint32_t>(path3.size()));
+                 std::vector<uint8_t> next;
+                 for (uint32_t i = 0; i < 3u; ++i)
+@@ -2577,8 +2578,9 @@
+                 packet.insert(packet.end(), path2.begin(), path2.end());
+                 mem.processVIF1Data(packet.data(), 28u);
+                 std::vector<uint8_t> path3;
+-                appendU64(path3, makeGifTag(0u, GIF_FMT_IMAGE, 0u));
++                appendU64(path3, makeGifTag(1u, GIF_FMT_IMAGE, 0u));
+                 appendU64(path3, 0ull);
++                appendU64(path3, 0ull); appendU64(path3, 0ull); // IMAGE no vacia
+                 arbiter.submit(GifPathId::Path3, path3.data(), static_cast<uint32_t>(path3.size()));
+                 mem.processVIF1Data(packet.data() + 28u, static_cast<uint32_t>(packet.size()) - 28u);
+                 t.IsTrue(delivered.size() == 2u && delivered[directHl ? 0u : 1u] == path3 &&
+@@ -2649,8 +2651,10 @@
+                 for (const unsigned id : order)
+                 {
+                     std::vector<uint8_t> packet;
+-                    appendU64(packet, makeGifTag(0u, id == 2u ? GIF_FMT_IMAGE : GIF_FMT_PACKED, 1u));
++                    // GOW-Port: la prioridad IMAGE requiere NLOOP>0; etiqueta vacia no transmite pixels.
++                    appendU64(packet, makeGifTag(id == 2u ? 1u : 0u, id == 2u ? GIF_FMT_IMAGE : GIF_FMT_PACKED, 1u));
+                     appendU64(packet, id);
++                    if (id == 2u) { appendU64(packet, 0ull); appendU64(packet, 0ull); }
+                     arbiter.submit(id == 2u ? GifPathId::Path3 : GifPathId::Path2,
+                                    packet.data(), static_cast<uint32_t>(packet.size()), id == 0u);
+                 }
+@@ -2683,8 +2687,9 @@
+                 for (const unsigned id : order)
+                 {
+                     std::vector<uint8_t> packet;
+-                    appendU64(packet, makeGifTag(0u, id == 1u ? GIF_FMT_IMAGE : GIF_FMT_PACKED, 1u));
++                    appendU64(packet, makeGifTag(id == 1u ? 1u : 0u, id == 1u ? GIF_FMT_IMAGE : GIF_FMT_PACKED, 1u));
+                     appendU64(packet, id);
++                    if (id == 1u) { appendU64(packet, 0ull); appendU64(packet, 0ull); }
+                     arbiter.submit(id == 0u ? GifPathId::Path2 : GifPathId::Path3,
+                                    packet.data(), static_cast<uint32_t>(packet.size()), id == 0u);
+                 }
+@@ -2696,6 +2701,125 @@
+             } while (std::next_permutation(order.begin(), order.end()));
+         });
+ 
++        // GOW-Port: clasificar el flujo completo, incluidos payloads que parecen GIFtags.
++        tc.Run("GIF arbiter retains PATH3 IMAGE classification across drains", [](TestCase &t)
++        {
++            std::vector<GifPathId> order;
++            GifArbiter arbiter;
++            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
++            std::vector<uint8_t> image;
++            appendU64(image, makeGifTag(2u, GIF_FMT_IMAGE, 0u)); appendU64(image, 0ull);
++            arbiter.submit(GifPathId::Path3, image.data(), static_cast<uint32_t>(image.size()));
++            arbiter.drain(); order.clear();
++            const std::vector<uint8_t> pixels(32u, 0u);
++            std::vector<uint8_t> hl;
++            appendU64(hl, makeGifTag(0u, GIF_FMT_PACKED, 1u)); appendU64(hl, 0ull);
++            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
++            arbiter.submit(GifPathId::Path3, pixels.data(), static_cast<uint32_t>(pixels.size()));
++            arbiter.drain();
++            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path3, GifPathId::Path2},
++                     "DIRECTHL debe esperar al payload IMAGE pendiente, aunque no lleve etiqueta");
++        });
++
++        tc.Run("GIF arbiter recognizes IMAGE after PACKED setup in the same block", [](TestCase &t)
++        {
++            std::vector<GifPathId> order;
++            GifArbiter arbiter;
++            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
++            std::vector<uint8_t> path3;
++            appendU64(path3, makeGifTag(1u, GIF_FMT_PACKED, 1u)); appendU64(path3, 0xEull); // A+D
++            appendU64(path3, 7ull); appendU64(path3, GS_REG_COLCLAMP);
++            appendU64(path3, makeGifTag(1u, GIF_FMT_IMAGE, 0u)); appendU64(path3, 0ull);
++            appendU64(path3, 0ull); appendU64(path3, 0ull);
++            const std::vector<uint8_t> hl(16u, 0u);
++            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
++            arbiter.submit(GifPathId::Path3, path3.data(), static_cast<uint32_t>(path3.size()));
++            arbiter.drain();
++            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path3, GifPathId::Path2},
++                     "IMAGE se reconoce tras el setup sin adelantarla a sus registros");
++        });
++
++        tc.Run("GIF arbiter does not interpret PACKED payload as an IMAGE tag", [](TestCase &t)
++        {
++            std::vector<GifPathId> order;
++            GifArbiter arbiter;
++            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
++            std::vector<uint8_t> packed;
++            appendU64(packed, makeGifTag(1u, GIF_FMT_PACKED, 1u)); appendU64(packed, 0xFull); // NOP
++            arbiter.submit(GifPathId::Path3, packed.data(), static_cast<uint32_t>(packed.size()));
++            arbiter.drain(); order.clear();
++            std::vector<uint8_t> payload;
++            appendU64(payload, makeGifTag(1u, GIF_FMT_IMAGE, 0u)); appendU64(payload, 0ull);
++            const std::vector<uint8_t> hl(16u, 0u);
++            arbiter.submit(GifPathId::Path3, payload.data(), static_cast<uint32_t>(payload.size()));
++            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
++            arbiter.drain();
++            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path2, GifPathId::Path3},
++                     "Un registro PACKED conserva su prioridad aunque sus bits parezcan una etiqueta IMAGE");
++        });
++
++        tc.Run("GIF arbiter ignores empty IMAGE tags for DIRECTHL priority", [](TestCase &t)
++        {
++            std::vector<GifPathId> order;
++            GifArbiter arbiter;
++            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
++            std::vector<uint8_t> empty;
++            appendU64(empty, makeGifTag(0u, GIF_FMT_IMAGE, 0u)); appendU64(empty, 0ull);
++            const std::vector<uint8_t> hl(16u, 0u);
++            arbiter.submit(GifPathId::Path3, empty.data(), static_cast<uint32_t>(empty.size()));
++            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
++            arbiter.drain();
++            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path2, GifPathId::Path3},
++                     "NLOOP=0 no inicia una transferencia IMAGE ni bloquea DIRECTHL");
++        });
++
++        tc.Run("GIF arbiter keeps REGLIST padding and partial next tag across drains", [](TestCase &t)
++        {
++            std::vector<GifPathId> order;
++            GifArbiter arbiter;
++            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
++            std::vector<uint8_t> prefix;
++            appendU64(prefix, makeGifTag(1u, GIF_FMT_REGLIST, 1u)); appendU64(prefix, 0xFull);
++            appendU64(prefix, 0ull); // un registro, con 8 bytes de relleno pendientes
++            arbiter.submit(GifPathId::Path3, prefix.data(), static_cast<uint32_t>(prefix.size()));
++            arbiter.drain(); order.clear();
++            std::vector<uint8_t> middle;
++            appendU64(middle, makeGifTag(1u, GIF_FMT_IMAGE, 0u)); // relleno: no es una etiqueta
++            appendU64(middle, makeGifTag(1u, GIF_FMT_IMAGE, 0u)); // mitad real de la siguiente etiqueta
++            const std::vector<uint8_t> hl(16u, 0u);
++            arbiter.submit(GifPathId::Path3, middle.data(), static_cast<uint32_t>(middle.size()));
++            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
++            arbiter.drain();
++            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path2, GifPathId::Path3},
++                     "Ni el relleno ni una etiqueta incompleta inician IMAGE");
++            order.clear();
++            std::vector<uint8_t> last;
++            appendU64(last, 0ull); appendU64(last, 0ull); appendU64(last, 0ull);
++            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
++            arbiter.submit(GifPathId::Path3, last.data(), static_cast<uint32_t>(last.size()));
++            arbiter.drain();
++            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path3, GifPathId::Path2},
++                     "La etiqueta IMAGE reconstruida recupera la prioridad sin contar el relleno");
++        });
++
++        tc.Run("GIF arbiter reset discards PATH3 classification and queued packets", [](TestCase &t)
++        {
++            std::vector<GifPathId> order;
++            GifArbiter arbiter;
++            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
++            std::vector<uint8_t> image;
++            appendU64(image, makeGifTag(2u, GIF_FMT_IMAGE, 0u)); appendU64(image, 0ull);
++            arbiter.submit(GifPathId::Path3, image.data(), static_cast<uint32_t>(image.size()));
++            arbiter.reset();
++            t.IsTrue(arbiter.empty(), "reset descarta los paquetes antiguos");
++            const std::vector<uint8_t> emptyTag(16u, 0u);
++            arbiter.submit(GifPathId::Path3, emptyTag.data(), static_cast<uint32_t>(emptyTag.size()));
++            arbiter.submit(GifPathId::Path2, emptyTag.data(), static_cast<uint32_t>(emptyTag.size()), true);
++            arbiter.drain();
++            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path2, GifPathId::Path3},
++                     "reset evita interpretar la nueva etiqueta como pixels de la transferencia antigua");
++        });
++
+         tc.Run("unaligned accesses throw", [](TestCase &t)
+         {
+             PS2Memory mem;

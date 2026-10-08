@@ -1,0 +1,994 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="424" viewBox="0 0 900 424" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" role="img" aria-labelledby="titulo-estado">
+<title id="titulo-estado">Estado: librerías* 65.4%, hardware 60.5%</title>
+<style>
+  .fondo { fill: #ffffff; }
+  .borde { stroke: #d0d7de; }
+  .t1 { fill: #1f2328; }
+  .t2 { fill: #59636e; }
+  .ok { fill: #0ca30c; }
+  .parcial { fill: #fab219; }
+  .pendiente { fill: #c4c8ce; }
+  .rayado { stroke: #8a5a00; }
+  .chip { fill: #ffffff; fill-opacity: .85; }
+  .badge-k { fill: #59636e; }
+  .badge-t { fill: #ffffff; }
+  .badge-v-oscuro { fill: #1f2328; }
+  .txt-pendiente { fill: #1f2328; }
+  .grupo { fill: #ffffff; }
+  @media (prefers-color-scheme: dark) {
+    .fondo { fill: #0d1117; }
+    .borde { stroke: #30363d; }
+    .t1 { fill: #e6edf3; }
+    .t2 { fill: #9198a1; }
+    .pendiente { fill: #4b525c; }
+    .chip { fill: #0d1117; fill-opacity: .8; }
+    .badge-k { fill: #3d444d; }
+    .txt-pendiente { fill: #e6edf3; }
+    .grupo { fill: #0d1117; }
+  }
+</style>
+<defs><pattern id="rayas" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line class="rayado" x1="0" y1="0" x2="0" y2="6" stroke-width="1.5" stroke-opacity=".55"/></pattern></defs>
+<rect class="fondo" width="900" height="424" rx="6"/>
+<text class="t1" x="16" y="34" font-size="24" font-weight="600">Estado</text>
+<line class="borde" x1="16" y1="44" x2="884" y2="44" stroke-width="1"/>
+<rect class="badge-k" x="16" y="56" width="88" height="22" rx="3"/>
+<rect class="parcial" x="104" y="56" width="52" height="22" rx="3"/>
+<rect class="parcial" x="104" y="56" width="4" height="22"/>
+<text class="badge-t" x="60" y="71" font-size="12" text-anchor="middle">librerías*</text>
+<text class="badge-v-oscuro" x="130" y="71" font-size="12" font-weight="600" text-anchor="middle">65.4%</text>
+<rect class="badge-k" x="164" y="56" width="73.6" height="22" rx="3"/>
+<rect class="parcial" x="237.6" y="56" width="52" height="22" rx="3"/>
+<rect class="parcial" x="237.6" y="56" width="4" height="22"/>
+<text class="badge-t" x="200.8" y="71" font-size="12" text-anchor="middle">hardware</text>
+<text class="badge-v-oscuro" x="263.6" y="71" font-size="12" font-weight="600" text-anchor="middle">60.5%</text>
+<text class="t1" x="16" y="102" font-size="14">Librerías del SDK de Sony*: 65.4% (423/647)</text>
+<rect class="grupo" x="16" y="112" width="424" height="260"/>
+<rect class="ok" x="17.5" y="113.5" width="11.6" height="11.7"><title>libc · sub_00289200 (148 B)</title></rect>
+<rect class="ok" x="30.1" y="113.5" width="11.6" height="11.7"><title>libc · sub_00289294 (172 B)</title></rect>
+<rect class="ok" x="42.7" y="113.5" width="11.6" height="11.7"><title>libc · sub_00289340 (252 B)</title></rect>
+<rect class="ok" x="55.3" y="113.5" width="11.6" height="11.7"><title>libc · sub_0028943C (184 B)</title></rect>
+<rect class="ok" x="67.9" y="113.5" width="11.6" height="11.7"><title>libc · sub_002894F4 (304 B)</title></rect>
+<rect class="ok" x="80.5" y="113.5" width="11.6" height="11.7"><title>libc · sub_00289624 (416 B)</title></rect>
+<rect class="ok" x="93.1" y="113.5" width="11.6" height="11.7"><title>libc · sub_002897C4 (332 B)</title></rect>
+<rect class="ok" x="105.7" y="113.5" width="11.6" height="11.7"><title>libc · sub_00289910 (280 B)</title></rect>
+<rect class="ok" x="118.3" y="113.5" width="11.6" height="11.7"><title>libc · sub_00289A28 (328 B)</title></rect>
+<rect class="ok" x="130.9" y="113.5" width="11.6" height="11.7"><title>libc · sub_00289B70 (456 B)</title></rect>
+<rect class="ok" x="143.5" y="113.5" width="11.6" height="11.7"><title>libc · sub_00289D38 (472 B)</title></rect>
+<rect class="ok" x="156.1" y="113.5" width="11.6" height="11.7"><title>libc · sub_00289F10 (32 B)</title></rect>
+<rect class="ok" x="168.7" y="113.5" width="11.6" height="11.7"><title>libc · sub_00289F30 (48 B)</title></rect>
+<rect class="ok" x="17.5" y="126.2" width="11.6" height="11.7"><title>libc · sub_00289F60 (152 B)</title></rect>
+<rect class="ok" x="30.1" y="126.2" width="11.6" height="11.7"><title>libc · sub_00289FF8 (208 B)</title></rect>
+<rect class="ok" x="42.7" y="126.2" width="11.6" height="11.7"><title>libc · sub_0028A0C8 (96 B)</title></rect>
+<rect class="ok" x="55.3" y="126.2" width="11.6" height="11.7"><title>libc · sub_0028A128 (32 B)</title></rect>
+<rect class="ok" x="67.9" y="126.2" width="11.6" height="11.7"><title>libc · sub_0028A148 (360 B)</title></rect>
+<rect class="ok" x="80.5" y="126.2" width="11.6" height="11.7"><title>libc · sub_0028A2B0 (128 B)</title></rect>
+<rect class="ok" x="93.1" y="126.2" width="11.6" height="11.7"><title>libc · sub_0028A330 (8 B)</title></rect>
+<rect class="ok" x="105.7" y="126.2" width="11.6" height="11.7"><title>libc · sub_0028A338 (152 B)</title></rect>
+<rect class="ok" x="118.3" y="126.2" width="11.6" height="11.7"><title>libc · sub_0028A3D0 (104 B)</title></rect>
+<rect class="ok" x="130.9" y="126.2" width="11.6" height="11.7"><title>libc · sub_0028A438 (128 B)</title></rect>
+<rect class="ok" x="143.5" y="126.2" width="11.6" height="11.7"><title>libc · sub_0028A4B8 (104 B)</title></rect>
+<rect class="ok" x="156.1" y="126.2" width="11.6" height="11.7"><title>libc · sub_0028A520 (32 B)</title></rect>
+<rect class="ok" x="168.7" y="126.2" width="11.6" height="11.7"><title>libc · sub_0028A540 (2832 B)</title></rect>
+<rect class="ok" x="17.5" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028B050 (240 B)</title></rect>
+<rect class="ok" x="30.1" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028B140 (16 B)</title></rect>
+<rect class="ok" x="42.7" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028B150 (32 B)</title></rect>
+<rect class="ok" x="55.3" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028B170 (40 B)</title></rect>
+<rect class="ok" x="67.9" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028B198 (216 B)</title></rect>
+<rect class="ok" x="80.5" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028B270 (80 B)</title></rect>
+<rect class="ok" x="93.1" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028B2C0 (72 B)</title></rect>
+<rect class="ok" x="105.7" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028B308 (832 B)</title></rect>
+<rect class="ok" x="118.3" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028B648 (96 B)</title></rect>
+<rect class="ok" x="130.9" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028B6A8 (64 B)</title></rect>
+<rect class="ok" x="143.5" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028B6E8 (2528 B)</title></rect>
+<rect class="ok" x="156.1" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028C0C8 (48 B)</title></rect>
+<rect class="ok" x="168.7" y="138.9" width="11.6" height="11.7"><title>libc · sub_0028C0F8 (3832 B)</title></rect>
+<rect class="ok" x="17.5" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028CFF0 (56 B)</title></rect>
+<rect class="ok" x="30.1" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D028 (528 B)</title></rect>
+<rect class="ok" x="42.7" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D238 (56 B)</title></rect>
+<rect class="ok" x="55.3" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D270 (128 B)</title></rect>
+<rect class="ok" x="67.9" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D2F0 (200 B)</title></rect>
+<rect class="ok" x="80.5" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D3B8 (80 B)</title></rect>
+<rect class="ok" x="93.1" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D408 (40 B)</title></rect>
+<rect class="ok" x="105.7" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D430 (160 B)</title></rect>
+<rect class="ok" x="118.3" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D4D0 (128 B)</title></rect>
+<rect class="ok" x="130.9" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D550 (112 B)</title></rect>
+<rect class="ok" x="143.5" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D5C0 (120 B)</title></rect>
+<rect class="ok" x="156.1" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D638 (160 B)</title></rect>
+<rect class="ok" x="168.7" y="151.5" width="11.6" height="11.7"><title>libc · sub_0028D6D8 (1424 B)</title></rect>
+<rect class="ok" x="17.5" y="164.2" width="11.6" height="11.7"><title>libc · sub_0028DC68 (264 B)</title></rect>
+<rect class="ok" x="30.1" y="164.2" width="11.6" height="11.7"><title>libc · sub_0028DD70 (208 B)</title></rect>
+<rect class="ok" x="42.7" y="164.2" width="11.6" height="11.7"><title>libc · sub_0028DE40 (4168 B)</title></rect>
+<rect class="ok" x="55.3" y="164.2" width="11.6" height="11.7"><title>libc · sub_0028EE88 (432 B)</title></rect>
+<rect class="ok" x="67.9" y="164.2" width="11.6" height="11.7"><title>libc · sub_0028F038 (264 B)</title></rect>
+<rect class="ok" x="80.5" y="164.2" width="11.6" height="11.7"><title>libc · sub_0028F140 (3848 B)</title></rect>
+<rect class="ok" x="93.1" y="164.2" width="11.6" height="11.7"><title>libc · sub_00290048 (616 B)</title></rect>
+<rect class="ok" x="105.7" y="164.2" width="11.6" height="11.7"><title>libc · sub_002902B0 (1840 B)</title></rect>
+<rect class="ok" x="118.3" y="164.2" width="11.6" height="11.7"><title>libc · sub_002909E0 (760 B)</title></rect>
+<rect class="ok" x="130.9" y="164.2" width="11.6" height="11.7"><title>libc · sub_00290CD8 (368 B)</title></rect>
+<rect class="ok" x="143.5" y="164.2" width="11.6" height="11.7"><title>libc · sub_00290E48 (560 B)</title></rect>
+<rect class="ok" x="156.1" y="164.2" width="11.6" height="11.7"><title>libc · sub_00291078 (56 B)</title></rect>
+<rect class="ok" x="168.7" y="164.2" width="11.6" height="11.7"><title>libc · sub_002910B0 (32 B)</title></rect>
+<rect class="ok" x="17.5" y="176.9" width="11.6" height="11.7"><title>libc · sub_002910D0 (32 B)</title></rect>
+<rect class="ok" x="30.1" y="176.9" width="11.6" height="11.7"><title>libc · sub_002910F0 (24 B)</title></rect>
+<rect class="ok" x="42.7" y="176.9" width="11.6" height="11.7"><title>libc · sub_00291108 (40 B)</title></rect>
+<rect class="ok" x="55.3" y="176.9" width="11.6" height="11.7"><title>libc · sub_00291130 (240 B)</title></rect>
+<rect class="ok" x="67.9" y="176.9" width="11.6" height="11.7"><title>libc · sub_00291220 (496 B)</title></rect>
+<rect class="ok" x="80.5" y="176.9" width="11.6" height="11.7"><title>libc · sub_00291410 (1096 B)</title></rect>
+<rect class="ok" x="93.1" y="176.9" width="11.6" height="11.7"><title>libc · sub_00291858 (1584 B)</title></rect>
+<rect class="ok" x="105.7" y="176.9" width="11.6" height="11.7"><title>libc · sub_00291E88 (448 B)</title></rect>
+<rect class="ok" x="118.3" y="176.9" width="11.6" height="11.7"><title>libc · sub_00292048 (88 B)</title></rect>
+<rect class="ok" x="130.9" y="176.9" width="11.6" height="11.7"><title>libc · sub_002920A0 (96 B)</title></rect>
+<rect class="ok" x="143.5" y="176.9" width="11.6" height="11.7"><title>libc · sub_00292100 (96 B)</title></rect>
+<rect class="ok" x="156.1" y="176.9" width="11.6" height="11.7"><title>libc · sub_00292160 (96 B)</title></rect>
+<rect class="ok" x="168.7" y="176.9" width="11.6" height="11.7"><title>libc · sub_002921C0 (96 B)</title></rect>
+<rect class="ok" x="17.5" y="189.6" width="11.6" height="11.7"><title>libc · sub_00292220 (96 B)</title></rect>
+<rect class="ok" x="30.1" y="189.6" width="11.6" height="11.7"><title>libc · sub_00292280 (272 B)</title></rect>
+<rect class="ok" x="42.7" y="189.6" width="11.6" height="11.7"><title>libc · sub_00292390 (104 B)</title></rect>
+<rect class="ok" x="55.3" y="189.6" width="11.6" height="11.7"><title>libc · sub_002923F8 (144 B)</title></rect>
+<rect class="ok" x="67.9" y="189.6" width="11.6" height="11.7"><title>libc · sub_00292488 (48 B)</title></rect>
+<rect class="ok" x="80.5" y="189.6" width="11.6" height="11.7"><title>libc · sub_002924B8 (280 B)</title></rect>
+<rect class="ok" x="93.1" y="189.6" width="11.6" height="11.7"><title>libc · sub_002925D0 (408 B)</title></rect>
+<rect class="ok" x="105.7" y="189.6" width="11.6" height="11.7"><title>libc · sub_00292768 (168 B)</title></rect>
+<rect class="ok" x="118.3" y="189.6" width="11.6" height="11.7"><title>libc · sub_00292810 (56 B)</title></rect>
+<rect class="ok" x="130.9" y="189.6" width="11.6" height="11.7"><title>libc · sub_00292848 (264 B)</title></rect>
+<rect class="ok" x="143.5" y="189.6" width="11.6" height="11.7"><title>libc · sub_00292950 (312 B)</title></rect>
+<rect class="ok" x="156.1" y="189.6" width="11.6" height="11.7"><title>libc · sub_00292A88 (136 B)</title></rect>
+<rect class="ok" x="168.7" y="189.6" width="11.6" height="11.7"><title>libc · sub_00292B10 (192 B)</title></rect>
+<rect class="ok" x="17.5" y="202.3" width="11.6" height="11.7"><title>libc · sub_00292BD0 (56 B)</title></rect>
+<rect class="ok" x="30.1" y="202.3" width="11.6" height="11.7"><title>libc · sub_00292C08 (520 B)</title></rect>
+<rect class="ok" x="42.7" y="202.3" width="11.6" height="11.7"><title>libc · sub_00292E10 (256 B)</title></rect>
+<rect class="ok" x="55.3" y="202.3" width="11.6" height="11.7"><title>libc · sub_00292F10 (344 B)</title></rect>
+<rect class="ok" x="67.9" y="202.3" width="11.6" height="11.7"><title>libc · sub_00293068 (104 B)</title></rect>
+<rect class="ok" x="80.5" y="202.3" width="11.6" height="11.7"><title>libc · sub_002930D0 (400 B)</title></rect>
+<rect class="ok" x="93.1" y="202.3" width="11.6" height="11.7"><title>libc · sub_00293260 (200 B)</title></rect>
+<rect class="ok" x="105.7" y="202.3" width="11.6" height="11.7"><title>libc · sub_00293328 (408 B)</title></rect>
+<rect class="ok" x="118.3" y="202.3" width="11.6" height="11.7"><title>libc · sub_002934C0 (384 B)</title></rect>
+<rect class="ok" x="130.9" y="202.3" width="11.6" height="11.7"><title>libc · sub_00293640 (200 B)</title></rect>
+<rect class="ok" x="143.5" y="202.3" width="11.6" height="11.7"><title>libc · sub_00293708 (504 B)</title></rect>
+<rect class="ok" x="156.1" y="202.3" width="11.6" height="11.7"><title>libc · sub_00293900 (16 B)</title></rect>
+<rect class="ok" x="168.7" y="202.3" width="11.6" height="11.7"><title>libc · sub_00293910 (16 B)</title></rect>
+<rect class="ok" x="17.5" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293920 (16 B)</title></rect>
+<rect class="ok" x="30.1" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293930 (16 B)</title></rect>
+<rect class="ok" x="42.7" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293940 (16 B)</title></rect>
+<rect class="ok" x="55.3" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293950 (16 B)</title></rect>
+<rect class="ok" x="67.9" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293960 (16 B)</title></rect>
+<rect class="ok" x="80.5" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293970 (16 B)</title></rect>
+<rect class="ok" x="93.1" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293980 (16 B)</title></rect>
+<rect class="ok" x="105.7" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293990 (144 B)</title></rect>
+<rect class="ok" x="118.3" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293A20 (16 B)</title></rect>
+<rect class="ok" x="130.9" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293A30 (16 B)</title></rect>
+<rect class="ok" x="143.5" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293A40 (48 B)</title></rect>
+<rect class="ok" x="156.1" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293A70 (64 B)</title></rect>
+<rect class="ok" x="168.7" y="214.9" width="11.6" height="11.7"><title>libc · sub_00293AB0 (32 B)</title></rect>
+<rect class="ok" x="17.5" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293AD0 (64 B)</title></rect>
+<rect class="ok" x="30.1" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293B10 (16 B)</title></rect>
+<rect class="ok" x="42.7" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293B20 (48 B)</title></rect>
+<rect class="ok" x="55.3" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293B50 (16 B)</title></rect>
+<rect class="ok" x="67.9" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293B60 (48 B)</title></rect>
+<rect class="ok" x="80.5" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293B90 (112 B)</title></rect>
+<rect class="ok" x="93.1" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293C00 (32 B)</title></rect>
+<rect class="ok" x="105.7" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293C20 (16 B)</title></rect>
+<rect class="ok" x="118.3" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293C30 (16 B)</title></rect>
+<rect class="ok" x="130.9" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293C40 (16 B)</title></rect>
+<rect class="ok" x="143.5" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293C50 (16 B)</title></rect>
+<rect class="ok" x="156.1" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293C60 (16 B)</title></rect>
+<rect class="ok" x="168.7" y="227.6" width="11.6" height="11.7"><title>libc · sub_00293C70 (80 B)</title></rect>
+<rect class="ok" x="17.5" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293CC0 (16 B)</title></rect>
+<rect class="ok" x="30.1" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293CD0 (464 B)</title></rect>
+<rect class="ok" x="42.7" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293EA0 (48 B)</title></rect>
+<rect class="ok" x="55.3" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293ED0 (32 B)</title></rect>
+<rect class="ok" x="67.9" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293EF0 (64 B)</title></rect>
+<rect class="ok" x="80.5" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293F30 (16 B)</title></rect>
+<rect class="ok" x="93.1" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293F40 (32 B)</title></rect>
+<rect class="ok" x="105.7" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293F60 (48 B)</title></rect>
+<rect class="ok" x="118.3" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293F90 (48 B)</title></rect>
+<rect class="ok" x="130.9" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293FC0 (32 B)</title></rect>
+<rect class="ok" x="143.5" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293FE0 (16 B)</title></rect>
+<rect class="ok" x="156.1" y="240.3" width="11.6" height="11.7"><title>libc · sub_00293FF0 (16 B)</title></rect>
+<rect class="ok" x="168.7" y="240.3" width="11.6" height="11.7"><title>libc · sub_00294000 (16 B)</title></rect>
+<rect class="ok" x="17.5" y="253" width="11.6" height="11.7"><title>libc · sub_00294010 (16 B)</title></rect>
+<rect class="ok" x="30.1" y="253" width="11.6" height="11.7"><title>libc · sub_00294020 (16 B)</title></rect>
+<rect class="ok" x="42.7" y="253" width="11.6" height="11.7"><title>libc · sub_00294030 (32 B)</title></rect>
+<rect class="ok" x="55.3" y="253" width="11.6" height="11.7"><title>libc · sub_00294050 (48 B)</title></rect>
+<rect class="ok" x="67.9" y="253" width="11.6" height="11.7"><title>libc · sub_00294080 (16 B)</title></rect>
+<rect class="ok" x="80.5" y="253" width="11.6" height="11.7"><title>libc · sub_00294090 (16 B)</title></rect>
+<rect class="ok" x="93.1" y="253" width="11.6" height="11.7"><title>libc · sub_002940A0 (16 B)</title></rect>
+<rect class="parcial" x="17.5" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026F228 (208 B)</title></rect>
+<rect x="17.5" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="30.1" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026F2F8 (568 B)</title></rect>
+<rect x="30.1" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="42.7" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026F530 (200 B)</title></rect>
+<rect x="42.7" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="55.3" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026F5F8 (440 B)</title></rect>
+<rect x="55.3" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="67.9" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026F7B0 (696 B)</title></rect>
+<rect x="67.9" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="80.5" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026FA68 (368 B)</title></rect>
+<rect x="80.5" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="93.1" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026FBD8 (456 B)</title></rect>
+<rect x="93.1" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="105.7" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026FDA0 (176 B)</title></rect>
+<rect x="105.7" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="118.3" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026FE50 (16 B)</title></rect>
+<rect x="118.3" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="130.9" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026FE60 (72 B)</title></rect>
+<rect x="130.9" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="143.5" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026FEA8 (72 B)</title></rect>
+<rect x="143.5" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="156.1" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026FEF0 (128 B)</title></rect>
+<rect x="156.1" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="168.7" y="267.7" width="11.6" height="12"><title>libmpeg · sub_0026FF70 (24 B)</title></rect>
+<rect x="168.7" y="267.7" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="17.5" y="280.6" width="11.6" height="12"><title>libmpeg · sub_0026FF88 (72 B)</title></rect>
+<rect x="17.5" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="30.1" y="280.6" width="11.6" height="12"><title>libmpeg · sub_0026FFD0 (120 B)</title></rect>
+<rect x="30.1" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="42.7" y="280.6" width="11.6" height="12"><title>libmpeg · sub_00270048 (120 B)</title></rect>
+<rect x="42.7" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="55.3" y="280.6" width="11.6" height="12"><title>libmpeg · sub_002700C0 (72 B)</title></rect>
+<rect x="55.3" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="67.9" y="280.6" width="11.6" height="12"><title>libmpeg · sub_00270108 (128 B)</title></rect>
+<rect x="67.9" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="80.5" y="280.6" width="11.6" height="12"><title>libmpeg · sub_00270188 (208 B)</title></rect>
+<rect x="80.5" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="93.1" y="280.6" width="11.6" height="12"><title>libmpeg · sub_00270258 (24 B)</title></rect>
+<rect x="93.1" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="105.7" y="280.6" width="11.6" height="12"><title>libmpeg · sub_00270270 (16 B)</title></rect>
+<rect x="105.7" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="118.3" y="280.6" width="11.6" height="12"><title>libmpeg · sub_00270280 (16 B)</title></rect>
+<rect x="118.3" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="130.9" y="280.6" width="11.6" height="12"><title>libmpeg · sub_00270290 (112 B)</title></rect>
+<rect x="130.9" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="143.5" y="280.6" width="11.6" height="12"><title>libmpeg · sub_00270300 (40 B)</title></rect>
+<rect x="143.5" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="156.1" y="280.6" width="11.6" height="12"><title>libmpeg · sub_00270328 (40 B)</title></rect>
+<rect x="156.1" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="168.7" y="280.6" width="11.6" height="12"><title>libmpeg · sub_00270350 (656 B)</title></rect>
+<rect x="168.7" y="280.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="17.5" y="293.6" width="11.6" height="12"><title>libmpeg · sub_002705E0 (704 B)</title></rect>
+<rect x="17.5" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="30.1" y="293.6" width="11.6" height="12"><title>libmpeg · sub_002708A0 (1056 B)</title></rect>
+<rect x="30.1" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="42.7" y="293.6" width="11.6" height="12"><title>libmpeg · sub_00270CC0 (192 B)</title></rect>
+<rect x="42.7" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="55.3" y="293.6" width="11.6" height="12"><title>libmpeg · sub_00270D80 (144 B)</title></rect>
+<rect x="55.3" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="67.9" y="293.6" width="11.6" height="12"><title>libmpeg · sub_00270E10 (448 B)</title></rect>
+<rect x="67.9" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="80.5" y="293.6" width="11.6" height="12"><title>libmpeg · sub_00270FD0 (1240 B)</title></rect>
+<rect x="80.5" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="93.1" y="293.6" width="11.6" height="12"><title>libmpeg · sub_002714A8 (328 B)</title></rect>
+<rect x="93.1" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="105.7" y="293.6" width="11.6" height="12"><title>libmpeg · sub_002715F0 (224 B)</title></rect>
+<rect x="105.7" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="118.3" y="293.6" width="11.6" height="12"><title>libmpeg · sub_002716D0 (464 B)</title></rect>
+<rect x="118.3" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="130.9" y="293.6" width="11.6" height="12"><title>libmpeg · sub_002718A0 (1704 B)</title></rect>
+<rect x="130.9" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="143.5" y="293.6" width="11.6" height="12"><title>libmpeg · sub_00271F48 (7592 B)</title></rect>
+<rect x="143.5" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="156.1" y="293.6" width="11.6" height="12"><title>libmpeg · sub_00273CF0 (992 B)</title></rect>
+<rect x="156.1" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="168.7" y="293.6" width="11.6" height="12"><title>libmpeg · sub_002740D0 (32 B)</title></rect>
+<rect x="168.7" y="293.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="17.5" y="306.6" width="11.6" height="12"><title>libmpeg · sub_002740F0 (304 B)</title></rect>
+<rect x="17.5" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="30.1" y="306.6" width="11.6" height="12"><title>libmpeg · sub_00274220 (16 B)</title></rect>
+<rect x="30.1" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="42.7" y="306.6" width="11.6" height="12"><title>libmpeg · sub_00274230 (160 B)</title></rect>
+<rect x="42.7" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="55.3" y="306.6" width="11.6" height="12"><title>libmpeg · sub_002742D0 (200 B)</title></rect>
+<rect x="55.3" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="67.9" y="306.6" width="11.6" height="12"><title>libmpeg · sub_00274398 (88 B)</title></rect>
+<rect x="67.9" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="80.5" y="306.6" width="11.6" height="12"><title>libmpeg · sub_002743F0 (64 B)</title></rect>
+<rect x="80.5" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="93.1" y="306.6" width="11.6" height="12"><title>libmpeg · sub_00274430 (392 B)</title></rect>
+<rect x="93.1" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="105.7" y="306.6" width="11.6" height="12"><title>libmpeg · sub_002745B8 (1800 B)</title></rect>
+<rect x="105.7" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="118.3" y="306.6" width="11.6" height="12"><title>libmpeg · sub_00274CC0 (592 B)</title></rect>
+<rect x="118.3" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="130.9" y="306.6" width="11.6" height="12"><title>libmpeg · sub_00274F10 (1160 B)</title></rect>
+<rect x="130.9" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="143.5" y="306.6" width="11.6" height="12"><title>libmpeg · sub_00275398 (544 B)</title></rect>
+<rect x="143.5" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="156.1" y="306.6" width="11.6" height="12"><title>libmpeg · sub_002755B8 (576 B)</title></rect>
+<rect x="156.1" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="168.7" y="306.6" width="11.6" height="12"><title>libmpeg · sub_002757F8 (816 B)</title></rect>
+<rect x="168.7" y="306.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="17.5" y="319.6" width="11.6" height="12"><title>libmpeg · sub_00275B28 (1064 B)</title></rect>
+<rect x="17.5" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="30.1" y="319.6" width="11.6" height="12"><title>libmpeg · sub_00275F50 (416 B)</title></rect>
+<rect x="30.1" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="42.7" y="319.6" width="11.6" height="12"><title>libmpeg · sub_002760F0 (1368 B)</title></rect>
+<rect x="42.7" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="55.3" y="319.6" width="11.6" height="12"><title>libmpeg · sub_00276648 (736 B)</title></rect>
+<rect x="55.3" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="67.9" y="319.6" width="11.6" height="12"><title>libmpeg · sub_00276928 (384 B)</title></rect>
+<rect x="67.9" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="80.5" y="319.6" width="11.6" height="12"><title>libmpeg · sub_00276AA8 (232 B)</title></rect>
+<rect x="80.5" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="93.1" y="319.6" width="11.6" height="12"><title>libmpeg · sub_00276B90 (296 B)</title></rect>
+<rect x="93.1" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="105.7" y="319.6" width="11.6" height="12"><title>libmpeg · sub_00276CB8 (56 B)</title></rect>
+<rect x="105.7" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="118.3" y="319.6" width="11.6" height="12"><title>libmpeg · sub_00276CF0 (8 B)</title></rect>
+<rect x="118.3" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="130.9" y="319.6" width="11.6" height="12"><title>libmpeg · sub_00276CF8 (624 B)</title></rect>
+<rect x="130.9" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="143.5" y="319.6" width="11.6" height="12"><title>libmpeg · sub_00276F68 (384 B)</title></rect>
+<rect x="143.5" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="156.1" y="319.6" width="11.6" height="12"><title>libmpeg · sub_002770E8 (120 B)</title></rect>
+<rect x="156.1" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="168.7" y="319.6" width="11.6" height="12"><title>libmpeg · sub_00277160 (152 B)</title></rect>
+<rect x="168.7" y="319.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="17.5" y="332.6" width="11.6" height="12"><title>libmpeg · sub_002771F8 (184 B)</title></rect>
+<rect x="17.5" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="30.1" y="332.6" width="11.6" height="12"><title>libmpeg · sub_002772B0 (208 B)</title></rect>
+<rect x="30.1" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="42.7" y="332.6" width="11.6" height="12"><title>libmpeg · sub_00277380 (176 B)</title></rect>
+<rect x="42.7" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="55.3" y="332.6" width="11.6" height="12"><title>libmpeg · sub_00277430 (184 B)</title></rect>
+<rect x="55.3" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="67.9" y="332.6" width="11.6" height="12"><title>libmpeg · sub_002774E8 (248 B)</title></rect>
+<rect x="67.9" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="80.5" y="332.6" width="11.6" height="12"><title>libmpeg · sub_002775E0 (256 B)</title></rect>
+<rect x="80.5" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="93.1" y="332.6" width="11.6" height="12"><title>libmpeg · sub_002776E0 (160 B)</title></rect>
+<rect x="93.1" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="105.7" y="332.6" width="11.6" height="12"><title>libmpeg · sub_00277780 (176 B)</title></rect>
+<rect x="105.7" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="118.3" y="332.6" width="11.6" height="12"><title>libmpeg · sub_00277830 (224 B)</title></rect>
+<rect x="118.3" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="130.9" y="332.6" width="11.6" height="12"><title>libmpeg · sub_00277910 (232 B)</title></rect>
+<rect x="130.9" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="143.5" y="332.6" width="11.6" height="12"><title>libmpeg · sub_002779F8 (216 B)</title></rect>
+<rect x="143.5" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="156.1" y="332.6" width="11.6" height="12"><title>libmpeg · sub_00277AD0 (208 B)</title></rect>
+<rect x="156.1" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="168.7" y="332.6" width="11.6" height="12"><title>libmpeg · sub_00277BA0 (288 B)</title></rect>
+<rect x="168.7" y="332.6" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="17.5" y="345.5" width="11.6" height="12"><title>libmpeg · sub_00277CC0 (280 B)</title></rect>
+<rect x="17.5" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="30.1" y="345.5" width="11.6" height="12"><title>libmpeg · sub_00277DD8 (160 B)</title></rect>
+<rect x="30.1" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="42.7" y="345.5" width="11.6" height="12"><title>libmpeg · sub_00277E78 (416 B)</title></rect>
+<rect x="42.7" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="55.3" y="345.5" width="11.6" height="12"><title>libmpeg · sub_00278018 (792 B)</title></rect>
+<rect x="55.3" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="67.9" y="345.5" width="11.6" height="12"><title>libmpeg · sub_00278330 (688 B)</title></rect>
+<rect x="67.9" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="80.5" y="345.5" width="11.6" height="12"><title>libmpeg · sub_002785E0 (160 B)</title></rect>
+<rect x="80.5" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="93.1" y="345.5" width="11.6" height="12"><title>libmpeg · sub_00278680 (328 B)</title></rect>
+<rect x="93.1" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="105.7" y="345.5" width="11.6" height="12"><title>libmpeg · sub_002787C8 (320 B)</title></rect>
+<rect x="105.7" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="118.3" y="345.5" width="11.6" height="12"><title>libmpeg · sub_00278908 (232 B)</title></rect>
+<rect x="118.3" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="130.9" y="345.5" width="11.6" height="12"><title>libmpeg · sub_002789F0 (16 B)</title></rect>
+<rect x="130.9" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="143.5" y="345.5" width="11.6" height="12"><title>libmpeg · sub_00278A00 (16 B)</title></rect>
+<rect x="143.5" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="156.1" y="345.5" width="11.6" height="12"><title>libmpeg · sub_00278A10 (488 B)</title></rect>
+<rect x="156.1" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="168.7" y="345.5" width="11.6" height="12"><title>libmpeg · sub_00278BF8 (16 B)</title></rect>
+<rect x="168.7" y="345.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="17.5" y="358.5" width="11.6" height="12"><title>libmpeg · sub_00278C08 (16 B)</title></rect>
+<rect x="17.5" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="30.1" y="358.5" width="11.6" height="12"><title>libmpeg · sub_00278C18 (464 B)</title></rect>
+<rect x="30.1" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="42.7" y="358.5" width="11.6" height="12"><title>libmpeg · sub_00278DE8 (56 B)</title></rect>
+<rect x="42.7" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="55.3" y="358.5" width="11.6" height="12"><title>libmpeg · sub_00278E20 (8 B)</title></rect>
+<rect x="55.3" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="67.9" y="358.5" width="11.6" height="12"><title>libmpeg · sub_00278E28 (344 B)</title></rect>
+<rect x="67.9" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="80.5" y="358.5" width="11.6" height="12"><title>libmpeg · sub_00278F80 (8 B)</title></rect>
+<rect x="80.5" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="93.1" y="358.5" width="11.6" height="12"><title>libmpeg · sub_00278F88 (80 B)</title></rect>
+<rect x="93.1" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="105.7" y="358.5" width="11.6" height="12"><title>libmpeg · sub_00278FD8 (144 B)</title></rect>
+<rect x="105.7" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="118.3" y="358.5" width="11.6" height="12"><title>libmpeg · sub_00279068 (152 B)</title></rect>
+<rect x="118.3" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="130.9" y="358.5" width="11.6" height="12"><title>libmpeg · sub_00279100 (248 B)</title></rect>
+<rect x="130.9" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="143.5" y="358.5" width="11.6" height="12"><title>libmpeg · sub_002791F8 (120 B)</title></rect>
+<rect x="143.5" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="156.1" y="358.5" width="11.6" height="12"><title>libmpeg · sub_00279270 (120 B)</title></rect>
+<rect x="156.1" y="358.5" width="11.6" height="12" fill="url(#rayas)" pointer-events="none"/>
+<rect class="ok" x="183.3" y="113.5" width="11.2" height="11.4"><title>libkernel · sub_002940B0 (144 B)</title></rect>
+<rect class="ok" x="195.5" y="113.5" width="11.2" height="11.4"><title>libkernel · sub_00294140 (168 B)</title></rect>
+<rect class="ok" x="207.8" y="113.5" width="11.2" height="11.4"><title>libkernel · sub_002941E8 (128 B)</title></rect>
+<rect class="ok" x="220" y="113.5" width="11.2" height="11.4"><title>libkernel · sub_00294268 (120 B)</title></rect>
+<rect class="ok" x="232.2" y="113.5" width="11.2" height="11.4"><title>libkernel · sub_002942E0 (8 B)</title></rect>
+<rect class="ok" x="244.5" y="113.5" width="11.2" height="11.4"><title>libkernel · sub_002942E8 (8 B)</title></rect>
+<rect class="ok" x="256.7" y="113.5" width="11.2" height="11.4"><title>libkernel · sub_002942F0 (176 B)</title></rect>
+<rect class="ok" x="268.9" y="113.5" width="11.2" height="11.4"><title>libkernel · sub_002943A0 (24 B)</title></rect>
+<rect class="ok" x="281.1" y="113.5" width="11.2" height="11.4"><title>libkernel · sub_002943B8 (168 B)</title></rect>
+<rect class="ok" x="293.4" y="113.5" width="11.2" height="11.4"><title>libkernel · sub_00294460 (136 B)</title></rect>
+<rect class="ok" x="305.6" y="113.5" width="11.2" height="11.4"><title>libkernel · sub_002944E8 (168 B)</title></rect>
+<rect class="ok" x="183.3" y="125.9" width="11.2" height="11.4"><title>libkernel · sub_00294590 (136 B)</title></rect>
+<rect class="ok" x="195.5" y="125.9" width="11.2" height="11.4"><title>libkernel · sub_00294618 (16 B)</title></rect>
+<rect class="ok" x="207.8" y="125.9" width="11.2" height="11.4"><title>libkernel · sub_00294628 (104 B)</title></rect>
+<rect class="ok" x="220" y="125.9" width="11.2" height="11.4"><title>libkernel · sub_00294690 (104 B)</title></rect>
+<rect class="ok" x="232.2" y="125.9" width="11.2" height="11.4"><title>libkernel · sub_002946F8 (104 B)</title></rect>
+<rect class="ok" x="244.5" y="125.9" width="11.2" height="11.4"><title>libkernel · sub_00294760 (104 B)</title></rect>
+<rect class="ok" x="256.7" y="125.9" width="11.2" height="11.4"><title>libkernel · sub_002947C8 (216 B)</title></rect>
+<rect class="ok" x="268.9" y="125.9" width="11.2" height="11.4"><title>libkernel · sub_002948A0 (400 B)</title></rect>
+<rect class="ok" x="281.1" y="125.9" width="11.2" height="11.4"><title>libkernel · sub_00294A30 (200 B)</title></rect>
+<rect class="ok" x="293.4" y="125.9" width="11.2" height="11.4"><title>libkernel · sub_00294AF8 (376 B)</title></rect>
+<rect class="ok" x="305.6" y="125.9" width="11.2" height="11.4"><title>libkernel · sub_00294C70 (40 B)</title></rect>
+<rect class="ok" x="183.3" y="138.3" width="11.2" height="11.4"><title>libkernel · sub_00294C98 (40 B)</title></rect>
+<rect class="ok" x="195.5" y="138.3" width="11.2" height="11.4"><title>libkernel · sub_00294CC0 (64 B)</title></rect>
+<rect class="ok" x="207.8" y="138.3" width="11.2" height="11.4"><title>libkernel · sub_00294D00 (64 B)</title></rect>
+<rect class="ok" x="220" y="138.3" width="11.2" height="11.4"><title>libkernel · sub_00294D40 (408 B)</title></rect>
+<rect class="ok" x="232.2" y="138.3" width="11.2" height="11.4"><title>libkernel · sub_00294ED8 (376 B)</title></rect>
+<rect class="ok" x="244.5" y="138.3" width="11.2" height="11.4"><title>libkernel · sub_00295050 (208 B)</title></rect>
+<rect class="ok" x="256.7" y="138.3" width="11.2" height="11.4"><title>libkernel · sub_00295120 (192 B)</title></rect>
+<rect class="ok" x="268.9" y="138.3" width="11.2" height="11.4"><title>libkernel · sub_002951E0 (56 B)</title></rect>
+<rect class="ok" x="281.1" y="138.3" width="11.2" height="11.4"><title>libkernel · sub_00295218 (176 B)</title></rect>
+<rect class="ok" x="293.4" y="138.3" width="11.2" height="11.4"><title>libkernel · sub_002952C8 (56 B)</title></rect>
+<rect class="ok" x="305.6" y="138.3" width="11.2" height="11.4"><title>libkernel · sub_00295300 (144 B)</title></rect>
+<rect class="ok" x="183.3" y="150.7" width="11.2" height="11.4"><title>libkernel · sub_00295390 (472 B)</title></rect>
+<rect class="ok" x="195.5" y="150.7" width="11.2" height="11.4"><title>libkernel · sub_00295568 (3352 B)</title></rect>
+<rect class="ok" x="207.8" y="150.7" width="11.2" height="11.4"><title>libkernel · sub_00296280 (88 B)</title></rect>
+<rect class="ok" x="220" y="150.7" width="11.2" height="11.4"><title>libkernel · sub_002962D8 (40 B)</title></rect>
+<rect class="ok" x="232.2" y="150.7" width="11.2" height="11.4"><title>libkernel · sub_00296300 (40 B)</title></rect>
+<rect class="ok" x="244.5" y="150.7" width="11.2" height="11.4"><title>libkernel · sub_00296328 (80 B)</title></rect>
+<rect class="ok" x="256.7" y="150.7" width="11.2" height="11.4"><title>libkernel · sub_00296378 (72 B)</title></rect>
+<rect class="ok" x="268.9" y="150.7" width="11.2" height="11.4"><title>libkernel · sub_002963C0 (128 B)</title></rect>
+<rect class="ok" x="281.1" y="150.7" width="11.2" height="11.4"><title>libkernel · sub_00296440 (128 B)</title></rect>
+<rect class="ok" x="293.4" y="150.7" width="11.2" height="11.4"><title>libkernel · sub_002964C0 (32 B)</title></rect>
+<rect class="ok" x="305.6" y="150.7" width="11.2" height="11.4"><title>libkernel · sub_002964E0 (16 B)</title></rect>
+<rect class="ok" x="183.3" y="163.1" width="11.2" height="11.4"><title>libkernel · sub_002964F0 (40 B)</title></rect>
+<rect class="ok" x="195.5" y="163.1" width="11.2" height="11.4"><title>libkernel · sub_00299230 (80 B)</title></rect>
+<rect class="ok" x="207.8" y="163.1" width="11.2" height="11.4"><title>libkernel · sub_00299280 (24 B)</title></rect>
+<rect class="ok" x="220" y="163.1" width="11.2" height="11.4"><title>libkernel · sub_00299298 (160 B)</title></rect>
+<rect class="ok" x="232.2" y="163.1" width="11.2" height="11.4"><title>libkernel · sub_00299338 (64 B)</title></rect>
+<rect class="ok" x="244.5" y="163.1" width="11.2" height="11.4"><title>libkernel · sub_00299378 (24 B)</title></rect>
+<rect class="ok" x="256.7" y="163.1" width="11.2" height="11.4"><title>libkernel · sub_00299390 (256 B)</title></rect>
+<rect class="ok" x="268.9" y="163.1" width="11.2" height="11.4"><title>libkernel · sub_00299490 (16 B)</title></rect>
+<rect class="ok" x="281.1" y="163.1" width="11.2" height="11.4"><title>libkernel · sub_002994A0 (88 B)</title></rect>
+<rect class="ok" x="293.4" y="163.1" width="11.2" height="11.4"><title>libkernel · sub_002994F8 (16 B)</title></rect>
+<rect class="ok" x="305.6" y="163.1" width="11.2" height="11.4"><title>libkernel · sub_00299508 (16 B)</title></rect>
+<rect class="ok" x="183.3" y="175.5" width="11.2" height="11.4"><title>libkernel · sub_00299518 (56 B)</title></rect>
+<rect class="ok" x="195.5" y="175.5" width="11.2" height="11.4"><title>libkernel · sub_00299550 (16 B)</title></rect>
+<rect class="ok" x="207.8" y="175.5" width="11.2" height="11.4"><title>libkernel · sub_00299560 (104 B)</title></rect>
+<rect class="ok" x="220" y="175.5" width="11.2" height="11.4"><title>libkernel · sub_002995C8 (176 B)</title></rect>
+<rect class="ok" x="232.2" y="175.5" width="11.2" height="11.4"><title>libkernel · sub_00299678 (48 B)</title></rect>
+<rect class="ok" x="244.5" y="175.5" width="11.2" height="11.4"><title>libkernel · sub_002996A8 (8 B)</title></rect>
+<rect class="ok" x="256.7" y="175.5" width="11.2" height="11.4"><title>libkernel · sub_002996B0 (48 B)</title></rect>
+<rect class="ok" x="268.9" y="175.5" width="11.2" height="11.4"><title>libkernel · sub_002996E0 (16 B)</title></rect>
+<rect class="ok" x="281.1" y="175.5" width="11.2" height="11.4"><title>libkernel · sub_002996F0 (16 B)</title></rect>
+<rect class="ok" x="293.4" y="175.5" width="11.2" height="11.4"><title>libkernel · sub_00299700 (56 B)</title></rect>
+<rect class="ok" x="305.6" y="175.5" width="11.2" height="11.4"><title>libkernel · sub_00299738 (16 B)</title></rect>
+<rect class="ok" x="183.3" y="187.9" width="11.2" height="11.4"><title>libkernel · sub_00299748 (328 B)</title></rect>
+<rect class="ok" x="195.5" y="187.9" width="11.2" height="11.4"><title>libkernel · sub_00299890 (16 B)</title></rect>
+<rect class="ok" x="207.8" y="187.9" width="11.2" height="11.4"><title>libkernel · sub_002998A0 (16 B)</title></rect>
+<rect class="ok" x="220" y="187.9" width="11.2" height="11.4"><title>libkernel · sub_002998B0 (16 B)</title></rect>
+<rect class="ok" x="232.2" y="187.9" width="11.2" height="11.4"><title>libkernel · sub_002998C0 (352 B)</title></rect>
+<rect class="ok" x="244.5" y="187.9" width="11.2" height="11.4"><title>libkernel · sub_00299A20 (152 B)</title></rect>
+<rect class="ok" x="256.7" y="187.9" width="11.2" height="11.4"><title>libkernel · sub_00299AB8 (400 B)</title></rect>
+<rect class="ok" x="268.9" y="187.9" width="11.2" height="11.4"><title>libkernel · sub_00299C48 (136 B)</title></rect>
+<rect class="ok" x="281.1" y="187.9" width="11.2" height="11.4"><title>libkernel · sub_00299CD0 (56 B)</title></rect>
+<rect class="ok" x="293.4" y="187.9" width="11.2" height="11.4"><title>libkernel · sub_00299D08 (680 B)</title></rect>
+<rect class="ok" x="305.6" y="187.9" width="11.2" height="11.4"><title>libkernel · sub_00299FB0 (88 B)</title></rect>
+<rect class="ok" x="183.3" y="200.3" width="11.2" height="11.4"><title>libkernel · sub_0029A008 (112 B)</title></rect>
+<rect class="ok" x="195.5" y="200.3" width="11.2" height="11.4"><title>libkernel · sub_0029A078 (88 B)</title></rect>
+<rect class="ok" x="207.8" y="200.3" width="11.2" height="11.4"><title>libkernel · sub_0029A0D0 (176 B)</title></rect>
+<rect class="ok" x="220" y="200.3" width="11.2" height="11.4"><title>libkernel · sub_0029A180 (128 B)</title></rect>
+<rect class="ok" x="232.2" y="200.3" width="11.2" height="11.4"><title>libkernel · sub_0029A200 (248 B)</title></rect>
+<rect class="ok" x="244.5" y="200.3" width="11.2" height="11.4"><title>libkernel · sub_0029A2F8 (128 B)</title></rect>
+<rect class="ok" x="256.7" y="200.3" width="11.2" height="11.4"><title>libkernel · sub_0029A378 (128 B)</title></rect>
+<rect class="ok" x="268.9" y="200.3" width="11.2" height="11.4"><title>libkernel · sub_0029A3F8 (80 B)</title></rect>
+<rect class="ok" x="281.1" y="200.3" width="11.2" height="11.4"><title>libkernel · sub_0029A448 (96 B)</title></rect>
+<rect class="ok" x="293.4" y="200.3" width="11.2" height="11.4"><title>libkernel · sub_0029A4A8 (600 B)</title></rect>
+<rect class="ok" x="305.6" y="200.3" width="11.2" height="11.4"><title>libkernel · sub_0029A700 (168 B)</title></rect>
+<rect class="ok" x="183.3" y="212.7" width="11.2" height="11.4"><title>libkernel · sub_0029A7A8 (80 B)</title></rect>
+<rect class="ok" x="195.5" y="212.7" width="11.2" height="11.4"><title>libkernel · sub_0029A7F8 (48 B)</title></rect>
+<rect class="ok" x="207.8" y="212.7" width="11.2" height="11.4"><title>libkernel · sub_0029A828 (48 B)</title></rect>
+<rect class="ok" x="220" y="212.7" width="11.2" height="11.4"><title>libkernel · sub_0029A858 (56 B)</title></rect>
+<rect class="ok" x="232.2" y="212.7" width="11.2" height="11.4"><title>libkernel · sub_0029A890 (72 B)</title></rect>
+<rect class="ok" x="244.5" y="212.7" width="11.2" height="11.4"><title>libkernel · sub_0029A8D8 (48 B)</title></rect>
+<rect class="ok" x="256.7" y="212.7" width="11.2" height="11.4"><title>libkernel · sub_0029A908 (16 B)</title></rect>
+<rect class="ok" x="268.9" y="212.7" width="11.2" height="11.4"><title>libkernel · sub_0029A918 (56 B)</title></rect>
+<rect class="ok" x="281.1" y="212.7" width="11.2" height="11.4"><title>libkernel · sub_0029A950 (16 B)</title></rect>
+<rect class="ok" x="293.4" y="212.7" width="11.2" height="11.4"><title>libkernel · sub_0029A960 (16 B)</title></rect>
+<rect class="ok" x="305.6" y="212.7" width="11.2" height="11.4"><title>libkernel · sub_0029A970 (200 B)</title></rect>
+<rect class="ok" x="183.3" y="225.1" width="11.2" height="11.4"><title>libkernel · sub_0029AA38 (80 B)</title></rect>
+<rect class="ok" x="195.5" y="225.1" width="11.2" height="11.4"><title>libkernel · sub_0029AA88 (856 B)</title></rect>
+<rect class="parcial" x="319.8" y="113.5" width="12.3" height="11.4"><title>libmc2 · sub_0027C100 (416 B)</title></rect>
+<rect x="319.8" y="113.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="333.1" y="113.5" width="12.3" height="11.4"><title>libmc2 · sub_0027C2A0 (224 B)</title></rect>
+<rect x="333.1" y="113.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="346.4" y="113.5" width="12.3" height="11.4"><title>libmc2 · sub_0027C380 (144 B)</title></rect>
+<rect x="346.4" y="113.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="359.7" y="113.5" width="12.3" height="11.4"><title>libmc2 · sub_0027C410 (176 B)</title></rect>
+<rect x="359.7" y="113.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="373" y="113.5" width="12.3" height="11.4"><title>libmc2 · sub_0027C4C0 (192 B)</title></rect>
+<rect x="373" y="113.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="386.3" y="113.5" width="12.3" height="11.4"><title>libmc2 · sub_0027C580 (288 B)</title></rect>
+<rect x="386.3" y="113.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="399.6" y="113.5" width="12.3" height="11.4"><title>libmc2 · sub_0027C6A0 (288 B)</title></rect>
+<rect x="399.6" y="113.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="412.9" y="113.5" width="12.3" height="11.4"><title>libmc2 · sub_0027C7C0 (248 B)</title></rect>
+<rect x="412.9" y="113.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="426.2" y="113.5" width="12.3" height="11.4"><title>libmc2 · sub_0027C8B8 (232 B)</title></rect>
+<rect x="426.2" y="113.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="319.8" y="125.9" width="12.3" height="11.4"><title>libmc2 · sub_0027C9A0 (304 B)</title></rect>
+<rect x="319.8" y="125.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="333.1" y="125.9" width="12.3" height="11.4"><title>libmc2 · sub_0027CAD0 (256 B)</title></rect>
+<rect x="333.1" y="125.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="346.4" y="125.9" width="12.3" height="11.4"><title>libmc2 · sub_0027CBD0 (704 B)</title></rect>
+<rect x="346.4" y="125.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="359.7" y="125.9" width="12.3" height="11.4"><title>libmc2 · sub_0027CE90 (168 B)</title></rect>
+<rect x="359.7" y="125.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="373" y="125.9" width="12.3" height="11.4"><title>libmc2 · sub_0027CF38 (48 B)</title></rect>
+<rect x="373" y="125.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="386.3" y="125.9" width="12.3" height="11.4"><title>libmc2 · sub_0027CF68 (176 B)</title></rect>
+<rect x="386.3" y="125.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="399.6" y="125.9" width="12.3" height="11.4"><title>libmc2 · sub_0027D018 (96 B)</title></rect>
+<rect x="399.6" y="125.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="412.9" y="125.9" width="12.3" height="11.4"><title>libmc2 · sub_0027D078 (112 B)</title></rect>
+<rect x="412.9" y="125.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="426.2" y="125.9" width="12.3" height="11.4"><title>libmc2 · sub_0027D0E8 (96 B)</title></rect>
+<rect x="426.2" y="125.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="319.8" y="138.3" width="12.3" height="11.4"><title>libmc2 · sub_0027D148 (384 B)</title></rect>
+<rect x="319.8" y="138.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="333.1" y="138.3" width="12.3" height="11.4"><title>libmc2 · sub_0027D2C8 (288 B)</title></rect>
+<rect x="333.1" y="138.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="346.4" y="138.3" width="12.3" height="11.4"><title>libmc2 · sub_0027D3E8 (72 B)</title></rect>
+<rect x="346.4" y="138.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="359.7" y="138.3" width="12.3" height="11.4"><title>libmc2 · sub_0027D430 (392 B)</title></rect>
+<rect x="359.7" y="138.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="373" y="138.3" width="12.3" height="11.4"><title>libmc2 · sub_0027D5B8 (96 B)</title></rect>
+<rect x="373" y="138.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="386.3" y="138.3" width="12.3" height="11.4"><title>libmc2 · sub_0027D618 (288 B)</title></rect>
+<rect x="386.3" y="138.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="399.6" y="138.3" width="12.3" height="11.4"><title>libmc2 · sub_0027D738 (144 B)</title></rect>
+<rect x="399.6" y="138.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="412.9" y="138.3" width="12.3" height="11.4"><title>libmc2 · sub_0027D7C8 (280 B)</title></rect>
+<rect x="412.9" y="138.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="426.2" y="138.3" width="12.3" height="11.4"><title>libmc2 · sub_0027D8E0 (72 B)</title></rect>
+<rect x="426.2" y="138.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="319.8" y="150.7" width="12.3" height="11.4"><title>libmc2 · sub_0027D928 (104 B)</title></rect>
+<rect x="319.8" y="150.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="333.1" y="150.7" width="12.3" height="11.4"><title>libmc2 · sub_0027D990 (304 B)</title></rect>
+<rect x="333.1" y="150.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="346.4" y="150.7" width="12.3" height="11.4"><title>libmc2 · sub_0027DAC0 (304 B)</title></rect>
+<rect x="346.4" y="150.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="359.7" y="150.7" width="12.3" height="11.4"><title>libmc2 · sub_0027DBF0 (216 B)</title></rect>
+<rect x="359.7" y="150.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="373" y="150.7" width="12.3" height="11.4"><title>libmc2 · sub_0027DCC8 (384 B)</title></rect>
+<rect x="373" y="150.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="386.3" y="150.7" width="12.3" height="11.4"><title>libmc2 · sub_0027DE48 (144 B)</title></rect>
+<rect x="386.3" y="150.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="399.6" y="150.7" width="12.3" height="11.4"><title>libmc2 · sub_0027DED8 (88 B)</title></rect>
+<rect x="399.6" y="150.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="412.9" y="150.7" width="12.3" height="11.4"><title>libmc2 · sub_0027DF30 (920 B)</title></rect>
+<rect x="412.9" y="150.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="426.2" y="150.7" width="12.3" height="11.4"><title>libmc2 · sub_0027E2C8 (2352 B)</title></rect>
+<rect x="426.2" y="150.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="319.8" y="163.1" width="12.3" height="11.4"><title>libmc2 · sub_0027EBF8 (256 B)</title></rect>
+<rect x="319.8" y="163.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="333.1" y="163.1" width="12.3" height="11.4"><title>libmc2 · sub_0027ECF8 (232 B)</title></rect>
+<rect x="333.1" y="163.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="346.4" y="163.1" width="12.3" height="11.4"><title>libmc2 · sub_0027EDE0 (632 B)</title></rect>
+<rect x="346.4" y="163.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="359.7" y="163.1" width="12.3" height="11.4"><title>libmc2 · sub_0027F058 (1080 B)</title></rect>
+<rect x="359.7" y="163.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="373" y="163.1" width="12.3" height="11.4"><title>libmc2 · sub_0027F490 (424 B)</title></rect>
+<rect x="373" y="163.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="386.3" y="163.1" width="12.3" height="11.4"><title>libmc2 · sub_0027F638 (304 B)</title></rect>
+<rect x="386.3" y="163.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="399.6" y="163.1" width="12.3" height="11.4"><title>libmc2 · sub_0027F768 (1304 B)</title></rect>
+<rect x="399.6" y="163.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="412.9" y="163.1" width="12.3" height="11.4"><title>libmc2 · sub_0027FC80 (1360 B)</title></rect>
+<rect x="412.9" y="163.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="426.2" y="163.1" width="12.3" height="11.4"><title>libmc2 · sub_002801D0 (496 B)</title></rect>
+<rect x="426.2" y="163.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="319.8" y="175.5" width="12.3" height="11.4"><title>libmc2 · sub_002803C0 (1472 B)</title></rect>
+<rect x="319.8" y="175.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="333.1" y="175.5" width="12.3" height="11.4"><title>libmc2 · sub_00280980 (536 B)</title></rect>
+<rect x="333.1" y="175.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="346.4" y="175.5" width="12.3" height="11.4"><title>libmc2 · sub_00280B98 (280 B)</title></rect>
+<rect x="346.4" y="175.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="359.7" y="175.5" width="12.3" height="11.4"><title>libmc2 · sub_00280CB0 (1312 B)</title></rect>
+<rect x="359.7" y="175.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="373" y="175.5" width="12.3" height="11.4"><title>libmc2 · sub_002811D0 (208 B)</title></rect>
+<rect x="373" y="175.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="386.3" y="175.5" width="12.3" height="11.4"><title>libmc2 · sub_002812A0 (464 B)</title></rect>
+<rect x="386.3" y="175.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="399.6" y="175.5" width="12.3" height="11.4"><title>libmc2 · sub_00281470 (160 B)</title></rect>
+<rect x="399.6" y="175.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="412.9" y="175.5" width="12.3" height="11.4"><title>libmc2 · sub_00281510 (56 B)</title></rect>
+<rect x="412.9" y="175.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="426.2" y="175.5" width="12.3" height="11.4"><title>libmc2 · sub_00281548 (32 B)</title></rect>
+<rect x="426.2" y="175.5" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="319.8" y="187.9" width="12.3" height="11.4"><title>libmc2 · sub_00281568 (32 B)</title></rect>
+<rect x="319.8" y="187.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="333.1" y="187.9" width="12.3" height="11.4"><title>libmc2 · sub_00281588 (32 B)</title></rect>
+<rect x="333.1" y="187.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="346.4" y="187.9" width="12.3" height="11.4"><title>libmc2 · sub_002815A8 (280 B)</title></rect>
+<rect x="346.4" y="187.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="359.7" y="187.9" width="12.3" height="11.4"><title>libmc2 · sub_002816C0 (288 B)</title></rect>
+<rect x="359.7" y="187.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="373" y="187.9" width="12.3" height="11.4"><title>libmc2 · sub_002817E0 (64 B)</title></rect>
+<rect x="373" y="187.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="386.3" y="187.9" width="12.3" height="11.4"><title>libmc2 · sub_00281820 (64 B)</title></rect>
+<rect x="386.3" y="187.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="399.6" y="187.9" width="12.3" height="11.4"><title>libmc2 · sub_00281860 (112 B)</title></rect>
+<rect x="399.6" y="187.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="412.9" y="187.9" width="12.3" height="11.4"><title>libmc2 · sub_002818D0 (920 B)</title></rect>
+<rect x="412.9" y="187.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="426.2" y="187.9" width="12.3" height="11.4"><title>libmc2 · sub_00281C68 (320 B)</title></rect>
+<rect x="426.2" y="187.9" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="319.8" y="200.3" width="12.3" height="11.4"><title>libmc2 · sub_00281DA8 (32 B)</title></rect>
+<rect x="319.8" y="200.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="333.1" y="200.3" width="12.3" height="11.4"><title>libmc2 · sub_00281DC8 (32 B)</title></rect>
+<rect x="333.1" y="200.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="346.4" y="200.3" width="12.3" height="11.4"><title>libmc2 · sub_00281DE8 (72 B)</title></rect>
+<rect x="346.4" y="200.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="359.7" y="200.3" width="12.3" height="11.4"><title>libmc2 · sub_00281E30 (72 B)</title></rect>
+<rect x="359.7" y="200.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="373" y="200.3" width="12.3" height="11.4"><title>libmc2 · sub_00281E78 (376 B)</title></rect>
+<rect x="373" y="200.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="386.3" y="200.3" width="12.3" height="11.4"><title>libmc2 · sub_00281FF0 (208 B)</title></rect>
+<rect x="386.3" y="200.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="399.6" y="200.3" width="12.3" height="11.4"><title>libmc2 · sub_002820C0 (88 B)</title></rect>
+<rect x="399.6" y="200.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="412.9" y="200.3" width="12.3" height="11.4"><title>libmc2 · sub_00282118 (48 B)</title></rect>
+<rect x="412.9" y="200.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="426.2" y="200.3" width="12.3" height="11.4"><title>libmc2 · sub_00282148 (144 B)</title></rect>
+<rect x="426.2" y="200.3" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="319.8" y="212.7" width="12.3" height="11.4"><title>libmc2 · sub_002821D8 (48 B)</title></rect>
+<rect x="319.8" y="212.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="333.1" y="212.7" width="12.3" height="11.4"><title>libmc2 · sub_00282208 (40 B)</title></rect>
+<rect x="333.1" y="212.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="346.4" y="212.7" width="12.3" height="11.4"><title>libmc2 · sub_00282230 (64 B)</title></rect>
+<rect x="346.4" y="212.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="359.7" y="212.7" width="12.3" height="11.4"><title>libmc2 · sub_00282270 (472 B)</title></rect>
+<rect x="359.7" y="212.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="373" y="212.7" width="12.3" height="11.4"><title>libmc2 · sub_00282448 (256 B)</title></rect>
+<rect x="373" y="212.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="386.3" y="212.7" width="12.3" height="11.4"><title>libmc2 · sub_00282548 (216 B)</title></rect>
+<rect x="386.3" y="212.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="399.6" y="212.7" width="12.3" height="11.4"><title>libmc2 · sub_00282620 (240 B)</title></rect>
+<rect x="399.6" y="212.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="412.9" y="212.7" width="12.3" height="11.4"><title>libmc2 · sub_00282710 (312 B)</title></rect>
+<rect x="412.9" y="212.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="426.2" y="212.7" width="12.3" height="11.4"><title>libmc2 · sub_00282848 (264 B)</title></rect>
+<rect x="426.2" y="212.7" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="319.8" y="225.1" width="12.3" height="11.4"><title>libmc2 · sub_00282950 (408 B)</title></rect>
+<rect x="319.8" y="225.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="333.1" y="225.1" width="12.3" height="11.4"><title>libmc2 · sub_00282AE8 (32 B)</title></rect>
+<rect x="333.1" y="225.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="346.4" y="225.1" width="12.3" height="11.4"><title>libmc2 · sub_00282B08 (408 B)</title></rect>
+<rect x="346.4" y="225.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="359.7" y="225.1" width="12.3" height="11.4"><title>libmc2 · sub_00282CA0 (304 B)</title></rect>
+<rect x="359.7" y="225.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="373" y="225.1" width="12.3" height="11.4"><title>libmc2 · sub_00282DD0 (56 B)</title></rect>
+<rect x="373" y="225.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="386.3" y="225.1" width="12.3" height="11.4"><title>libmc2 · sub_00282E08 (56 B)</title></rect>
+<rect x="386.3" y="225.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="399.6" y="225.1" width="12.3" height="11.4"><title>libmc2 · sub_00282E40 (288 B)</title></rect>
+<rect x="399.6" y="225.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="412.9" y="225.1" width="12.3" height="11.4"><title>libmc2 · sub_00282F60 (72 B)</title></rect>
+<rect x="412.9" y="225.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="426.2" y="225.1" width="12.3" height="11.4"><title>libmc2 · sub_00282FA8 (48 B)</title></rect>
+<rect x="426.2" y="225.1" width="12.3" height="11.4" fill="url(#rayas)" pointer-events="none"/>
+<rect class="ok" x="183.3" y="239.5" width="10.7" height="12.4"><title>C++ EH · sub_00285490 (40 B)</title></rect>
+<rect class="ok" x="195" y="239.5" width="10.7" height="12.4"><title>C++ EH · sub_002854B8 (48 B)</title></rect>
+<rect class="ok" x="206.7" y="239.5" width="10.7" height="12.4"><title>C++ EH · sub_002854E8 (8 B)</title></rect>
+<rect class="ok" x="218.4" y="239.5" width="10.7" height="12.4"><title>C++ EH · sub_002854F0 (88 B)</title></rect>
+<rect class="ok" x="230.1" y="239.5" width="10.7" height="12.4"><title>C++ EH · sub_00285548 (40 B)</title></rect>
+<rect class="ok" x="241.8" y="239.5" width="10.7" height="12.4"><title>C++ EH · sub_00285570 (40 B)</title></rect>
+<rect class="ok" x="253.5" y="239.5" width="10.7" height="12.4"><title>C++ EH · sub_00285598 (40 B)</title></rect>
+<rect class="ok" x="183.3" y="252.9" width="10.7" height="12.4"><title>C++ EH · sub_002855C0 (104 B)</title></rect>
+<rect class="ok" x="195" y="252.9" width="10.7" height="12.4"><title>C++ EH · sub_00285628 (40 B)</title></rect>
+<rect class="ok" x="206.7" y="252.9" width="10.7" height="12.4"><title>C++ EH · sub_00285650 (656 B)</title></rect>
+<rect class="ok" x="218.4" y="252.9" width="10.7" height="12.4"><title>C++ EH · sub_002858E0 (72 B)</title></rect>
+<rect class="ok" x="230.1" y="252.9" width="10.7" height="12.4"><title>C++ EH · sub_00285928 (8 B)</title></rect>
+<rect class="ok" x="241.8" y="252.9" width="10.7" height="12.4"><title>C++ EH · sub_00285930 (8 B)</title></rect>
+<rect class="ok" x="253.5" y="252.9" width="10.7" height="12.4"><title>C++ EH · sub_00285938 (216 B)</title></rect>
+<rect class="ok" x="183.3" y="266.3" width="10.7" height="12.4"><title>C++ EH · sub_00285A10 (328 B)</title></rect>
+<rect class="ok" x="195" y="266.3" width="10.7" height="12.4"><title>C++ EH · sub_00285B58 (136 B)</title></rect>
+<rect class="ok" x="206.7" y="266.3" width="10.7" height="12.4"><title>C++ EH · sub_00285BE0 (128 B)</title></rect>
+<rect class="ok" x="218.4" y="266.3" width="10.7" height="12.4"><title>C++ EH · sub_00285C60 (144 B)</title></rect>
+<rect class="ok" x="230.1" y="266.3" width="10.7" height="12.4"><title>C++ EH · sub_00285CF0 (8 B)</title></rect>
+<rect class="ok" x="241.8" y="266.3" width="10.7" height="12.4"><title>C++ EH · sub_00285CF8 (816 B)</title></rect>
+<rect class="ok" x="253.5" y="266.3" width="10.7" height="12.4"><title>C++ EH · sub_00286028 (480 B)</title></rect>
+<rect class="ok" x="183.3" y="279.7" width="10.7" height="12.4"><title>C++ EH · sub_00286208 (488 B)</title></rect>
+<rect class="ok" x="195" y="279.7" width="10.7" height="12.4"><title>C++ EH · sub_002863F0 (72 B)</title></rect>
+<rect class="ok" x="206.7" y="279.7" width="10.7" height="12.4"><title>C++ EH · sub_00286438 (80 B)</title></rect>
+<rect class="ok" x="218.4" y="279.7" width="10.7" height="12.4"><title>C++ EH · sub_00286488 (256 B)</title></rect>
+<rect class="ok" x="230.1" y="279.7" width="10.7" height="12.4"><title>C++ EH · sub_00286588 (616 B)</title></rect>
+<rect class="ok" x="241.8" y="279.7" width="10.7" height="12.4"><title>C++ EH · sub_002867F0 (72 B)</title></rect>
+<rect class="ok" x="253.5" y="279.7" width="10.7" height="12.4"><title>C++ EH · sub_00286838 (136 B)</title></rect>
+<rect class="ok" x="183.3" y="293.1" width="10.7" height="12.4"><title>C++ EH · sub_002868C0 (320 B)</title></rect>
+<rect class="ok" x="195" y="293.1" width="10.7" height="12.4"><title>C++ EH · sub_00286A00 (232 B)</title></rect>
+<rect class="ok" x="206.7" y="293.1" width="10.7" height="12.4"><title>C++ EH · sub_00286AE8 (264 B)</title></rect>
+<rect class="ok" x="218.4" y="293.1" width="10.7" height="12.4"><title>C++ EH · sub_00286BF0 (1080 B)</title></rect>
+<rect class="ok" x="230.1" y="293.1" width="10.7" height="12.4"><title>C++ EH · sub_00287028 (472 B)</title></rect>
+<rect class="ok" x="241.8" y="293.1" width="10.7" height="12.4"><title>C++ EH · sub_00287200 (376 B)</title></rect>
+<rect class="ok" x="183.3" y="308.5" width="10.7" height="11.6"><title>libgcc · sub_00283790 (1776 B)</title></rect>
+<rect class="ok" x="195" y="308.5" width="10.7" height="11.6"><title>libgcc · sub_00283E80 (48 B)</title></rect>
+<rect class="ok" x="206.7" y="308.5" width="10.7" height="11.6"><title>libgcc · sub_00283EB0 (96 B)</title></rect>
+<rect class="ok" x="218.4" y="308.5" width="10.7" height="11.6"><title>libgcc · sub_00283F10 (8 B)</title></rect>
+<rect class="ok" x="230.1" y="308.5" width="10.7" height="11.6"><title>libgcc · sub_00283F18 (1488 B)</title></rect>
+<rect class="ok" x="241.8" y="308.5" width="10.7" height="11.6"><title>libgcc · sub_002844E8 (304 B)</title></rect>
+<rect class="ok" x="253.5" y="308.5" width="10.7" height="11.6"><title>libgcc · sub_00284618 (160 B)</title></rect>
+<rect class="ok" x="183.3" y="321.1" width="10.7" height="11.6"><title>libgcc · sub_002846B8 (576 B)</title></rect>
+<rect class="ok" x="195" y="321.1" width="10.7" height="11.6"><title>libgcc · sub_002848F8 (88 B)</title></rect>
+<rect class="ok" x="206.7" y="321.1" width="10.7" height="11.6"><title>libgcc · sub_00284950 (104 B)</title></rect>
+<rect class="ok" x="218.4" y="321.1" width="10.7" height="11.6"><title>libgcc · sub_002849B8 (680 B)</title></rect>
+<rect class="ok" x="230.1" y="321.1" width="10.7" height="11.6"><title>libgcc · sub_00284C60 (360 B)</title></rect>
+<rect class="ok" x="241.8" y="321.1" width="10.7" height="11.6"><title>libgcc · sub_00284DC8 (280 B)</title></rect>
+<rect class="ok" x="253.5" y="321.1" width="10.7" height="11.6"><title>libgcc · sub_00284EE0 (80 B)</title></rect>
+<rect class="ok" x="183.3" y="333.7" width="10.7" height="11.6"><title>libgcc · sub_00284F30 (184 B)</title></rect>
+<rect class="ok" x="195" y="333.7" width="10.7" height="11.6"><title>libgcc · sub_00284FE8 (152 B)</title></rect>
+<rect class="ok" x="206.7" y="333.7" width="10.7" height="11.6"><title>libgcc · sub_00285080 (160 B)</title></rect>
+<rect class="ok" x="218.4" y="333.7" width="10.7" height="11.6"><title>libgcc · sub_00285120 (48 B)</title></rect>
+<rect class="ok" x="230.1" y="333.7" width="10.7" height="11.6"><title>libgcc · sub_00285150 (88 B)</title></rect>
+<rect class="ok" x="241.8" y="333.7" width="10.7" height="11.6"><title>libgcc · sub_002851A8 (272 B)</title></rect>
+<rect class="ok" x="253.5" y="333.7" width="10.7" height="11.6"><title>libgcc · sub_002852B8 (192 B)</title></rect>
+<rect class="ok" x="183.3" y="346.3" width="10.7" height="11.6"><title>libgcc · sub_00285378 (152 B)</title></rect>
+<rect class="ok" x="195" y="346.3" width="10.7" height="11.6"><title>libgcc · sub_00285410 (48 B)</title></rect>
+<rect class="ok" x="206.7" y="346.3" width="10.7" height="11.6"><title>libgcc · sub_00285440 (64 B)</title></rect>
+<rect class="ok" x="218.4" y="346.3" width="10.7" height="11.6"><title>libgcc · sub_00285480 (16 B)</title></rect>
+<rect class="ok" x="230.1" y="346.3" width="10.7" height="11.6"><title>libgcc · sub_0029ADE0 (96 B)</title></rect>
+<rect class="ok" x="241.8" y="346.3" width="10.7" height="11.6"><title>libgcc · sub_0029AE40 (248 B)</title></rect>
+<rect class="ok" x="253.5" y="346.3" width="10.7" height="11.6"><title>libgcc · sub_0029AF38 (152 B)</title></rect>
+<rect class="ok" x="183.3" y="358.9" width="10.7" height="11.6"><title>libgcc · sub_0029AFD0 (1640 B)</title></rect>
+<rect class="ok" x="195" y="358.9" width="10.7" height="11.6"><title>libgcc · sub_0029B638 (1344 B)</title></rect>
+<rect class="ok" x="206.7" y="358.9" width="10.7" height="11.6"><title>libgcc · sub_0029BB78 (24 B)</title></rect>
+<rect class="ok" x="218.4" y="358.9" width="10.7" height="11.6"><title>libgcc · sub_0029BB90 (20 B)</title></rect>
+<rect class="ok" x="267.2" y="239.5" width="10.9" height="12.4"><title>sif · sub_00296518 (640 B)</title></rect>
+<rect class="ok" x="279.1" y="239.5" width="10.9" height="12.4"><title>sif · sub_00296798 (56 B)</title></rect>
+<rect class="ok" x="291" y="239.5" width="10.9" height="12.4"><title>sif · sub_002967D0 (120 B)</title></rect>
+<rect class="ok" x="303" y="239.5" width="10.9" height="12.4"><title>sif · sub_00296848 (80 B)</title></rect>
+<rect class="ok" x="267.2" y="252.9" width="10.9" height="12.4"><title>sif · sub_00296898 (312 B)</title></rect>
+<rect class="ok" x="279.1" y="252.9" width="10.9" height="12.4"><title>sif · sub_002969D0 (64 B)</title></rect>
+<rect class="ok" x="291" y="252.9" width="10.9" height="12.4"><title>sif · sub_00296A10 (64 B)</title></rect>
+<rect class="ok" x="303" y="252.9" width="10.9" height="12.4"><title>sif · sub_00296A50 (328 B)</title></rect>
+<rect class="ok" x="267.2" y="266.4" width="10.9" height="12.4"><title>sif · sub_00296B98 (592 B)</title></rect>
+<rect class="ok" x="279.1" y="266.4" width="10.9" height="12.4"><title>sif · sub_00296DE8 (40 B)</title></rect>
+<rect class="ok" x="291" y="266.4" width="10.9" height="12.4"><title>sif · sub_00296E10 (168 B)</title></rect>
+<rect class="ok" x="303" y="266.4" width="10.9" height="12.4"><title>sif · sub_00296EB8 (32 B)</title></rect>
+<rect class="ok" x="267.2" y="279.8" width="10.9" height="12.4"><title>sif · sub_00296ED8 (48 B)</title></rect>
+<rect class="ok" x="279.1" y="279.8" width="10.9" height="12.4"><title>sif · sub_00296F08 (64 B)</title></rect>
+<rect class="ok" x="291" y="279.8" width="10.9" height="12.4"><title>sif · sub_00296F48 (208 B)</title></rect>
+<rect class="ok" x="303" y="279.8" width="10.9" height="12.4"><title>sif · sub_00297018 (64 B)</title></rect>
+<rect class="ok" x="267.2" y="293.2" width="10.9" height="12.4"><title>sif · sub_00297058 (216 B)</title></rect>
+<rect class="ok" x="279.1" y="293.2" width="10.9" height="12.4"><title>sif · sub_00297130 (80 B)</title></rect>
+<rect class="ok" x="291" y="293.2" width="10.9" height="12.4"><title>sif · sub_00297180 (64 B)</title></rect>
+<rect class="ok" x="303" y="293.2" width="10.9" height="12.4"><title>sif · sub_002971C0 (208 B)</title></rect>
+<rect class="ok" x="267.2" y="306.6" width="10.9" height="12.4"><title>sif · sub_00297290 (336 B)</title></rect>
+<rect class="ok" x="279.1" y="306.6" width="10.9" height="12.4"><title>sif · sub_002973E0 (144 B)</title></rect>
+<rect class="ok" x="291" y="306.6" width="10.9" height="12.4"><title>sif · sub_00297470 (512 B)</title></rect>
+<rect class="ok" x="303" y="306.6" width="10.9" height="12.4"><title>sif · sub_00297670 (88 B)</title></rect>
+<rect class="ok" x="267.2" y="322" width="10.9" height="11.4"><title>fileio · sub_002976C8 (120 B)</title></rect>
+<rect class="ok" x="279.1" y="322" width="10.9" height="11.4"><title>fileio · sub_00297740 (136 B)</title></rect>
+<rect class="ok" x="291" y="322" width="10.9" height="11.4"><title>fileio · sub_002977C8 (240 B)</title></rect>
+<rect class="ok" x="303" y="322" width="10.9" height="11.4"><title>fileio · sub_002978B8 (112 B)</title></rect>
+<rect class="ok" x="267.2" y="334.4" width="10.9" height="11.4"><title>fileio · sub_00297928 (952 B)</title></rect>
+<rect class="ok" x="279.1" y="334.4" width="10.9" height="11.4"><title>fileio · sub_00297CE0 (88 B)</title></rect>
+<rect class="ok" x="291" y="334.4" width="10.9" height="11.4"><title>fileio · sub_00297D38 (48 B)</title></rect>
+<rect class="ok" x="303" y="334.4" width="10.9" height="11.4"><title>fileio · sub_00297D68 (16 B)</title></rect>
+<rect class="ok" x="267.2" y="346.7" width="10.9" height="11.4"><title>fileio · sub_00297D78 (72 B)</title></rect>
+<rect class="ok" x="279.1" y="346.7" width="10.9" height="11.4"><title>fileio · sub_00297DC0 (520 B)</title></rect>
+<rect class="ok" x="291" y="346.7" width="10.9" height="11.4"><title>fileio · sub_00297FC8 (144 B)</title></rect>
+<rect class="ok" x="303" y="346.7" width="10.9" height="11.4"><title>fileio · sub_00298058 (56 B)</title></rect>
+<rect class="ok" x="267.2" y="359.1" width="10.9" height="11.4"><title>fileio · sub_00298090 (656 B)</title></rect>
+<rect class="ok" x="279.1" y="359.1" width="10.9" height="11.4"><title>fileio · sub_00298320 (384 B)</title></rect>
+<rect class="ok" x="291" y="359.1" width="10.9" height="11.4"><title>fileio · sub_002984A0 (720 B)</title></rect>
+<rect class="ok" x="316.9" y="239.5" width="12.2" height="10.1"><title>libscf · sub_00282FD8 (112 B)</title></rect>
+<rect class="ok" x="330" y="239.5" width="12.2" height="10.1"><title>libscf · sub_00283048 (80 B)</title></rect>
+<rect class="ok" x="343.2" y="239.5" width="12.2" height="10.1"><title>libscf · sub_00283098 (88 B)</title></rect>
+<rect class="ok" x="316.9" y="250.6" width="12.2" height="10.1"><title>libscf · sub_002830F0 (104 B)</title></rect>
+<rect class="ok" x="330" y="250.6" width="12.2" height="10.1"><title>libscf · sub_00283158 (104 B)</title></rect>
+<rect class="ok" x="343.2" y="250.6" width="12.2" height="10.1"><title>libscf · sub_002831C0 (48 B)</title></rect>
+<rect class="ok" x="316.9" y="261.7" width="12.2" height="10.1"><title>libscf · sub_002831F0 (32 B)</title></rect>
+<rect class="ok" x="330" y="261.7" width="12.2" height="10.1"><title>libscf · sub_00283210 (560 B)</title></rect>
+<rect class="ok" x="343.2" y="261.7" width="12.2" height="10.1"><title>libscf · sub_00283440 (48 B)</title></rect>
+<rect class="ok" x="316.9" y="272.8" width="12.2" height="10.1"><title>libscf · sub_00283470 (184 B)</title></rect>
+<rect class="ok" x="330" y="272.8" width="12.2" height="10.1"><title>libscf · sub_00283528 (72 B)</title></rect>
+<rect class="ok" x="343.2" y="272.8" width="12.2" height="10.1"><title>libscf · sub_00283570 (248 B)</title></rect>
+<rect class="ok" x="316.9" y="283.9" width="12.2" height="10.1"><title>libscf · sub_00283668 (264 B)</title></rect>
+<rect class="ok" x="330" y="283.9" width="12.2" height="10.1"><title>libscf · sub_00283770 (32 B)</title></rect>
+<rect class="ok" x="358.4" y="239.5" width="12.2" height="10.1"><title>libm · sub_00287378 (248 B)</title></rect>
+<rect class="ok" x="371.6" y="239.5" width="12.2" height="10.1"><title>libm · sub_00287470 (328 B)</title></rect>
+<rect class="ok" x="384.8" y="239.5" width="12.2" height="10.1"><title>libm · sub_002875B8 (1312 B)</title></rect>
+<rect class="ok" x="358.4" y="250.6" width="12.2" height="10.1"><title>libm · sub_00287AD8 (808 B)</title></rect>
+<rect class="ok" x="371.6" y="250.6" width="12.2" height="10.1"><title>libm · sub_00287E00 (592 B)</title></rect>
+<rect class="ok" x="384.8" y="250.6" width="12.2" height="10.1"><title>libm · sub_00288050 (2920 B)</title></rect>
+<rect class="ok" x="358.4" y="261.7" width="12.2" height="10.1"><title>libm · sub_00288BB8 (472 B)</title></rect>
+<rect class="ok" x="371.6" y="261.7" width="12.2" height="10.1"><title>libm · sub_00288D90 (56 B)</title></rect>
+<rect class="ok" x="384.8" y="261.7" width="12.2" height="10.1"><title>libm · sub_00288DC8 (472 B)</title></rect>
+<rect class="ok" x="358.4" y="272.8" width="12.2" height="10.1"><title>libm · sub_00288FA0 (40 B)</title></rect>
+<rect class="ok" x="371.6" y="272.8" width="12.2" height="10.1"><title>libm · sub_00288FC8 (440 B)</title></rect>
+<rect class="ok" x="384.8" y="272.8" width="12.2" height="10.1"><title>libm · sub_00289180 (40 B)</title></rect>
+<rect class="ok" x="358.4" y="283.9" width="12.2" height="10.1"><title>libm · sub_002891A8 (72 B)</title></rect>
+<rect class="ok" x="371.6" y="283.9" width="12.2" height="10.1"><title>libm · sub_002891F0 (16 B)</title></rect>
+<rect class="ok" x="400" y="239.5" width="12.2" height="10.1"><title>loadfile · sub_00298770 (136 B)</title></rect>
+<rect class="ok" x="413.1" y="239.5" width="12.2" height="10.1"><title>loadfile · sub_002987F8 (112 B)</title></rect>
+<rect class="ok" x="426.3" y="239.5" width="12.2" height="10.1"><title>loadfile · sub_00298868 (120 B)</title></rect>
+<rect class="ok" x="400" y="250.6" width="12.2" height="10.1"><title>loadfile · sub_002988E0 (48 B)</title></rect>
+<rect class="ok" x="413.1" y="250.6" width="12.2" height="10.1"><title>loadfile · sub_00298910 (256 B)</title></rect>
+<rect class="ok" x="426.3" y="250.6" width="12.2" height="10.1"><title>loadfile · sub_00298A10 (144 B)</title></rect>
+<rect class="ok" x="400" y="261.7" width="12.2" height="10.1"><title>loadfile · sub_00298AA0 (56 B)</title></rect>
+<rect class="ok" x="413.1" y="261.7" width="12.2" height="10.1"><title>loadfile · sub_00298AD8 (528 B)</title></rect>
+<rect class="ok" x="426.3" y="261.7" width="12.2" height="10.1"><title>loadfile · sub_00298CE8 (32 B)</title></rect>
+<rect class="ok" x="400" y="272.8" width="12.2" height="10.1"><title>loadfile · sub_00298D08 (552 B)</title></rect>
+<rect class="ok" x="413.1" y="272.8" width="12.2" height="10.1"><title>loadfile · sub_00298F30 (72 B)</title></rect>
+<rect class="ok" x="426.3" y="272.8" width="12.2" height="10.1"><title>loadfile · sub_00298F78 (344 B)</title></rect>
+<rect class="ok" x="400" y="283.9" width="12.2" height="10.1"><title>loadfile · sub_002990D0 (80 B)</title></rect>
+<rect class="ok" x="413.1" y="283.9" width="12.2" height="10.1"><title>loadfile · sub_00299120 (272 B)</title></rect>
+<rect class="parcial" x="316.9" y="297" width="9.3" height="12.2"><title>libpad2 · sub_0027B7E8 (64 B)</title></rect>
+<rect x="316.9" y="297" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="327.1" y="297" width="9.3" height="12.2"><title>libpad2 · sub_0027B828 (104 B)</title></rect>
+<rect x="327.1" y="297" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="337.4" y="297" width="9.3" height="12.2"><title>libpad2 · sub_0027B890 (264 B)</title></rect>
+<rect x="337.4" y="297" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="347.7" y="297" width="9.3" height="12.2"><title>libpad2 · sub_0027B998 (88 B)</title></rect>
+<rect x="347.7" y="297" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="358" y="297" width="9.3" height="12.2"><title>libpad2 · sub_0027B9F0 (216 B)</title></rect>
+<rect x="358" y="297" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="316.9" y="310.1" width="9.3" height="12.2"><title>libpad2 · sub_0027BAC8 (208 B)</title></rect>
+<rect x="316.9" y="310.1" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="327.1" y="310.1" width="9.3" height="12.2"><title>libpad2 · sub_0027BB98 (320 B)</title></rect>
+<rect x="327.1" y="310.1" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="337.4" y="310.1" width="9.3" height="12.2"><title>libpad2 · sub_0027BCD8 (120 B)</title></rect>
+<rect x="337.4" y="310.1" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="347.7" y="310.1" width="9.3" height="12.2"><title>libpad2 · sub_0027BD50 (88 B)</title></rect>
+<rect x="347.7" y="310.1" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="358" y="310.1" width="9.3" height="12.2"><title>libpad2 · sub_0027BDA8 (104 B)</title></rect>
+<rect x="358" y="310.1" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="316.9" y="323.3" width="9.3" height="12.2"><title>libpad2 · sub_0027BE10 (104 B)</title></rect>
+<rect x="316.9" y="323.3" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="327.1" y="323.3" width="9.3" height="12.2"><title>libpad2 · sub_0027BE78 (96 B)</title></rect>
+<rect x="327.1" y="323.3" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="337.4" y="323.3" width="9.3" height="12.2"><title>libpad2 · sub_0027BED8 (184 B)</title></rect>
+<rect x="337.4" y="323.3" width="9.3" height="12.2" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="316.9" y="338.4" width="9.3" height="10"><title>libdbc · sub_0027ACA8 (88 B)</title></rect>
+<rect x="316.9" y="338.4" width="9.3" height="10" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="327.1" y="338.4" width="9.3" height="10"><title>libdbc · sub_0027AD00 (672 B)</title></rect>
+<rect x="327.1" y="338.4" width="9.3" height="10" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="337.4" y="338.4" width="9.3" height="10"><title>libdbc · sub_0027AFA0 (112 B)</title></rect>
+<rect x="337.4" y="338.4" width="9.3" height="10" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="347.7" y="338.4" width="9.3" height="10"><title>libdbc · sub_0027B010 (216 B)</title></rect>
+<rect x="347.7" y="338.4" width="9.3" height="10" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="358" y="338.4" width="9.3" height="10"><title>libdbc · sub_0027B0E8 (136 B)</title></rect>
+<rect x="358" y="338.4" width="9.3" height="10" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="316.9" y="349.4" width="9.3" height="10"><title>libdbc · sub_0027B170 (328 B)</title></rect>
+<rect x="316.9" y="349.4" width="9.3" height="10" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="327.1" y="349.4" width="9.3" height="10"><title>libdbc · sub_0027B2B8 (256 B)</title></rect>
+<rect x="327.1" y="349.4" width="9.3" height="10" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="337.4" y="349.4" width="9.3" height="10"><title>libdbc · sub_0027B3B8 (432 B)</title></rect>
+<rect x="337.4" y="349.4" width="9.3" height="10" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="347.7" y="349.4" width="9.3" height="10"><title>libdbc · sub_0027B568 (360 B)</title></rect>
+<rect x="347.7" y="349.4" width="9.3" height="10" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="358" y="349.4" width="9.3" height="10"><title>libdbc · sub_0027B6D0 (240 B)</title></rect>
+<rect x="358" y="349.4" width="9.3" height="10" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="316.9" y="360.5" width="9.3" height="10"><title>libdbc · sub_0027B7C0 (40 B)</title></rect>
+<rect x="316.9" y="360.5" width="9.3" height="10" fill="url(#rayas)" pointer-events="none"/>
+<rect class="ok" x="370.3" y="297" width="11.5" height="9.3"><title>libcdvd · sub_0027A340 (232 B)</title></rect>
+<rect class="ok" x="382.8" y="297" width="11.5" height="9.3"><title>libcdvd · sub_0027A428 (160 B)</title></rect>
+<rect class="ok" x="395.3" y="297" width="11.5" height="9.3"><title>libcdvd · sub_0027A4C8 (88 B)</title></rect>
+<rect class="ok" x="370.3" y="307.2" width="11.5" height="9.3"><title>libcdvd · sub_0027A520 (136 B)</title></rect>
+<rect class="ok" x="382.8" y="307.2" width="11.5" height="9.3"><title>libcdvd · sub_0027A5A8 (160 B)</title></rect>
+<rect class="ok" x="395.3" y="307.2" width="11.5" height="9.3"><title>libcdvd · sub_0027A648 (112 B)</title></rect>
+<rect class="ok" x="370.3" y="317.5" width="11.5" height="9.3"><title>libcdvd · sub_0027A6B8 (344 B)</title></rect>
+<rect class="ok" x="382.8" y="317.5" width="11.5" height="9.3"><title>libcdvd · sub_0027A810 (752 B)</title></rect>
+<rect class="ok" x="395.3" y="317.5" width="11.5" height="9.3"><title>libcdvd · sub_0027AB00 (208 B)</title></rect>
+<rect class="ok" x="370.3" y="327.7" width="11.5" height="9.3"><title>libcdvd · sub_0027ABD0 (216 B)</title></rect>
+<rect class="ok" x="409.8" y="297" width="8.9" height="12.7"><title>libdma · sub_00279E50 (120 B)</title></rect>
+<rect class="ok" x="419.7" y="297" width="8.9" height="12.7"><title>libdma · sub_00279EC8 (40 B)</title></rect>
+<rect class="ok" x="429.6" y="297" width="8.9" height="12.7"><title>libdma · sub_00279EF0 (56 B)</title></rect>
+<rect class="ok" x="409.8" y="310.6" width="8.9" height="12.7"><title>libdma · sub_00279F28 (40 B)</title></rect>
+<rect class="ok" x="419.7" y="310.6" width="8.9" height="12.7"><title>libdma · sub_00279F50 (224 B)</title></rect>
+<rect class="ok" x="429.6" y="310.6" width="8.9" height="12.7"><title>libdma · sub_0027A030 (480 B)</title></rect>
+<rect class="ok" x="409.8" y="324.3" width="8.9" height="12.7"><title>libdma · sub_0027A210 (136 B)</title></rect>
+<rect class="ok" x="419.7" y="324.3" width="8.9" height="12.7"><title>libdma · sub_0027A298 (168 B)</title></rect>
+<rect class="ok" x="370.3" y="340" width="10.2" height="9.5"><title>libgraph · sub_00279838 (400 B)</title></rect>
+<rect class="ok" x="381.5" y="340" width="10.2" height="9.5"><title>libgraph · sub_002799C8 (16 B)</title></rect>
+<rect class="ok" x="392.7" y="340" width="10.2" height="9.5"><title>libgraph · sub_002799D8 (104 B)</title></rect>
+<rect class="ok" x="370.3" y="350.5" width="10.2" height="9.5"><title>libgraph · sub_00279A40 (152 B)</title></rect>
+<rect class="ok" x="381.5" y="350.5" width="10.2" height="9.5"><title>libgraph · sub_00279AD8 (792 B)</title></rect>
+<rect class="ok" x="392.7" y="350.5" width="10.2" height="9.5"><title>libgraph · sub_00279DF0 (64 B)</title></rect>
+<rect class="ok" x="370.3" y="361" width="10.2" height="9.5"><title>libgraph · sub_00279E30 (32 B)</title></rect>
+<rect class="parcial" x="405.9" y="340" width="10.7" height="9.5"><title>libipu · sub_002792E8 (232 B)</title></rect>
+<rect x="405.9" y="340" width="10.7" height="9.5" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="417.6" y="340" width="10.7" height="9.5"><title>libipu · sub_002793D0 (336 B)</title></rect>
+<rect x="417.6" y="340" width="10.7" height="9.5" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="405.9" y="350.5" width="10.7" height="9.5"><title>libipu · sub_00279520 (104 B)</title></rect>
+<rect x="405.9" y="350.5" width="10.7" height="9.5" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="417.6" y="350.5" width="10.7" height="9.5"><title>libipu · sub_00279588 (120 B)</title></rect>
+<rect x="417.6" y="350.5" width="10.7" height="9.5" fill="url(#rayas)" pointer-events="none"/>
+<rect class="parcial" x="405.9" y="361" width="10.7" height="9.5"><title>libipu · sub_00279600 (568 B)</title></rect>
+<rect x="405.9" y="361" width="10.7" height="9.5" fill="url(#rayas)" pointer-events="none"/>
+<rect class="pendiente" x="431.3" y="340" width="7.2" height="14.7"><title>libvib · sub_0027BF90 (128 B)</title></rect>
+<rect class="pendiente" x="431.3" y="355.8" width="7.2" height="14.7"><title>libvib · sub_0027C010 (240 B)</title></rect>
+<rect class="chip" x="18" y="114" width="34.4" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="22" y="125" font-size="11" pointer-events="none">libc</text>
+<rect class="chip" x="18" y="268.2" width="54.2" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="22" y="279.2" font-size="11" pointer-events="none">libmpeg</text>
+<rect class="chip" x="183.8" y="114" width="67.4" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="187.8" y="125" font-size="11" pointer-events="none">libkernel</text>
+<rect class="chip" x="320.3" y="114" width="47.6" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="324.3" y="125" font-size="11" pointer-events="none">libmc2</text>
+<rect class="chip" x="183.8" y="240" width="47.6" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="187.8" y="251" font-size="11" pointer-events="none">C++ EH</text>
+<rect class="chip" x="183.8" y="309" width="47.6" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="187.8" y="320" font-size="11" pointer-events="none">libgcc</text>
+<rect class="chip" x="267.7" y="240" width="27.8" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="271.7" y="251" font-size="11" pointer-events="none">sif</text>
+<rect class="chip" x="267.7" y="322.5" width="47.6" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="271.7" y="333.5" font-size="11" pointer-events="none">fileio</text>
+<rect class="chip" x="358.9" y="240" width="34.4" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="362.9" y="251" font-size="11" pointer-events="none">libm</text>
+<rect class="chip" x="317.4" y="338.9" width="47.6" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="321.4" y="349.9" font-size="11" pointer-events="none">libdbc</text>
+<text class="t1" x="460" y="102" font-size="14">Hardware de la PS2: 60.5%</text>
+<rect class="grupo" x="460" y="112" width="424" height="260"/>
+<rect class="ok" x="461.5" y="113.5" width="92.5" height="79.6"><title>CPU R3000A (intérprete) — Planificador ocioso de Opus integrado y validado con GS/VU1: recuerda el próximo despertar; su perfil reduce IOP de ~1300–1500 a ~570–650 ms cada 5 s; falta una comparación de FPS sin compilaciones concurrentes</title></rect>
+<text class="badge-t" x="507.7" y="157.2" font-size="11" text-anchor="middle" pointer-events="none">R3000A</text>
+<rect class="ok" x="555" y="113.5" width="61.3" height="79.6"><title>Módulos IRX originales</title></rect>
+<text class="badge-t" x="585.6" y="157.2" font-size="11" text-anchor="middle" pointer-events="none">IRX</text>
+<rect class="ok" x="461.5" y="194.1" width="76.9" height="63.5"><title>SIF: RPC y DMA EE ↔ IOP</title></rect>
+<text class="badge-t" x="499.9" y="229.7" font-size="11" text-anchor="middle" pointer-events="none">SIF</text>
+<rect class="ok" x="539.4" y="194.1" width="76.9" height="63.5"><title>CDVD: lectura de la ISO original</title></rect>
+<text class="badge-t" x="577.8" y="229.7" font-size="11" text-anchor="middle" pointer-events="none">CDVD</text>
+<rect class="parcial" x="461.5" y="258.6" width="65.8" height="111.9"><title>SPU2: salida de audio — Bancos cargados y sonido continuo en tiempo emulado verificados; a ~2 fps se oye entrecortado; faltan reverb y ADMA</title></rect>
+<rect x="461.5" y="258.6" width="65.8" height="111.9" fill="url(#rayas)" pointer-events="none"/>
+<text class="badge-v-oscuro" x="494.4" y="318.4" font-size="11" text-anchor="middle" pointer-events="none">SPU2</text>
+<rect class="parcial" x="528.3" y="258.6" width="88" height="55.4"><title>Mando DualShock 2 — libpad2 por HLE (primer puerto); en el SIO2 emulado los mandos se ven desconectados</title></rect>
+<rect x="528.3" y="258.6" width="88" height="55.4" fill="url(#rayas)" pointer-events="none"/>
+<text class="badge-v-oscuro" x="572.3" y="290.2" font-size="11" text-anchor="middle" pointer-events="none">Pad</text>
+<rect class="parcial" x="528.3" y="315.1" width="88" height="55.4"><title>SIO2: memory card — SIO2 y tarjeta de 8 MB con ECC: cargar, guardar y recargar verificados en el juego sobre una copia PCSX2; faltan formateo y reapertura en PCSX2</title></rect>
+<rect x="528.3" y="315.1" width="88" height="55.4" fill="url(#rayas)" pointer-events="none"/>
+<text class="badge-v-oscuro" x="572.3" y="346.6" font-size="11" text-anchor="middle" pointer-events="none">MC</text>
+<rect class="ok" x="619.3" y="113.5" width="144.9" height="85"><title>CPU R5900 (recompilada a C++)</title></rect>
+<text class="badge-t" x="691.7" y="159.8" font-size="11" text-anchor="middle" pointer-events="none">R5900</text>
+<rect class="ok" x="619.3" y="199.5" width="86.5" height="85"><title>Kernel: hilos, semáforos y alarmas</title></rect>
+<text class="badge-t" x="662.5" y="245.8" font-size="11" text-anchor="middle" pointer-events="none">Kernel</text>
+<rect class="ok" x="706.8" y="199.5" width="57.4" height="85"><title>FPU (COP1) e instrucciones MMI</title></rect>
+<text class="badge-t" x="735.5" y="245.8" font-size="11" text-anchor="middle" pointer-events="none">FPU/MMI</text>
+<rect class="ok" x="619.3" y="285.5" width="57.4" height="85"><title>INTC: VSync e interrupción del GS</title></rect>
+<text class="badge-t" x="647.9" y="331.9" font-size="11" text-anchor="middle" pointer-events="none">INTC</text>
+<rect class="ok" x="677.6" y="285.5" width="57.4" height="85"><title>Controlador DMA — Las cadenas fromSPR/toSPR ya copian la paleta de huesos; formas de Kratos y enemigos verificadas en partida</title></rect>
+<text class="badge-t" x="706.3" y="331.9" font-size="11" text-anchor="middle" pointer-events="none">DMAC</text>
+<rect class="ok" x="736" y="285.5" width="28.2" height="85"><title>Temporizadores</title></rect>
+<text class="badge-t" x="750.1" y="331.9" font-size="11" text-anchor="middle" transform="rotate(-90 750.1 328)" pointer-events="none">Timers</text>
+<rect class="ok" x="767.2" y="113.5" width="45.5" height="106.5"><title>GIF (PATH1-3)</title></rect>
+<text class="badge-t" x="789.9" y="170.6" font-size="11" text-anchor="middle" pointer-events="none">GIF</text>
+<rect class="parcial" x="813.7" y="113.5" width="68.8" height="106.5"><title>GS: primitivas y framebuffer — CPU/OpenGL conservados; barco, Kratos, enemigos y HUD visibles. Orden color/Z y alias por ancho/vuelta validados. Feedback inestable acotado a 33 envíos; snapshot opcional estable en 64 pasadas, aún distinto de CPU. Z de solo lectura retenido; profiler GPU por variante y frontera de consultas verificado; falta cobertura completa</title></rect>
+<rect x="813.7" y="113.5" width="68.8" height="106.5" fill="url(#rayas)" pointer-events="none"/>
+<text class="badge-v-oscuro" x="848.1" y="170.6" font-size="11" text-anchor="middle" pointer-events="none">GS</text>
+<rect class="parcial" x="767.2" y="221" width="115.3" height="63.5"><title>VIF1 y VU1 — Bloques compilados, flags persistentes, SSE de cuatro carriles y enlace opcional del microcódigo local integrados; regresión FTZ/DAZ conserva underflow. Modelos y HUD visibles tras MMI/EFU/SPR; falta certificar cobertura y rendimiento sostenido</title></rect>
+<rect x="767.2" y="221" width="115.3" height="63.5" fill="url(#rayas)" pointer-events="none"/>
+<text class="badge-v-oscuro" x="824.8" y="256.6" font-size="11" text-anchor="middle" pointer-events="none">VIF1/VU1</text>
+<rect class="parcial" x="767.2" y="285.5" width="57.2" height="85"><title>GS: texturas, CLUT y fuentes — HUD visible; bilineal y nearest STQ CPU/OpenGL verificados, incluidos límites 16.16 con signo, con patrones procedurales de PCSX2 software; feedback GPU estable en modo experimental; lotes de texturas regionales optimizados y verificados en los 13 PSM; quedan pendientes la caché GS real y la cobertura de fuentes/CLUT</title></rect>
+<rect x="767.2" y="285.5" width="57.2" height="85" fill="url(#rayas)" pointer-events="none"/>
+<text class="badge-v-oscuro" x="795.8" y="331.1" font-size="9" text-anchor="middle" pointer-events="none">Tex/CLUT</text>
+<rect class="parcial" x="825.3" y="285.5" width="57.2" height="85"><title>IPU: vídeo FMV — La intro FMV funciona por decodificación MPEG por software; no demuestra emulación completa del hardware IPU</title></rect>
+<rect x="825.3" y="285.5" width="57.2" height="85" fill="url(#rayas)" pointer-events="none"/>
+<text class="badge-v-oscuro" x="853.9" y="331.9" font-size="11" text-anchor="middle" pointer-events="none">IPU</text>
+<rect class="chip" x="462" y="114" width="27.8" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="466" y="125" font-size="11" pointer-events="none">IOP</text>
+<rect class="chip" x="619.8" y="114" width="21.2" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="623.8" y="125" font-size="11" pointer-events="none">EE</text>
+<rect class="chip" x="767.7" y="114" width="54.2" height="15" rx="2" pointer-events="none"/>
+<text class="t1" x="771.7" y="125" font-size="11" pointer-events="none">GS / VU</text>
+<rect class="ok" x="16" y="384" width="12" height="12" rx="2"/>
+<text class="t2" x="33" y="394" font-size="12">Funciona</text>
+<rect class="parcial" x="108.6" y="384" width="12" height="12" rx="2"/>
+<rect x="108.6" y="384" width="12" height="12" rx="2" fill="url(#rayas)"/>
+<text class="t2" x="125.6" y="394" font-size="12">Parcial</text>
+<rect class="pendiente" x="194.0" y="384" width="12" height="12" rx="2"/>
+<text class="t2" x="211.0" y="394" font-size="12">Pendiente</text>
+<text class="t2" x="16" y="414" font-size="11">* Funciones de las librerías estáticas de Sony enlazadas en SCUS_973.99 (config/funcmap.csv). Hardware: ponderado por componente.</text>
+</svg>

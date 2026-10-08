@@ -200,7 +200,8 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 4, kIopBlockSize);
             ps2_stubs::sceSifAllocIopHeap(env.rdram.data(), &env.ctx, &env.runtime);
             const uint32_t iopAddress = ::getRegU32(&env.ctx, 2);
-            t.IsTrue(iopAddress >= 0x00120000u && iopAddress < 0x00200000u,
+            // GOW-Port: el heap del IOP empieza en 0x70000 (IopMemory::HeapBase), tras los modulos cargados.
+            t.IsTrue(iopAddress >= 0x00070000u && iopAddress < 0x00200000u,
                      "sceSifAllocIopHeap should return an address in physical IOP RAM");
             std::memset(env.rdram.data() + iopAddress, 0x5Au, payload.size());
 

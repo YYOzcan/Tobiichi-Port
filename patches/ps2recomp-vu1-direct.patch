@@ -1,0 +1,539 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 835c9f9..16b3cb1 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -60,6 +60,11 @@ public:
+                 GS &gs, PS2Memory *memory = nullptr,
+                 uint32_t top = 0, uint32_t itop = 0, uint32_t maxCycles = 65536);
+ 
++    // GOW-Port: escribir VF/VI/ACC al ejecutar en vez de encolarlos (ver m_directRegisterWrites). El
++    // resultado del programa no cambia, pero el estado intermedio que ve quien corta la ejecución por
++    // presupuesto sí; por eso las pruebas del modelo de latencias lo dejan desactivado.
++    void setDirectRegisterWrites(bool enabled);
++
+     VU1State &state() { return m_state; }
+     const VU1State &state() const { return m_state; }
+ 
+@@ -209,6 +214,16 @@ private:
+     uint32_t m_cachedCodeSize = 0;
+     uint64_t m_cachedCodeGeneration = 0;
+     bool m_decodedCodeCacheValid = false;
++    DecodedInstructionPair m_decodedScratch{}; // GOW-Port: pares fuera de la caché (se devuelven por referencia)
++    // GOW-Port: VU1 escribe VF/VI/ACC al ejecutar en vez de encolarlos con su latencia. Equivale al modelo
++    // con colas porque los lectores se detienen hasta que el registro está listo (m_vfReady...) y solo se
++    // confirma la última escritura emitida. GOW_VU1_COLAS=1 vuelve al modelo con colas.
++    bool m_directRegisterWrites = false;
++    // GOW-Port: ciclo de la próxima entrada de las colas que vence; commitReadyPipelines no hace nada antes.
++    uint64_t m_nextCommitCycle = ~0ull;
++    // GOW-Port: el microcódigo cargado no lee el registro de estado (FSAND/FSEQ/FSOR); no hace falta
++    // calcular los bits pegajosos de los productos (calculateFmacProductSticky).
++    bool m_statusUnread = false;
+ 
+     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
+     ScalarPipelineEntry m_fdiv{};
+@@ -254,7 +269,7 @@ private:
+     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
+     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
+     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
+-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
++    const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
+ 
+     void execUpper(uint32_t instr);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 4864dcf..ccecb62 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -550,6 +550,12 @@ PS2Runtime::PS2Runtime()
+ 
+     m_eeScheduler = std::make_unique<EeScheduler>(*this);
+ 
++    // GOW-Port: VU1 sin colas de escritura (un tercio más rápido); GOW_VU1_COLAS=1 vuelve al modelo con colas.
++    {
++        const char *queues = std::getenv("GOW_VU1_COLAS");
++        m_vu1.setDirectRegisterWrites(!(queues && std::strcmp(queues, "1") == 0));
++    }
++
+     // Assign rather than memset: R5900Context's constructor zeroes itself and
+     // then applies the COP0 reset values, which a memset here would discard.
+     m_cpuContext = R5900Context{};
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 3bcf3de..246af25 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -83,8 +83,16 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+     reset();
+ }
+ 
++void VU1Interpreter::setDirectRegisterWrites(bool enabled)
++{
++    m_directRegisterWrites = enabled && m_unit == Unit::VU1;
++    m_decodedCodeCacheValid = false; // recalcula m_statusUnread
++    m_statusUnread = false;
++}
++
+ void VU1Interpreter::resetScheduler()
+ {
++    m_nextCommitCycle = ~0ull;
+     m_flagPipeline = {};
+     m_fdiv = {};
+     m_efu = {};
+@@ -200,22 +208,116 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
+ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
+                                          uint8_t laneFlags[4])
+ {
++    // GOW-Port: decodifica la operación una vez por instrucción (antes calculateFmacExactResult
++    // recorría el switch de opcodes en cada componente). Mismas fórmulas en long double.
++    enum class Kind : uint8_t { None, Add, Sub, Madd, Msub, Mul, Opmsub, Opmula };
++    enum class Source : uint8_t { Broadcast, Q, I, Vector };
++    const uint32_t upper = m_currentUpperInstruction;
++    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
++    const uint8_t code = op >= 0x3Cu ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : op;
++    Kind kind = Kind::None;
++    Source source = Source::Vector;
++    if (code <= 0x03u) { kind = Kind::Add; source = Source::Broadcast; }
++    else if (code <= 0x07u) { kind = Kind::Sub; source = Source::Broadcast; }
++    else if (code <= 0x0Bu) { kind = Kind::Madd; source = Source::Broadcast; }
++    else if (code <= 0x0Fu) { kind = Kind::Msub; source = Source::Broadcast; }
++    else if (code >= 0x18u && code <= 0x1Bu) { kind = Kind::Mul; source = Source::Broadcast; }
++    else
++    {
++        switch (code)
++        {
++        case 0x1Cu: kind = Kind::Mul; source = Source::Q; break;
++        case 0x1Eu: kind = Kind::Mul; source = Source::I; break;
++        case 0x20u: kind = Kind::Add; source = Source::Q; break;
++        case 0x21u: kind = Kind::Madd; source = Source::Q; break;
++        case 0x22u: kind = Kind::Add; source = Source::I; break;
++        case 0x23u: kind = Kind::Madd; source = Source::I; break;
++        case 0x24u: kind = Kind::Sub; source = Source::Q; break;
++        case 0x25u: kind = Kind::Msub; source = Source::Q; break;
++        case 0x26u: kind = Kind::Sub; source = Source::I; break;
++        case 0x27u: kind = Kind::Msub; source = Source::I; break;
++        case 0x28u: kind = Kind::Add; break;
++        case 0x29u: kind = Kind::Madd; break;
++        case 0x2Au: kind = Kind::Mul; break;
++        case 0x2Cu: kind = Kind::Sub; break;
++        case 0x2Du: kind = Kind::Msub; break;
++        case 0x2Eu: kind = op < 0x3Cu ? Kind::Opmsub : Kind::Opmula; break;
++        default: break;
++        }
++    }
++
++    if (kind == Kind::None)
++    {
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            laneFlags[component] = 0u;
++            if ((dest & laneForComponent(component)) == 0u)
++                continue;
++            uint32_t flags = 0u;
++            result[component] = normalizeResult(result[component], flags);
++            laneFlags[component] = static_cast<uint8_t>(flags);
++        }
++        return;
++    }
++
++    const uint8_t fs = FS(upper);
++    const uint8_t ft = FT(upper);
++    long double vs[4];
++    long double vt[4];
++    long double acc[4];
++    for (uint32_t component = 0; component < 4u; ++component)
++    {
++        vs[component] = static_cast<long double>(normalizeOperand(m_state.vf[fs][component]));
++        vt[component] = static_cast<long double>(normalizeOperand(m_state.vf[ft][component]));
++        acc[component] = static_cast<long double>(normalizeOperand(m_state.acc[component]));
++    }
++    long double scalar = 0.0L;
++    if (source == Source::Q)
++        scalar = static_cast<long double>(normalizeOperand(m_state.q));
++    else if (source == Source::I)
++        scalar = static_cast<long double>(normalizeOperand(m_state.i));
++    else if (source == Source::Broadcast)
++        scalar = vt[code & 3u];
++
++    static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
++    static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+         laneFlags[component] = 0u;
+         if ((dest & laneForComponent(component)) == 0u)
+             continue;
+-
+-        long double exactResult = 0.0L;
+-        if (calculateFmacExactResult(component, exactResult))
++        // GOW-Port: en ADD/SUB/MUL el resultado en float se redondea hacia cero desde el exacto. Si es normal y
++        // no está en el exponente máximo, el exacto no es cero ni desborda ni se queda por debajo del mínimo:
++        // el valor no cambia y los flags son solo el signo. Así se evita el cálculo en long double.
++        if (kind == Kind::Add || kind == Kind::Sub || kind == Kind::Mul)
+         {
+-            laneFlags[component] = normalizeFmacExactResult(result[component], exactResult);
+-            continue;
++            uint32_t bits = 0u;
++            std::memcpy(&bits, &result[component], sizeof(bits));
++            const uint32_t exponent = (bits >> 23) & 0xFFu;
++            if (exponent != 0u && exponent < 0xFEu)
++            {
++                laneFlags[component] = (bits & 0x80000000u) != 0u ? 0x2u : 0u;
++                continue;
++            }
+         }
+-
+-        uint32_t flags = 0u;
+-        result[component] = normalizeResult(result[component], flags);
+-        laneFlags[component] = static_cast<uint8_t>(flags);
++        const long double right = source == Source::Vector ? vt[component] : scalar;
++        long double exact = 0.0L;
++        switch (kind)
++        {
++        case Kind::Add: exact = vs[component] + right; break;
++        case Kind::Sub: exact = vs[component] - right; break;
++        case Kind::Madd: exact = acc[component] + vs[component] * right; break;
++        case Kind::Msub: exact = acc[component] - vs[component] * right; break;
++        case Kind::Mul: exact = vs[component] * right; break;
++        case Kind::Opmsub:
++            exact = component == 3u ? 0.0L : acc[component] - vs[crossLeft[component]] * vt[crossRight[component]];
++            break;
++        case Kind::Opmula:
++            exact = component == 3u ? 0.0L : vs[crossLeft[component]] * vt[crossRight[component]];
++            break;
++        default: break;
++        }
++        laneFlags[component] = normalizeFmacExactResult(result[component], exact);
+     }
+ }
+ 
+@@ -517,15 +619,9 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+         status |= flags;
+     }
+ 
+-    FlagPipelineEntry *entry = nullptr;
+-    for (FlagPipelineEntry &candidate : m_flagPipeline)
+-    {
+-        if (!candidate.valid)
+-        {
+-            entry = &candidate;
+-            break;
+-        }
+-    }
++    // GOW-Port: primera entrada libre a partir de la máscara de pendientes.
++    const uint32_t freeSlots = ~m_flagPending & ((1u << kMaxFlagEntries) - 1u);
++    FlagPipelineEntry *entry = freeSlots != 0u ? &m_flagPipeline[std::countr_zero(freeSlots)] : nullptr;
+     if (!entry)
+     {
+         reportReservedInstruction(true, 0xFFFFFFFFu);
+@@ -536,6 +632,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    m_nextCommitCycle = std::min(m_nextCommitCycle, entry->readyCycle);
+     m_flagPending |= 1u << static_cast<uint32_t>(entry - m_flagPipeline.data());
+     entry->mac = mac;
+     entry->status = status;
+@@ -548,7 +645,7 @@ void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
+ {
+     uint8_t laneFlags[4]{};
+     normalizeFmacResult(result, dest, laneFlags);
+-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
++    updateFmacFlags(laneFlags, dest, m_statusUnread ? 0u : calculateFmacProductSticky(dest));
+     applyDest(dst, result, dest);
+ }
+ 
+@@ -556,7 +653,7 @@ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
+ {
+     uint8_t laneFlags[4]{};
+     normalizeFmacResult(result, dest, laneFlags);
+-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
++    updateFmacFlags(laneFlags, dest, m_statusUnread ? 0u : calculateFmacProductSticky(dest));
+     applyDestAcc(result, dest);
+ }
+ 
+@@ -576,6 +673,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
+             m_flagPending |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+@@ -596,6 +694,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
+             m_flagPending |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+@@ -621,6 +720,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
+             m_flagPending |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+@@ -636,6 +736,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
++    m_nextCommitCycle = std::min(m_nextCommitCycle, m_fdiv.readyCycle);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -650,6 +751,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         {
+             entry.valid = true;
+             entry.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -667,6 +769,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         {
+             store.valid = true;
+             store.readyCycle = m_cycle + 1u;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, store.readyCycle);
+             m_storePending |= 1u << static_cast<uint32_t>(&store - m_storePipeline.data());
+             store.address = address;
+             store.laneMask = laneMask;
+@@ -689,6 +792,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
+             m_vfPending |= 1u << static_cast<uint32_t>(&write - m_vfWritePipeline.data());
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+@@ -716,6 +820,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
+             m_viPending |= 1u << static_cast<uint32_t>(&write - m_viWritePipeline.data());
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+@@ -738,6 +843,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
+             m_accPending |= 1u << static_cast<uint32_t>(&write - m_accWritePipeline.data());
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+@@ -755,6 +861,8 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
++    if (m_cycle < m_nextCommitCycle)
++        return;
+     for (uint32_t pending = m_flagPending; pending != 0u; pending &= pending - 1u)
+     {
+         const uint32_t index = static_cast<uint32_t>(std::countr_zero(pending));
+@@ -864,6 +972,24 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         write = {};
+     }
++
++    uint64_t next = ~0ull;
++    for (uint32_t pending = m_flagPending; pending != 0u; pending &= pending - 1u)
++        next = std::min(next, m_flagPipeline[std::countr_zero(pending)].readyCycle);
++    for (uint32_t pending = m_storePending; pending != 0u; pending &= pending - 1u)
++        next = std::min(next, m_storePipeline[std::countr_zero(pending)].readyCycle);
++    for (uint32_t pending = m_vfPending; pending != 0u; pending &= pending - 1u)
++        next = std::min(next, m_vfWritePipeline[std::countr_zero(pending)].readyCycle);
++    for (uint32_t pending = m_viPending; pending != 0u; pending &= pending - 1u)
++        next = std::min(next, m_viWritePipeline[std::countr_zero(pending)].readyCycle);
++    for (uint32_t pending = m_accPending; pending != 0u; pending &= pending - 1u)
++        next = std::min(next, m_accWritePipeline[std::countr_zero(pending)].readyCycle);
++    if (m_fdiv.valid)
++        next = std::min(next, m_fdiv.readyCycle);
++    for (const ScalarPipelineEntry &entry : m_efu)
++        if (entry.valid)
++            next = std::min(next, entry.readyCycle);
++    m_nextCommitCycle = next;
+ }
+ 
+ void VU1Interpreter::progressXgkick()
+@@ -1120,11 +1246,8 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+         }
+     }
+ 
+-    for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-    {
+-        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-            m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+-    }
++    for (uint32_t regs = decoded.lowerUsage.viWrite & 0xFFFEu; regs != 0u; regs &= regs - 1u)
++        m_viReady[std::countr_zero(regs)] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+         if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
+@@ -1602,19 +1725,28 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+     m_cachedCodeSize = codeSize;
+     m_cachedCodeGeneration = generation;
+     m_decodedCodeCacheValid = true;
++    // FSAND (0x16), FSEQ (0x14) y FSOR (0x17) son las únicas lecturas del estado en VU1.
++    m_statusUnread = m_directRegisterWrites;
++    for (uint32_t i = 0; i < pairCount && m_statusUnread; ++i)
++    {
++        const DecodedInstructionPair &pair = m_decodedCodeCache[i];
++        const uint32_t op = pair.lower >> 25;
++        if (!pair.iBit && (op == 0x14u || op == 0x16u || op == 0x17u))
++            m_statusUnread = false;
++    }
+ }
+ 
+-VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPairForPc(
++const VU1Interpreter::DecodedInstructionPair &VU1Interpreter::getDecodedInstructionPairForPc(
+     const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc)
+ {
+     if ((pc & 7u) != 0u)
+-        return decodeInstructionPair(vuCode, pc);
++        return m_decodedScratch = decodeInstructionPair(vuCode, pc);
+ 
+     const bool trackedVu1Code = memory != nullptr &&
+                                 ((m_unit == Unit::VU1 && vuCode == memory->getVU1Code()) ||
+                                  (m_unit == Unit::VU0 && vuCode == memory->getVU0Code()));
+     if (!trackedVu1Code)
+-        return decodeInstructionPair(vuCode, pc);
++        return m_decodedScratch = decodeInstructionPair(vuCode, pc);
+ 
+     const uint64_t generation = m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
+     if (!m_decodedCodeCacheValid ||
+@@ -1627,7 +1759,7 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
+     }
+     const uint32_t pairIndex = pc / 8u;
+     if (pairIndex >= kMaxDecodedPairs)
+-        return decodeInstructionPair(vuCode, pc);
++        return m_decodedScratch = decodeInstructionPair(vuCode, pc);
+     return m_decodedCodeCache[pairIndex];
+ }
+ 
+@@ -1699,7 +1831,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
+-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
++        const DecodedInstructionPair &decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+         {
+             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+@@ -1722,20 +1854,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ 
+         uint8_t writtenVi = 0u;
+         int32_t oldVi = 0;
+-        for (uint32_t reg = 1; reg < 16u; ++reg)
++        if (const uint32_t viWrites = decoded.lowerUsage.viWrite & 0xFFFEu; viWrites != 0u)
+         {
+-            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-            {
+-                writtenVi = static_cast<uint8_t>(reg);
+-                oldVi = m_state.vi[reg];
+-                break;
+-            }
++            writtenVi = static_cast<uint8_t>(std::countr_zero(viWrites));
++            oldVi = m_state.vi[writtenVi];
+         }
+ 
++        const bool direct = m_directRegisterWrites;
+         const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+         const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
+-        const bool hasUpperWrite = upperWrite.reg != 0u;
+-        const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
++        const bool hasUpperWrite = !direct && upperWrite.reg != 0u;
++        const bool hasLowerWrite = !direct && lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
+         const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
+         float oldUpperVf[4]{};
+         float newUpperVf[4]{};
+@@ -1747,7 +1876,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
+         if (hasDistinctLowerWrite)
+             std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
+-        if (decoded.upperUsage.accWrite != 0u)
++        if (!direct && decoded.upperUsage.accWrite != 0u)
+             std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
+ 
+         if (decoded.iBit)
+@@ -1803,7 +1932,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                                          : decoded.lowerUsage.latency;
+             queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
+         }
+-        if (decoded.upperUsage.accWrite != 0u)
++        if (!direct && decoded.upperUsage.accWrite != 0u)
+         {
+             std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
+             std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
+@@ -1812,7 +1941,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             queueAccWrite(decoded.upperUsage.accWrite, newAcc,
+                           kAccForwardLatency);
+         }
+-        if (writtenVi != 0u)
++        if (writtenVi != 0u && direct)
++        {
++            m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
++        }
++        else if (writtenVi != 0u)
+         {
+             const int32_t newVi = m_state.vi[writtenVi];
+             m_state.vi[writtenVi] = oldVi;
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index 08cd0fe..b91600f 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -577,6 +577,55 @@ void register_ps2_vu1_tests()
+                      "lower must read vf1 before upper ADD overwrites it");
+         });
+ 
++        // GOW-Port: PS2Runtime ejecuta VU1 con escrituras directas; el programa debe terminar igual.
++        tc.Run("direct register writes finish a VU1 program like the queued model", [](TestCase &t)
++        {
++            struct Result
++            {
++                float vf[8][4]{};
++                int32_t vi1 = 0;
++                uint64_t cycles = 0;
++                float stored[2][4]{};
++            };
++            const auto runProgram = [&](bool direct, Result &result)
++            {
++                Vu1Fixture fx;
++                if (!fx.initialize())
++                    return false;
++                const float loaded[4] = {0.5f, -2.0f, 8.0f, 1.0f};
++                writeVuQword(fx.data, 2u, loaded);
++                writeVuInstructionPair(fx.code, 0u, makeVuIaddiu(1u, 0u, 2), makeVuUpper(0x28u, 0xFu, 2u, 1u, 3u));  // vf3 = vf1 + vf2
++                writeVuInstructionPair(fx.code, 8u, makeVuLq(0xFu, 5u, 1u, 0), makeVuUpper(0x2Au, 0xFu, 1u, 3u, 4u)); // LQ vf5,(vi1); vf4 = vf3 * vf1
++                writeVuInstructionPair(fx.code, 16u, makeVuSq(0xFu, 4u, 0u, 4), makeVuUpper(0x28u, 0xFu, 4u, 5u, 6u)); // SQ vf4; vf6 = vf5 + vf4
++                writeVuInstructionPair(fx.code, 24u, makeVuSq(0xFu, 6u, 0u, 5), kVuUpperNop | 0x40000000u);           // SQ vf6, E
++                writeVuInstructionPair(fx.code, 32u, 0u, kVuUpperNop);
++
++                VU1Interpreter vu1;
++                vu1.setDirectRegisterWrites(direct);
++                for (uint32_t c = 0; c < 4u; ++c)
++                {
++                    vu1.state().vf[1][c] = 1.5f + static_cast<float>(c);
++                    vu1.state().vf[2][c] = -0.25f * static_cast<float>(c + 1u);
++                }
++                vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 1000u);
++                std::memcpy(result.vf, vu1.state().vf, sizeof(result.vf));
++                result.vi1 = vu1.state().vi[1];
++                result.cycles = vu1.state().cycles;
++                readVuQword(fx.data, 4u, result.stored[0]);
++                readVuQword(fx.data, 5u, result.stored[1]);
++                return true;
++            };
++            Result queued;
++            Result direct;
++            t.IsTrue(runProgram(false, queued), "queued run should initialize");
++            t.IsTrue(runProgram(true, direct), "direct run should initialize");
++            t.IsTrue(std::memcmp(queued.vf, direct.vf, sizeof(queued.vf)) == 0, "VF registers should match");
++            t.Equals(direct.vi1, queued.vi1, "VI1 should match");
++            t.Equals(direct.cycles, queued.cycles, "the cycle count (stalls included) should match");
++            t.IsTrue(std::memcmp(queued.stored, direct.stored, sizeof(queued.stored)) == 0, "stored qwords should match");
++            t.Equals(direct.stored[1][2], 17.625f, "the dependent chain should reach memory");
++        });
++
+         tc.Run("FMAC dependency stalls only the lanes that are read", [](TestCase &t)
+         {
+             Vu1Fixture fx;

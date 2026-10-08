@@ -6,6 +6,8 @@
 #include "ps2x/iop/iop_host.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <sstream>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -13,6 +15,9 @@
 
 namespace ps2x::iop::detail
 {
+    // GOW-Port: tope de ciclos del IOP que se dejan correr tras cada RPC (~0.1 s a 36.864 MHz).
+    constexpr uint64_t kRpcSettleCycles = 4000000u;
+
     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
         : m_host(host), m_memory(memory), m_kernel(kernel)
     {
@@ -39,6 +44,7 @@ namespace ps2x::iop::detail
             setV0(0u);
             return true;
         case 7: // sceSifSetDma
+        case 32: // GOW-Port: sceSifSetDmaIntr(dmat, count, func, data): igual, y llama a func(data) al terminar
         {
             constexpr uint32_t kDescriptorSize = 16u;
             constexpr uint32_t kMaxDescriptors = 32u;
@@ -101,16 +107,31 @@ namespace ps2x::iop::detail
                 }
             }
 
+            // GOW-Port: PS2X_IOP_TRACE_DMA=1 registra cada transferencia IOP -> EE (origen, destino, tamano, datos).
+            static const bool traceDma = std::getenv("PS2X_IOP_TRACE_DMA") != nullptr;
             for (uint32_t i = 0u; i < pendingCount; ++i)
             {
                 const PendingTransfer &transfer = pending[i];
-                if (!m_memory.readRam(transfer.source, scratch.data(), transfer.size) || !m_host.writeGuest(transfer.destination, scratch.data(), transfer.size))
+                const bool readOk = m_memory.readRam(transfer.source, scratch.data(), transfer.size);
+                const bool writeOk = readOk && m_host.writeGuest(transfer.destination, scratch.data(), transfer.size);
+                if (traceDma)
+                {
+                    std::ostringstream out;
+                    out << "[IOP:sifdma] src=0x" << std::hex << transfer.source << " dst=0x" << transfer.destination
+                        << " size=0x" << transfer.size << " read=" << readOk << " write=" << writeOk << " bytes=";
+                    for (uint32_t b = 0u; b < std::min<uint32_t>(16u, transfer.size); ++b)
+                        out << ' ' << static_cast<uint32_t>(scratch[b]);
+                    m_host.log(LogLevel::Info, out.str());
+                }
+                if (!writeOk)
                 {
                     setV0(0u);
                     return true;
                 }
             }
 
+            if (ordinal == 32u && cpu.gpr[6] != 0u)
+                m_dmaCallback = {cpu.gpr[6], cpu.gpr[7], cpu.gpr[28]};
             const uint32_t dmaId = m_nextDmaId++;
             if (m_nextDmaId == 0u || m_nextDmaId > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
             {
@@ -244,9 +265,33 @@ namespace ps2x::iop::detail
             m_kernel.sleepCurrent(cpu);
             setV0(0);
             return true;
-        case 23:
+        case 23: // sceSifGetOtherData(rd, eeSrc, iopDest, size, mode)
+        {
+            // GOW-Port: el IOP copia datos de la RAM del EE (smpd/989snd cargan así los bancos de sonido
+            // que el juego tiene en memoria del EE). Antes no copiaba nada y los bancos no llegaban al SPU2.
+            const uint32_t receiveData = cpu.gpr[4];
+            const uint32_t source = cpu.gpr[5];
+            const uint32_t destination = cpu.gpr[6];
+            const int32_t size = static_cast<int32_t>(cpu.gpr[7]);
+            if (size > 0)
+            {
+                std::vector<uint8_t> buffer(static_cast<size_t>(size));
+                if (!m_host.readGuest(source, buffer.data(), buffer.size()) ||
+                    !m_memory.writeRam(destination, buffer.data(), buffer.size()))
+                {
+                    setV0(static_cast<uint32_t>(-1));
+                    return true;
+                }
+            }
+            // SifRpcReceiveData_t: cabecera de 16 bytes y luego src, dest, size (como sifcmd).
+            if (receiveData != 0u)
+            {
+                const uint32_t fields[3] = {source, destination, static_cast<uint32_t>(size)};
+                (void)m_memory.writeRam(receiveData + 0x10u, fields, sizeof(fields));
+            }
             setV0(0);
             return true;
+        }
         case 24: // RemoveRpc
         {
             const uint32_t serverData = cpu.gpr[4];
@@ -298,6 +343,10 @@ namespace ps2x::iop::detail
                                                                request.send.size,
                                                                0u,
                                                                server.gp);
+        // GOW-Port: en el IOP real, si el servidor despierta a un hilo de mas prioridad (smpd: su hilo lector),
+        // ese hilo se ejecuta antes de que el hilo RPC conteste. Sin esto, smpd tomaba el destino de la lectura
+        // de la peticion siguiente y los datos acababan en el bufer equivocado.
+        executor.runReadyThreads(kRpcSettleCycles);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)

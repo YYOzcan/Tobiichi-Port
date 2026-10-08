@@ -1,0 +1,160 @@
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+@@ -211,6 +211,21 @@
+         return c;
+     }
+ 
++    // GOW-Port: fuera del ancho de fila, o tras 512 paginas logicas, XY deja
++    // de identificar un pixel unico de VRAM. La base alineada puede volver
++    // por 4 MiB sin alias si las coordenadas siguen dentro de ese dominio.
++    bool targetCoordinatesMayAlias(uint32_t psm, uint32_t bw, int x1, int y1)
++    {
++        const GSSwizzle::Format &f = GSSwizzle::GetFormat(psm);
++        if (f.kind == GSSwizzle::Kind::Invalid)
++            return false;
++        const uint32_t x = static_cast<uint32_t>(std::max(x1, 0));
++        const uint32_t y = static_cast<uint32_t>(std::max(y1, 0));
++        const uint32_t pagesPerRow = (bw * 64u) >> f.pageShiftX;
++        return x >= bw * 64u || (pagesPerRow == 0u && (y >> f.pageShiftY) != 0u) ||
++               (y >> f.pageShiftY) * pagesPerRow + (x >> f.pageShiftX) >= kPages;
++    }
++
+     void markPages(std::bitset<kPages> &pages, uint32_t psm, uint32_t base, uint32_t bw, int x0, int y0, int x1, int y1)
+     {
+         const GSSwizzle::Format &format = GSSwizzle::GetFormat(psm);
+@@ -333,6 +348,9 @@
+     // GOW-Port: color y profundidad pueden compartir VRAM con swizzles distintos.
+     std::bitset<kPages> colorPages;
+     std::bitset<kPages> depthAccessPages;
++    // GOW-Port: riesgo acumulado por destino; solo separa paginas solapadas.
++    bool colorCoordinatesAlias = false;
++    bool depthCoordinatesAlias = false;
+     std::bitset<kPages> batchClutPages;
+     bool deferUploads = true;
+     std::vector<uint32_t> pageMaps;
+@@ -1404,6 +1422,8 @@
+         writePages.reset();
+         colorPages.reset();
+         depthAccessPages.reset();
++        colorCoordinatesAlias = false;
++        depthCoordinatesAlias = false;
+         readPages.reset();
+         batchClutPages.reset();
+         hasTarget = false;
+@@ -1747,10 +1767,17 @@
+         const uint32_t ztest = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+         if (!ctx.zbuf.zmask || ztest >= 2u)
+             markPages(depth, ctx.zbuf.psm, ctx.zbuf.zbp << 5u, fbw, x0, y0, x1, y1);
++        const bool colorAlias = targetCoordinatesMayAlias(ctx.frame.psm, fbw, x1, y1);
++        const bool depthAlias = depth.any() && targetCoordinatesMayAlias(ctx.zbuf.psm, fbw, x1, y1);
+         // GOW-Port: orden entre primitivas cuando color y Z reinterpretan las mismas
+         // paginas. El orden por pixel del shader no protege alias entre otros pixels.
+         // Es conservador por pagina; no resuelve alias internos de una sola primitiva.
+-        if ((color & depthAccessPages).any() || (depth & colorPages).any())
++        // GOW-Port: el orden por XY tampoco protege dos direcciones del mismo
++        // color/Z que coinciden por stride o wrap. Conservar el lote habitual
++        // y el caso fuera de ancho pero con paginas fisicas disjuntas.
++        if ((color & depthAccessPages).any() || (depth & colorPages).any() ||
++            ((colorAlias || colorCoordinatesAlias) && (color & colorPages).any()) ||
++            ((depthAlias || depthCoordinatesAlias) && (depth & depthAccessPages).any()))
+         {
+             ++stats.flushTarget;
+             flushFor(0u);
+@@ -1816,6 +1843,8 @@
+         writePages |= write;
+         colorPages |= color;
+         depthAccessPages |= depth;
++        colorCoordinatesAlias |= colorAlias;
++        depthCoordinatesAlias |= depthAlias;
+         readPages |= read;
+         targetKey = key;
+         hasTarget = true;
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -17,6 +17,75 @@
+ 
+ namespace
+ {
++// GOW-Port: alias del mismo destino por stride y vuelta de VRAM. Un lote largo
++// en el primer XY hace observable que el ultimo sprite pierde sus escrituras.
++// Los controles conservan el batching normal, incluso al volver la base FBP.
++void gpuCoordinateAliasing(TestCase &t,bool hardware)
++{
++    std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
++    auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
++    raw->SetHardwareRasterAllowed(hardware);raw->SetFeedbackSnapshotEnabled(false);
++    GSThreadedBackend backend(std::move(gpu));
++    for(unsigned psm:{0u,1u,2u,10u}) for(unsigned fixture=0;fixture<10;++fixture) {
++        const bool wrap=fixture==1 || fixture==6,reverse=fixture==5 || fixture==6;
++        const bool depthOnly=fixture==7 || fixture==8,inactiveDepth=fixture==9;
++        const bool hazard=fixture==0 || wrap || reverse || depthOnly;
++        const unsigned colorPsm=fixture==7 || inactiveDepth?GS_PSM_CT16:fixture==8?GS_PSM_CT32:psm;
++        const unsigned depthPsm=fixture==8?GS_PSM_Z16:GS_PSM_Z32;
++        const auto &colorFormat=GSSwizzle::GetFormat(colorPsm);
++        const auto &depthFormat=GSSwizzle::GetFormat(depthPsm);
++        const unsigned height=depthOnly || inactiveDepth?32u:1u<<colorFormat.pageShiftY;
++        const unsigned bw=wrap?32u:fixture==4?2u:1u;
++        const unsigned period=512u/bw*(1u<<colorFormat.pageShiftY);
++        unsigned ax=0,ay=wrap?0:fixture==8?64u:height;
++        unsigned bx=fixture==2 || wrap?0:fixture==3?128u:64u,by=fixture==2?ay:wrap?period:0;
++        if(reverse){std::swap(ax,bx);std::swap(ay,by);}
++        const unsigned repetitions=reverse?1u:64u;
++        const auto first=GSSwizzle::Locate(depthOnly?depthFormat:colorFormat,(depthOnly?128u:511u)*32u,bw,ax,ay);
++        const auto last=GSSwizzle::Locate(depthOnly?depthFormat:colorFormat,(depthOnly?128u:511u)*32u,bw,bx,by);
++        if(hazard)t.IsTrue(first.byte==last.byte && (ax!=bx || ay!=by),"XY distintos apuntan al mismo pixel fisico");
++        std::vector<uint8_t> seed(vram.size());
++        for(size_t i=0;i<seed.size();i+=4){const uint32_t word=0xA5123456u;std::memcpy(seed.data()+i,&word,4);}
++        auto cpuVram=seed;GSCpuBackend cpu;cpu.Initialize(cpuVram.data(),uint32_t(cpuVram.size()));
++        std::vector<GSPrimitiveBatch> draws;
++        for(unsigned i=0;i<=repetitions;++i) {
++            const bool final=i==repetitions;const unsigned x=final?bx:ax,y=final?by:ay;
++            GSPrimitiveBatch b{};b.vertexCount=2;b.state.prim.type=GS_PRIM_SPRITE;b.state.colclamp=1;
++            auto &c=b.state.context;c.frame={511,bw,uint8_t(colorPsm),0};c.scissor={0,2047,0,2047};
++            c.zbuf={128,uint8_t(depthPsm),!depthOnly};c.test=0x30000;
++            b.vertices[0].x=float(x);b.vertices[0].y=float(y);
++            b.vertices[1].x=float(x+64u);b.vertices[1].y=float(y+height);
++            b.vertices[1].z=final?0xccbbaa:0x010203;
++            b.vertices[1].r=final?0xaa:0x11;b.vertices[1].g=final?0xbb:0x22;
++            b.vertices[1].b=final?0xcc:0x33;b.vertices[1].a=128;
++            draws.push_back(b);cpu.Submit(b);
++        }
++        std::vector<uint8_t> expected;cpu.SnapshotVram(expected);
++        t.IsTrue(expected!=seed,"El control realmente escribe color y, si procede, Z");
++        if(depthOnly)t.Equals(cpu.ReadVram(depthPsm,128u*32u,bw,bx,by),
++            uint32_t(depthPsm==GS_PSM_Z16?0xbbaau:0xccbbaau),"La ultima primitiva gana el alias de profundidad");
++        bool observedHardware=false;unsigned pass=0;
++        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(12);
++        do {
++            backend.Sync(GSSyncReason::Finish);std::copy(seed.begin(),seed.end(),vram.begin());
++            backend.Initialize(vram.data(),uint32_t(vram.size()));
++            if(dynamic_cast<GSGpuBackend*>(&backend.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
++            backend.Sync(GSSyncReason::Finish);const auto before=raw->GetStats();
++            for(const auto &draw:draws)backend.Submit(draw);
++            backend.Sync(GSSyncReason::DebugReadback);std::vector<uint8_t> actual;backend.SnapshotVram(actual);
++            const auto after=raw->GetStats();
++            t.IsTrue(actual==expected,"Stride/wrap preservan los 4 MiB frente a CPU");
++            t.IsTrue(after.batches-before.batches==(hazard?2u:1u),"Solo el riesgo con paginas solapadas divide el lote");
++            t.IsTrue(after.flushTarget-before.flushTarget==(hazard?1u:0u),"Orden del destino acumulado, en ambos sentidos");
++            t.IsTrue(after.flushTexture-before.flushTexture==0u,"No hay textura en estos controles");
++            t.IsTrue(after.prims-before.prims==draws.size(),"Todas las primitivas se rasterizan realmente");
++            if(after.tiles-before.tiles==0 && after.prims-before.prims==draws.size())observedHardware=true;
++            if(!hardware)t.IsTrue(after.tiles>before.tiles,"Compute efectivo requerido");
++            ++pass;if(hardware && !observedHardware)std::this_thread::sleep_for(std::chrono::milliseconds(20));
++        } while(pass<4 || (hardware && !observedHardware && std::chrono::steady_clock::now()<deadline));
++        if(hardware)t.IsTrue(observedHardware,"Hardware efectivo, sin tiles compute");
++    }
++}
+ // GOW-Port: color/Z con la misma base tienen swizzles distintos. Dos medias
+ // paginas se afectan entre primitivas aunque sus rectangulos XY sean disjuntos.
+ void gpuTargetAliasing(TestCase &t,bool hardware)
+@@ -1636,6 +1705,8 @@
+         const char *gpu=std::getenv("GOW_GS_GPU_TEST");
+         if(gpu && *gpu && *gpu!='0')
+         {
++            t.Run("OpenGL compute orders coordinate aliases from stride and VRAM wrap",[](TestCase &t){gpuCoordinateAliasing(t,false);});
++            t.Run("OpenGL hardware orders coordinate aliases from stride and VRAM wrap",[](TestCase &t){gpuCoordinateAliasing(t,true);});
+             t.Run("OpenGL compute orders color and depth aliases between primitives",[](TestCase &t){gpuTargetAliasing(t,false);});
+             t.Run("OpenGL hardware orders color and depth aliases between primitives",[](TestCase &t){gpuTargetAliasing(t,true);});
+             t.Run("OpenGL compute region pages batch only true texture hazards in all 13 formats",[](TestCase &t){gpuRegionPages(t,false);});

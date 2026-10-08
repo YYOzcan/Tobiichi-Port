@@ -1,0 +1,33 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "God of War",
+  "system": "PS2",
+  "type": "recomp",
+  "original": {
+    "region": "USA",
+    "serial": "SCUS-97399"
+  },
+  "project": "God of War — PS2 Static Recompilation",
+  "status": "in-progress",
+  "targets": ["Windows"],
+  "toolchain": "Ps2recomp",
+  "approach": "Static recompilation of MIPS R5900 code to C++20, with a PS2Recomp-based runtime and God of War-specific overrides.",
+  "maintainers": [
+    {
+      "name": "KIexster",
+      "link": "https://github.com/KIexster"
+    }
+  ],
+  "links": [
+    {
+      "label": "Project status",
+      "url": "https://github.com/KIexster/god-of-war-recomp/blob/main/docs/ESTADO.md"
+    }
+  ],
+  "help": [
+    "VIF/VU/GIF synchronization and 3D rendering",
+    "MPEG FMV playback",
+    "SPU2 audio and SIO2 memory cards"
+  ],
+  "notes": "Boots to the main menu with keyboard/controller input and difficulty selection. With FMVs skipped, the initial level reaches the gameplay state, but its framebuffer remains black. Text rendering, FMVs, audio and memory cards are still incomplete. Not yet playable."
+}

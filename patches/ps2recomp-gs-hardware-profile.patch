@@ -1,0 +1,234 @@
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+@@ -1608,15 +1608,24 @@
+                 g.BindFramebuffer(kFramebuffer, hwFramebuffer);
+                 g.Viewport(0, 0, 2048, 2048);
+                 g.BindVertexArray(hwVertexArray);
+-                const GLuint profRaster = profBegin();
+                 for (const HwRun &run : hwRuns)
+                 {
+                     g.UseProgram(run.program->id);
+                     g.Uniform4ui(run.program->loc[0], epoch, 0u, 0u, 0u);
+                     g.Uniform4ui(run.program->loc[1], hwConservative ? 1u : 0u, 0u, 0u, 0u);
++                    // GOW-Port: cada variante hardware tiene su consulta y su estado;
++                    // un lote puede contener distintas flags aunque comparta destino.
++                    if (prof.enabled)
++                    {
++                        const uint32_t stateIndex = prims[static_cast<size_t>(run.first) * kPrimWords] >> 8u;
++                        const uint32_t *state = states.data() + static_cast<size_t>(stateIndex) * kStateWords;
++                        prof.nextInfo = {run.last - run.first, 0u, 0u, 0u, state[SFbp] >> 5u,
++                                         state[SFpsm], state[SZbp] >> 5u, state[SFlags]};
++                    }
++                    const GLuint profRaster = profBegin();
+                     g.DrawArrays(kTriangles, static_cast<GLint>(run.first * 6u), static_cast<GLsizei>((run.last - run.first) * 6u));
++                    profEnd(0u, profRaster);
+                 }
+-                profEnd(0u, profRaster);
+                 if (prof.enabled)
+                     prof.prims += primCount;
+                 barrier();
+@@ -1678,9 +1687,8 @@
+             bindUpload(6u, tileListBuffer, tileList.data(), tileList.size() * sizeof(uint32_t));
+             g.UseProgram(raster.id);
+             g.Uniform4ui(raster.loc[0], epoch, 0u, 0u, 0u);
+-            const GLuint profRaster = profBegin();
+-            g.DispatchCompute(static_cast<GLuint>(touched.size()), 1u, 1u);
+-            profEnd(0u, profRaster);
++            // GOW-Port: adjuntar los datos antes de profEnd, que puede resolver
++            // y vaciar las 4096 consultas pendientes. El trabajo CPU queda fuera del timestamp.
+             if (prof.enabled)
+             {
+                 prof.pairs += tileList.size();
+@@ -1692,11 +1700,13 @@
+                 prof.maxBin = std::max(prof.maxBin, dispatchMax);
+                 const uint32_t s0 = prims.empty() ? 0u : (prims[0] >> 8u);
+                 const uint32_t *st0 = states.data() + static_cast<size_t>(s0) * kStateWords;
+-                if (!prof.pending.empty())
+-                    prof.pending.back().info = {primCount, static_cast<uint32_t>(touched.size()), static_cast<uint32_t>(tileList.size()),
+-                                            static_cast<uint32_t>(dispatchMax), st0[SFbp] >> 5u, st0[SFpsm], st0[SZbp] >> 5u, st0[SFlags]};
++                prof.nextInfo = {primCount, static_cast<uint32_t>(touched.size()), static_cast<uint32_t>(tileList.size()),
++                                 static_cast<uint32_t>(dispatchMax), st0[SFbp] >> 5u, st0[SFpsm], st0[SZbp] >> 5u, st0[SFlags]};
+                 prof.sumMaxBin += dispatchMax;
+             }
++            const GLuint profRaster = profBegin();
++            g.DispatchCompute(static_cast<GLuint>(touched.size()), 1u, 1u);
++            profEnd(0u, profRaster);
+             barrier();
+             stats.batches += 1u;
+             stats.tiles += touched.size();
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -14,6 +14,162 @@
+ #include <thread>
+ #include <vector>
+ #include <xmmintrin.h>
++
++// GOW-Port: capturar el profiler real sin exponer una API de prueba del renderer.
++#include <cstdio>
++#include <stdexcept>
++#include <string>
++#ifdef _WIN32
++#include <io.h>
++#else
++#include <unistd.h>
++#endif
++
++namespace
++{
++class GpuProfileCapture
++{
++    FILE *file = nullptr;
++    int saved = -1;
++    bool hadEnv = false;
++    std::string oldEnv;
++    static int descriptor(FILE *f) {
++#ifdef _WIN32
++        return _fileno(f);
++#else
++        return fileno(f);
++#endif
++    }
++    static int duplicate(int fd) {
++#ifdef _WIN32
++        return _dup(fd);
++#else
++        return dup(fd);
++#endif
++    }
++    static int redirect(int from, int to) {
++#ifdef _WIN32
++        return _dup2(from,to);
++#else
++        return dup2(from,to);
++#endif
++    }
++    static void setProfile(const char *value) {
++#ifdef _WIN32
++        _putenv_s("PS2X_GS_GPU_PROF",value?value:"");
++#else
++        if(value) setenv("PS2X_GS_GPU_PROF",value,1);
++        else unsetenv("PS2X_GS_GPU_PROF");
++#endif
++    }
++public:
++    GpuProfileCapture() {
++        if(const char *value=std::getenv("PS2X_GS_GPU_PROF")){hadEnv=true;oldEnv=value;}
++        file=std::tmpfile();
++        if(!file) throw std::runtime_error("No se pudo crear el registro temporal del profiler");
++        std::fflush(stderr);saved=duplicate(descriptor(stderr));
++        if(saved<0 || redirect(descriptor(file),descriptor(stderr))<0) {
++            if(saved>=0) {
++#ifdef _WIN32
++                _close(saved);
++#else
++                close(saved);
++#endif
++            }
++            std::fclose(file);file=nullptr;
++            throw std::runtime_error("No se pudo capturar stderr del profiler");
++        }
++        setProfile("1");
++    }
++    ~GpuProfileCapture() {
++        std::fflush(stderr);redirect(saved,descriptor(stderr));
++#ifdef _WIN32
++        _close(saved);
++#else
++        close(saved);
++#endif
++        std::fclose(file);setProfile(hadEnv?oldEnv.c_str():nullptr);
++    }
++    std::string read() {
++        std::fflush(stderr);std::rewind(file);std::string text;char buffer[4096];
++        while(const size_t n=std::fread(buffer,1,sizeof(buffer),file))text.append(buffer,n);
++        return text;
++    }
++    GpuProfileCapture(const GpuProfileCapture&)=delete;
++    GpuProfileCapture &operator=(const GpuProfileCapture&)=delete;
++};
++
++// Dos variantes en un mismo lote hardware, o el ultimo lote del umbral 4096
++// en otro destino compute. Pixeles procedurales e idempotentes frente al CPU.
++void gpuProfileAttribution(TestCase &t,bool hardware)
++{
++    GpuProfileCapture capture;
++    std::vector<uint8_t> seed(GSSwizzle::kMemorySize),expected,actual;
++    GSPrimitiveBatch first{};first.vertexCount=2;first.state.prim.type=GS_PRIM_SPRITE;
++    first.state.colclamp=1;
++    auto &c=first.state.context;c.frame={2,1,GS_PSM_CT32,0};c.scissor={0,63,0,31};
++    c.zbuf={104,GS_PSM_Z32,true};c.test=0x30000;c.alpha=0x44;
++    first.vertices[1].x=16;first.vertices[1].y=16;
++    for(auto &v:first.vertices){v.r=32;v.g=64;v.b=96;v.a=128;}
++    auto second=first;second.state.prim.abe=true;
++    if(hardware){second.vertices[0].x=16;second.vertices[1].x=32;}
++    else second.state.context.frame.fbp=3;
++    auto cpuVram=seed;GSCpuBackend cpu;cpu.Initialize(cpuVram.data(),uint32_t(cpuVram.size()));
++    cpu.Submit(first);cpu.Submit(second);cpu.SnapshotVram(expected);
++    t.IsTrue(expected!=seed,"El control CPU realmente escribe los pixeles");
++    auto vram=seed;std::string log;
++    {
++        GSGpuBackend gpu;gpu.SetHardwareRasterAllowed(hardware);gpu.SetFeedbackSnapshotEnabled(false);
++        gpu.Initialize(vram.data(),uint32_t(vram.size()));
++        if(!gpu.IsReady()){t.Fail("OpenGL efectivo requerido para el profiler");return;}
++        GSPresentationRequest request{};request.pmode=1;request.dispfb1=2ull|(1ull<<9);
++        request.display1=(63ull<<32)|(31ull<<44);
++        if(hardware) {
++            unsigned consecutive=0;
++            const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(12);
++            do {
++                const auto before=gpu.GetStats();gpu.Submit(first);gpu.Submit(second);
++                gpu.Present(request);const auto after=gpu.GetStats();
++                const bool hw=after.prims-before.prims==2u && after.tiles==before.tiles;
++                consecutive=hw?consecutive+1u:0u;
++                t.IsTrue(after.batches-before.batches==1u,"Dos variantes comparten el lote de raster");
++                if(!hw)std::this_thread::sleep_for(std::chrono::milliseconds(20));
++            } while(consecutive<8u && std::chrono::steady_clock::now()<deadline);
++            t.IsTrue(consecutive>=8u,"Ocho frames seguidos de hardware, sin fallback compute");
++        } else {
++            for(unsigned i=0;i<4096u;++i){gpu.Submit(i==4095u?second:first);gpu.Flush();}
++            for(unsigned i=0;i<4u;++i)gpu.Present(request);
++            t.Equals(gpu.GetStats().prims,uint64_t(4096),"4096 lotes compute efectivos");
++            t.IsTrue(gpu.GetStats().tiles>0u,"Compute efectivo requerido");
++        }
++        gpu.SnapshotVram(actual);t.IsTrue(actual==expected,"El profiler conserva los 4 MiB frente al CPU");
++        log=capture.read(); // Solo informes completos; excluir el parcial del destructor.
++    }
++    const std::string marker="[gs-gpu-prof] per frame:";
++    std::string report;
++    for(size_t pos=log.find(marker);pos!=std::string::npos;) {
++        const size_t end=log.find(marker,pos+marker.size());
++        const auto part=log.substr(pos,end==std::string::npos?end:end-pos);
++        if(part.find(" raster ")!=std::string::npos)report=part;
++        pos=end;
++    }
++    if(hardware) {
++        t.IsTrue(report.find(" ms (2)")!=std::string::npos && report.find("| prims 2 tiles 0 pairs 0")!=std::string::npos,
++                 "Dos consultas raster por frame hardware y primitivas reales");
++        for(const auto flags:{"0","8"}) {
++            const std::string target=std::string("target fbp 2 flags ")+flags+":";
++            const auto begin=report.find(target),end=report.find('\n',begin);
++            t.IsTrue(begin!=std::string::npos && report.substr(begin,end-begin).find("in 4 dispatches, 0 pairs, 4 prims")!=std::string::npos,
++                     "Cada variante hardware conserva destino, flags y cantidad de primitivas");
++        }
++    } else {
++        const auto begin=report.find("target fbp 3 flags 8:"),end=report.find('\n',begin);
++        t.IsTrue(begin!=std::string::npos && report.substr(begin,end-begin).find("in 1 dispatches, 1 pairs, 1 prims")!=std::string::npos,
++                 "El lote 4096 conserva datos al resolver y vaciar las consultas pendientes");
++    }
++    t.IsTrue(report.find("target fbp 0 flags 0:")==std::string::npos,"No hay consultas raster con datos vacios");
++}
++}
+ 
+ namespace
+ {
+@@ -1712,6 +1868,8 @@
+         const char *gpu=std::getenv("GOW_GS_GPU_TEST");
+         if(gpu && *gpu && *gpu!='0')
+         {
++            t.Run("OpenGL hardware profiler attributes each variant",[](TestCase &t){gpuProfileAttribution(t,true);});
++            t.Run("OpenGL compute profiler retains the pending-query boundary",[](TestCase &t){gpuProfileAttribution(t,false);});
+             t.Run("OpenGL compute orders coordinate aliases from stride and VRAM wrap",[](TestCase &t){gpuCoordinateAliasing(t,false);});
+             t.Run("OpenGL hardware orders coordinate aliases from stride and VRAM wrap",[](TestCase &t){gpuCoordinateAliasing(t,true);});
+             t.Run("OpenGL compute orders color and depth aliases between primitives",[](TestCase &t){gpuTargetAliasing(t,false);});

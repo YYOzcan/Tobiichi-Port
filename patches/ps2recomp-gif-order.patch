@@ -1,0 +1,146 @@
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -37,29 +37,43 @@
+     if (!m_processFn)
+         return;
+ 
+-    std::stable_sort(m_queue.begin(), m_queue.end(),
+-                     [](const GifArbiterPacket &a, const GifArbiterPacket &b)
+-                     {
+-                         // DIRECTHL cannot preempt PATH3 IMAGE transfers.
+-                         if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
++    while (!m_queue.empty())
++    {
++        // GOW-Port: la excepción DIRECTHL/IMAGE no es un orden débil estricto y no puede
++        // usarse como comparador de stable_sort. Agrupar solo por path conserva sus FIFO.
++        std::stable_sort(m_queue.begin(), m_queue.end(),
++                         [](const GifArbiterPacket &a, const GifArbiterPacket &b)
+                          {
+-                             if (a.path3Image && b.path2DirectHl)
+-                                 return true;
+-                             if (a.path2DirectHl && b.path3Image)
+-                                 return false;
+-                         }
+-                         return pathPriority(a.pathId) < pathPriority(b.pathId);
+-                     });
++                             return pathPriority(a.pathId) < pathPriority(b.pathId);
++                         });
++        const size_t count = m_queue.size();
++        size_t path2Begin = 0u;
++        while (path2Begin < count && m_queue[path2Begin].pathId == GifPathId::Path1)
++            ++path2Begin;
++        size_t path2End = path2Begin;
++        while (path2End < count && m_queue[path2End].pathId == GifPathId::Path2)
++            ++path2End;
+ 
+-    for (size_t i = 0; i < m_queue.size(); ++i)
+-    {
+-        auto &pkt = m_queue[i];
+-        if (!pkt.data.empty())
++        for (size_t i = 0u; i < path2Begin; ++i)
+         {
+-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++            auto &pkt = m_queue[i];
++            if (!pkt.data.empty())
++                m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
++        size_t path2 = path2Begin, path3 = path2End;
++        while (path2 < path2End || path3 < count)
++        {
++            // GOW-Port: decidir entre las cabeceras, nunca adelantar un paquete dentro del path.
++            // DIRECTHL espera a IMAGE en la cabecera PATH3; DIRECT mantiene prioridad normal.
++            const bool takePath2 = path2 < path2End &&
++                (path3 == count || !m_queue[path2].path2DirectHl || !m_queue[path3].path3Image);
++            auto &pkt = m_queue[takePath2 ? path2++ : path3++];
++            if (!pkt.data.empty())
++                m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++        }
++        // GOW-Port: conservar los paquetes que el callback haya añadido; se procesan en otra tanda.
++        m_queue.erase(m_queue.begin(), m_queue.begin() + count);
+     }
+-    m_queue.clear();
+ }
+ 
+ uint8_t GifArbiter::pathPriority(GifPathId id)
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -9,6 +9,7 @@
+ #include "Stubs/GS.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cstdint>
+ #include <cstring>
+ #include <vector>
+@@ -2601,6 +2602,69 @@
+             t.Equals(mem.vif1_regs.mark, 0x4567u, "reset must restore normal VIF command decoding");
+         });
+ 
++        // GOW-Port: DIRECTHL cambia la eleccion entre PATH2/PATH3, nunca el FIFO de cada path.
++        tc.Run("GIF arbiter preserves PATH2 FIFO when DIRECT and DIRECTHL share a queue", [](TestCase &t)
++        {
++            std::array<unsigned, 3> order{0u, 1u, 2u}; // HL, DIRECT, PATH3 IMAGE
++            do
++            {
++                std::vector<uint64_t> delivered;
++                GifArbiter arbiter([&](const uint8_t *data, uint32_t)
++                {
++                    uint64_t marker = 0u;
++                    std::memcpy(&marker, data + 8u, sizeof(marker));
++                    delivered.push_back(marker);
++                });
++                for (const unsigned id : order)
++                {
++                    std::vector<uint8_t> packet;
++                    appendU64(packet, makeGifTag(0u, id == 2u ? GIF_FMT_IMAGE : GIF_FMT_PACKED, 1u));
++                    appendU64(packet, id);
++                    arbiter.submit(id == 2u ? GifPathId::Path3 : GifPathId::Path2,
++                                   packet.data(), static_cast<uint32_t>(packet.size()), id == 0u);
++                }
++                // PATH1 siempre tiene prioridad sobre ambos, aunque se haya añadido el último.
++                std::vector<uint8_t> path1;
++                appendU64(path1, makeGifTag(0u, GIF_FMT_PACKED, 1u));
++                appendU64(path1, 3u);
++                arbiter.submit(GifPathId::Path1, path1.data(), static_cast<uint32_t>(path1.size()));
++                arbiter.drain();
++                const bool hlFirst = std::find(order.begin(), order.end(), 0u) < std::find(order.begin(), order.end(), 1u);
++                const std::vector<uint64_t> expected = hlFirst ? std::vector<uint64_t>{3u, 2u, 0u, 1u}
++                                                            : std::vector<uint64_t>{3u, 1u, 2u, 0u};
++                t.IsTrue(delivered == expected, "PATH2 order must survive arbitration against PATH3 IMAGE");
++                t.IsTrue(arbiter.empty(), "drain should release all packets");
++            } while (std::next_permutation(order.begin(), order.end()));
++        });
++
++        tc.Run("GIF arbiter preserves PATH3 setup before IMAGE when DIRECTHL is queued", [](TestCase &t)
++        {
++            std::array<unsigned, 3> order{0u, 1u, 2u}; // HL, PATH3 IMAGE, PATH3 setup
++            do
++            {
++                std::vector<uint64_t> delivered;
++                GifArbiter arbiter([&](const uint8_t *data, uint32_t)
++                {
++                    uint64_t marker = 0u;
++                    std::memcpy(&marker, data + 8u, sizeof(marker));
++                    delivered.push_back(marker);
++                });
++                for (const unsigned id : order)
++                {
++                    std::vector<uint8_t> packet;
++                    appendU64(packet, makeGifTag(0u, id == 1u ? GIF_FMT_IMAGE : GIF_FMT_PACKED, 1u));
++                    appendU64(packet, id);
++                    arbiter.submit(id == 0u ? GifPathId::Path2 : GifPathId::Path3,
++                                   packet.data(), static_cast<uint32_t>(packet.size()), id == 0u);
++                }
++                arbiter.drain();
++                const bool imageFirst = std::find(order.begin(), order.end(), 1u) < std::find(order.begin(), order.end(), 2u);
++                const std::vector<uint64_t> expected = imageFirst ? std::vector<uint64_t>{1u, 0u, 2u}
++                                                               : std::vector<uint64_t>{0u, 2u, 1u};
++                t.IsTrue(delivered == expected, "PATH3 setup and IMAGE order must survive DIRECTHL arbitration");
++            } while (std::next_permutation(order.begin(), order.end()));
++        });
++
+         tc.Run("unaligned accesses throw", [](TestCase &t)
+         {
+             PS2Memory mem;

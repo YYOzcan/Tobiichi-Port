@@ -1,0 +1,137 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -320,9 +320,12 @@
+ 
+     uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
+     {
+-        const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+-        const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
++        // GOW-Port: fracciones GS de 4 bits y truncado por etapa; oraculo PCSX2 v2.8.2 SW.
++        const uint32_t wx = std::min(uint32_t(fx * 16.0f), 15u);
++        const uint32_t wy = std::min(uint32_t(fy * 16.0f), 15u);
++        const uint32_t top = ((16u - wx) * c00 + wx * c10) >> 4;
++        const uint32_t bottom = ((16u - wx) * c01 + wx * c11) >> 4;
++        return uint8_t(((16u - wy) * top + wy * bottom) >> 4);
+     }
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+@@ -434,10 +434,12 @@
+ 
+ uint lerpChannel(uint c00, uint c10, uint c01, uint c11, float fx, float fy)
+ {
+-    precise float top = float(c00) + (float(c10) - float(c00)) * fx;
+-    precise float bottom = float(c01) + (float(c11) - float(c01)) * fx;
+-    precise float value = top + (bottom - top) * fy;
+-    return clampU8(int(value >= 0.0 ? floor(value + 0.5) : ceil(value - 0.5)));
++    // GOW-Port: mismas fracciones de 4 bits y truncados por etapa que el backend CPU.
++    uint wx = min(uint(fx * 16.0), 15u);
++    uint wy = min(uint(fy * 16.0), 15u);
++    uint top = ((16u - wx) * c00 + wx * c10) >> 4u;
++    uint bottom = ((16u - wx) * c01 + wx * c11) >> 4u;
++    return ((16u - wy) * top + wy * bottom) >> 4u;
+ }
+ 
+ float fabsQ(float q)
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -98,6 +98,52 @@
+         }
+     }
+ 
++
++    // GOW-Port: oraculo procedural de PCSX2 v2.8.2 software, cuatro texels RGBA.
++    // 256 fracciones UV: SHA256 RGBA 9de1ca132c07706433d8e86fedde114379437d2f869884342e2ec0c2353004d6.
++    // Fracciones de 4 bits y truncado por etapa; sin datos del juego ni formula duplicada.
++    void bilinearReference(TestCase &t,GSRasterBackend &backend)
++    {
++        struct Restore {unsigned csr=_mm_getcsr();~Restore(){_mm_setcsr(csr);}} restore;
++        _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++        const uint32_t colors[]={0x01fefe80u,0xff01017fu,0x807f8002u,0x038080fdu};
++        for(unsigned y=0;y<2;++y) for(unsigned x=0;x<2;++x)
++            backend.WriteVram(GS_PSM_CT32,8192,8,x,y,colors[y*2+x]);
++        for(bool fst:{true,false}) for(unsigned mode:{_MM_ROUND_NEAREST,_MM_ROUND_TOWARD_ZERO,_MM_ROUND_UP,_MM_ROUND_DOWN}) {
++            _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++            GSPrimitiveBatch b{};b.vertexCount=2;b.state.prim.type=GS_PRIM_SPRITE;
++            b.state.prim.tme=true;b.state.prim.fst=fst;b.state.linearFilter=true;
++            b.state.textureWidth=b.state.textureHeight=2;b.state.colclamp=1;
++            auto &c=b.state.context;c.frame.fbw=8;c.scissor={0,15,0,15};
++            c.zbuf.zbp=104;c.zbuf.psm=GS_PSM_Z24;c.zbuf.zmask=true;c.test=0x30000;c.clamp=5;c.tex1=0x60;
++            c.tex0.tbp0=8192;c.tex0.tbw=8;c.tex0.tw=c.tex0.th=1;c.tex0.tcc=1;c.tex0.tfx=1;
++            backend.ClearFramebuffer(c,0);
++            const unsigned before=(restore.csr & ~_MM_ROUND_MASK)|mode;_mm_setcsr(before);
++            for(unsigned y=0;y<16;++y) for(unsigned x=0;x<16;++x) {
++                for(auto &v:b.vertices) {
++                    v.r=v.g=v.b=v.a=128;v.z=7;v.u=uint16_t(8+x);v.v=uint16_t(8+y);
++                    v.s=float(8+x)/32.0f;v.t=float(8+y)/32.0f;v.q=1.0f;
++                }
++                b.vertices[0].x=float(x);b.vertices[0].y=float(y);
++                b.vertices[1].x=float(x+1);b.vertices[1].y=float(y+1);
++                backend.Submit(b);
++            }
++            backend.Sync(GSSyncReason::Finish);
++            const unsigned controls=_MM_ROUND_MASK|_MM_MASK_MASK|_MM_FLUSH_ZERO_MASK|0x40u;
++            t.IsTrue((_mm_getcsr()&controls)==(before&controls),"GS conserva los controles SSE del productor");
++            _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++            std::vector<uint8_t> actual;backend.SnapshotVram(actual);
++            if(actual.size()!=GSSwizzle::kMemorySize){t.Fail("VRAM completa requerida");return;}
++            uint64_t hash=14695981039346656037ull;
++            const auto &format=GSSwizzle::GetFormat(GS_PSM_CT32);
++            for(unsigned y=0;y<16;++y) for(unsigned x=0;x<16;++x) {
++                const auto p=GSSwizzle::Locate(format,0,8,x,y);
++                for(unsigned channel=0;channel<4;++channel) hash=(hash^actual[p.byte+channel])*1099511628211ull;
++            }
++            t.IsTrue(hash==0xfdde85267aad850dull,"RGBA completo coincide con el oraculo externo para FST/STQ y las 256 fracciones UV");
++        }
++    }
++
+     struct Recording
+     {
+         std::vector<int> events;
+@@ -363,7 +409,8 @@
+             control.vertices[1].x=25;control.vertices[1].y=25;
+             backend.ClearFramebuffer(draw.state.context,0x80332211u);backend.Submit(control);
+             const uint32_t expected=backend.ReadVram(0,0,1,24,24);
+-            t.Equals(expected,linear?0x8000492cu:0x8000573au,"Control texturizado exacto");
++            // GOW-Port: cada etapa bilineal trunca (43/72); nearest conserva 58/87.
++            t.Equals(expected,linear?0x8000482bu:0x8000573au,"Control texturizado exacto");
+             backend.ClearFramebuffer(draw.state.context,0x80332211u);backend.Submit(submitted);
+             for(uint32_t y=20;y<39u;++y)for(uint32_t x=20;x<37u;++x){
+                 if((x-20u)*19u+(y-20u)*17u>=323u)continue;
+@@ -605,6 +652,15 @@
+                     t.IsTrue(records.draws[0].vertices[i].z==double(depths[i]),"La cola conserva Z32 en XYZ3 y XYZ2 ADC");
+             }
+         });
++
++        t.Run("CPU bilinear uses GS fractional precision and truncates every stage",[](TestCase &t){
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size()));bilinearReference(t,backend);
++        });
++        t.Run("Threaded CPU bilinear matches the external RGBA reference",[](TestCase &t){
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSThreadedBackend backend(std::make_unique<GSCpuBackend>());
++            backend.Initialize(vram.data(),uint32_t(vram.size()));bilinearReference(t,backend);
++        });
+         // GOW-Port: exportación CPU adaptada de SotC ac9efa0 para repetir comandos GS.
+         t.Run("CPU and threaded CPU restore an incomplete CT24 transfer",[](TestCase &t) {
+             for(bool threaded:{false,true}) {
+@@ -1157,6 +1213,15 @@
+                     for(unsigned fixture=0;fixture<4u;++fixture) spriteSampling(t,backend,fixture);
+                 }
+             });
++
++            t.Run("OpenGL bilinear matches the external RGBA reference in compute and hardware",[](TestCase &t){
++                for(bool hardware:{false,true}){
++                    std::vector<uint8_t> vram(GSSwizzle::kMemorySize);auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
++                    raw->SetHardwareRasterAllowed(hardware);GSThreadedBackend backend(std::move(gpu));backend.Initialize(vram.data(),uint32_t(vram.size()));
++                    if(dynamic_cast<GSGpuBackend*>(&backend.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
++                    bilinearReference(t,backend);
++                }
++            });
+             t.Run("OpenGL compute and hardware preserve constant triangle RGBA and FOG",[](TestCase &t){
+                 for(const bool hardware:{false,true}){
+                     std::vector<uint8_t> vram(GSSwizzle::kMemorySize);auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();

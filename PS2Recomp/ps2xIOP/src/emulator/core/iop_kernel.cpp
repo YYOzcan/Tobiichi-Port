@@ -25,6 +25,7 @@ namespace ps2x::iop::detail
 
     void IopKernel::reset()
     {
+        ++m_version; // GOW-Port: invalida la caché de beginNextReady
         m_threads.clear();
         m_semaphores.clear();
         m_eventFlags.clear();
@@ -36,6 +37,7 @@ namespace ps2x::iop::detail
 
     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
     {
+        ++m_version; // GOW-Port: invalida la caché de beginNextReady
         const auto setV0 = [&](int32_t value)
         {
             cpu.gpr[2] = static_cast<uint32_t>(value);
@@ -352,6 +354,7 @@ namespace ps2x::iop::detail
 
     bool IopKernel::dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu)
     {
+        ++m_version; // GOW-Port: invalida la caché de beginNextReady
         const auto setV0 = [&](int32_t value)
         {
             cpu.gpr[2] = static_cast<uint32_t>(value);
@@ -414,6 +417,29 @@ namespace ps2x::iop::detail
                 m_currentThread->waitId = id;
                 cpu.yielded = true;
                 setV0(0);
+            }
+            else
+            {
+                // GOW-Port: sin hilo actual (servidor RPC llamado desde el EE) no se puede bloquear. Antes se
+                // devolvia como si se hubiera obtenido el semaforo: 989snd tomaba asi su candado del tick mientras
+                // el hilo del tick lo tenia, el candado quedaba con un dueno imposible y el sonido se paraba
+                // ("Sound System Tick locked out"). Ahora corren los demas hilos hasta que el semaforo se libera.
+                const auto available = [this, id]
+                {
+                    const auto semaphore = m_semaphores.find(id);
+                    return semaphore == m_semaphores.end() || semaphore->second.current > 0;
+                };
+                const bool acquired = m_outsideThreadWait && m_outsideThreadWait(available);
+                const auto semaphore = m_semaphores.find(id);
+                if (acquired && semaphore != m_semaphores.end())
+                {
+                    --semaphore->second.current;
+                    setV0(0);
+                }
+                else
+                {
+                    setV0(static_cast<uint32_t>(-419)); // KE_SEMA_ZERO: se agoto la espera o se borro el semaforo
+                }
             }
             return true;
         }
@@ -504,6 +530,7 @@ namespace ps2x::iop::detail
 
     int IopKernel::createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits)
     {
+        ++m_version; // GOW-Port: invalida la caché de beginNextReady
         EventFlag event;
         event.id = static_cast<int>(m_nextEventFlagId++);
         event.attr = attr;
@@ -516,6 +543,7 @@ namespace ps2x::iop::detail
 
     bool IopKernel::setInternalEventFlag(int id, uint32_t bits)
     {
+        ++m_version; // GOW-Port: invalida la caché de beginNextReady
         const auto event = m_eventFlags.find(id);
         if (event == m_eventFlags.end())
             return false;
@@ -526,6 +554,7 @@ namespace ps2x::iop::detail
 
     bool IopKernel::dispatchEventImport(uint16_t ordinal, IopCpuState &cpu)
     {
+        ++m_version; // GOW-Port: invalida la caché de beginNextReady
         const auto setV0 = [&](int32_t value)
         {
             cpu.gpr[2] = static_cast<uint32_t>(value);
@@ -618,7 +647,32 @@ namespace ps2x::iop::detail
                 cpu.yielded = true;
             }
             else
-                setV0(-418);
+            {
+                // GOW-Port: sin hilo actual (servidor RPC) se esperaba en falso con KE_EVF_COND. mc2_d manda los
+                // comandos de la memory card desde el servidor RPC de dbcman y sio2man espera el fin de la
+                // transferencia con WaitEventFlag: leía la respuesta antes de que llegara y daba la tarjeta por
+                // ausente. Ahora corren los demás hilos hasta que se cumple la condición (como WaitSema).
+                const int id = event->second.id;
+                const auto satisfied = [this, id, bits, mode]
+                {
+                    const auto current = m_eventFlags.find(id);
+                    return current == m_eventFlags.end() || eventSatisfied(current->second, bits, mode);
+                };
+                const bool ready = m_outsideThreadWait && m_outsideThreadWait(satisfied);
+                const auto current = m_eventFlags.find(id);
+                if (ready && current != m_eventFlags.end())
+                {
+                    if (cpu.gpr[7] != 0u)
+                        m_memory.write32(cpu.gpr[7], current->second.bits);
+                    if ((mode & 0x10u) != 0u)
+                        current->second.bits = 0u;
+                    setV0(0);
+                }
+                else
+                {
+                    setV0(static_cast<uint32_t>(-418));
+                }
+            }
             return true;
         }
         case 13:
@@ -654,6 +708,7 @@ namespace ps2x::iop::detail
 
     void IopKernel::sleepCurrent(IopCpuState &cpu)
     {
+        ++m_version; // GOW-Port: invalida la caché de beginNextReady
         if (m_currentThread == nullptr)
             return;
         m_currentThread->state = IopThreadState::Sleep;
@@ -662,6 +717,7 @@ namespace ps2x::iop::detail
 
     void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu)
     {
+        ++m_version; // GOW-Port: invalida la caché de beginNextReady
         if (m_currentThread == nullptr)
             return;
         m_currentThread->wakeCycle = wakeCycle;
@@ -671,15 +727,24 @@ namespace ps2x::iop::detail
 
     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
     {
-        for (auto &[id, thread] : m_threads)
-        {
-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
-                thread.state = IopThreadState::Ready;
-        }
+        if (m_idleVersion == m_version && currentCycle < m_idleUntil)
+            return nullptr; // GOW-Port: nada cambió y ningún hilo en Delay despierta todavía
 
+        // GOW-Port: un solo recorrido. Despertar los Delay vencidos y elegir el listo de menor prioridad (y
+        // menor id) no dependen del orden; los que siguen en Delay dan el próximo despertar.
         IopThread *next = nullptr;
+        uint64_t idleUntil = UINT64_MAX;
         for (auto &[id, thread] : m_threads)
         {
+            if (thread.state == IopThreadState::Delay)
+            {
+                if (thread.wakeCycle > currentCycle)
+                {
+                    idleUntil = std::min(idleUntil, thread.wakeCycle);
+                    continue;
+                }
+                thread.state = IopThreadState::Ready;
+            }
             if (thread.state != IopThreadState::Ready)
                 continue;
             if (next == nullptr || thread.priority < next->priority ||
@@ -687,8 +752,13 @@ namespace ps2x::iop::detail
                 next = &thread;
         }
         if (next == nullptr)
+        {
+            m_idleVersion = m_version;
+            m_idleUntil = idleUntil;
             return nullptr;
+        }
 
+        ++m_version;
         m_currentThread = next;
         next->state = IopThreadState::Running;
         next->cpu.stopped = false;
@@ -698,6 +768,8 @@ namespace ps2x::iop::detail
 
     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
     {
+        if (m_idleVersion == m_version) // GOW-Port: calculado por el último beginNextReady sin hilos listos
+            return std::min(fallback, m_idleUntil);
         uint64_t nextWake = fallback;
         for (const auto &[id, thread] : m_threads)
         {
@@ -709,6 +781,7 @@ namespace ps2x::iop::detail
 
     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
     {
+        ++m_version; // GOW-Port: invalida la caché de beginNextReady
         if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
             thread.state = IopThreadState::Dormant;
         else if (thread.state == IopThreadState::Running)
@@ -719,6 +792,7 @@ namespace ps2x::iop::detail
 
     void IopKernel::cleanupDeadThreads()
     {
+        ++m_version; // GOW-Port: invalida la caché de beginNextReady
         for (auto thread = m_threads.begin(); thread != m_threads.end();)
         {
             if (thread->second.state != IopThreadState::Dead)
@@ -734,6 +808,7 @@ namespace ps2x::iop::detail
 
     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
     {
+        ++m_version; // GOW-Port: invalida la caché de beginNextReady
         for (auto &[id, thread] : m_threads)
         {
             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);

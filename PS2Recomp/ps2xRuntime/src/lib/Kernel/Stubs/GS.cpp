@@ -709,7 +709,22 @@ namespace ps2_stubs
                           (static_cast<uint64_t>(0u) << 48);
         uint64_t trxreg = static_cast<uint64_t>(img.height) << 32 | static_cast<uint64_t>(img.width);
 
-        uint64_t q[10];
+        uint32_t pktAddr = runtime->guestMalloc(80u, 16u);
+        if (pktAddr == 0)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        uint8_t *pkt = getMemPtr(rdram, pktAddr);
+        if (!pkt)
+        {
+            runtime->guestFree(pktAddr);
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
         q[0] = makeGiftagAplusD(4u);
         q[1] = 0xEULL;
         q[2] = bitbltbuf;
@@ -721,11 +736,17 @@ namespace ps2_stubs
         q[8] = 1ULL;
         q[9] = 0x53ULL;
 
+        constexpr uint32_t GIF_CHANNEL = 0x1000A000;
+        constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
         auto &mem = runtime->memory();
-        mem.processGIFPacket(reinterpret_cast<const uint8_t *>(q), sizeof(q));
+        mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
+        mem.writeIORegister(GIF_CHANNEL + 0x20u, 5u);
+        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+        mem.processPendingTransfers();
 
         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "sceGsExecStoreImage", ctx);
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
+        runtime->guestFree(pktAddr);
 
         setReturnS32(ctx, 0);
     }
@@ -789,24 +810,43 @@ namespace ps2_stubs
 
             if (runtime)
             {
-                uint64_t q[16];
-                q[0] = makeGiftagAplusD(7u);
-                q[1] = 0xEULL;
-                q[2] = pmode;
-                q[3] = 0x41ULL;
-                q[4] = smode2;
-                q[5] = 0x42ULL;
-                q[6] = dispfb;
-                q[7] = 0x59ULL;
-                q[8] = display;
-                q[9] = 0x5aULL;
-                q[10] = dispfb;
-                q[11] = 0x5bULL;
-                q[12] = display;
-                q[13] = 0x5cULL;
-                q[14] = bgcolor;
-                q[15] = 0x5fULL;
-                runtime->memory().processGIFPacket(reinterpret_cast<const uint8_t *>(q), sizeof(q));
+                uint32_t pktAddr = runtime->guestMalloc(128u, 16u);
+                if (pktAddr != 0u)
+                {
+                    uint8_t *pkt = getMemPtr(rdram, pktAddr);
+                    if (pkt)
+                    {
+                        uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
+                        q[0] = makeGiftagAplusD(7u);
+                        q[1] = 0xEULL;
+                        q[2] = pmode;
+                        q[3] = 0x41ULL;
+                        q[4] = smode2;
+                        q[5] = 0x42ULL;
+                        q[6] = dispfb;
+                        q[7] = 0x59ULL;
+                        q[8] = display;
+                        q[9] = 0x5aULL;
+                        q[10] = dispfb;
+                        q[11] = 0x5bULL;
+                        q[12] = display;
+                        q[13] = 0x5cULL;
+                        q[14] = bgcolor;
+                        q[15] = 0x5fULL;
+                        constexpr uint32_t GIF_CHANNEL = 0x1000A000;
+                        constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
+                        auto &mem = runtime->memory();
+                        mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
+                        mem.writeIORegister(GIF_CHANNEL + 0x20u, 8u);
+                        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+                        mem.processPendingTransfers();
+                        runtime->guestFree(pktAddr);
+                    }
+                    else
+                    {
+                        runtime->guestFree(pktAddr);
+                    }
+                }
             }
         }
 

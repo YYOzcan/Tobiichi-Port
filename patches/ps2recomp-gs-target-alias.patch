@@ -1,0 +1,127 @@
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+@@ -330,6 +330,9 @@
+     std::vector<uint32_t> tileHeaders;
+     std::vector<uint32_t> tileList;
+     std::bitset<kPages> writePages;
++    // GOW-Port: color y profundidad pueden compartir VRAM con swizzles distintos.
++    std::bitset<kPages> colorPages;
++    std::bitset<kPages> depthAccessPages;
+     std::bitset<kPages> batchClutPages;
+     bool deferUploads = true;
+     std::vector<uint32_t> pageMaps;
+@@ -1399,6 +1402,8 @@
+             bins[tile].clear();
+         touched.clear();
+         writePages.reset();
++        colorPages.reset();
++        depthAccessPages.reset();
+         readPages.reset();
+         batchClutPages.reset();
+         hasTarget = false;
+@@ -1736,12 +1741,21 @@
+             flushFor(0u);
+         }
+ 
+-        std::bitset<kPages> write;
++        std::bitset<kPages> color, depth;
+         const uint32_t fbw = std::max<uint32_t>(ctx.frame.fbw, 1u);
+-        markPages(write, ctx.frame.psm, ctx.frame.fbp << 5u, fbw, x0, y0, x1, y1);
++        markPages(color, ctx.frame.psm, ctx.frame.fbp << 5u, fbw, x0, y0, x1, y1);
+         const uint32_t ztest = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+         if (!ctx.zbuf.zmask || ztest >= 2u)
+-            markPages(write, ctx.zbuf.psm, ctx.zbuf.zbp << 5u, fbw, x0, y0, x1, y1);
++            markPages(depth, ctx.zbuf.psm, ctx.zbuf.zbp << 5u, fbw, x0, y0, x1, y1);
++        // GOW-Port: orden entre primitivas cuando color y Z reinterpretan las mismas
++        // paginas. El orden por pixel del shader no protege alias entre otros pixels.
++        // Es conservador por pagina; no resuelve alias internos de una sola primitiva.
++        if ((color & depthAccessPages).any() || (depth & colorPages).any())
++        {
++            ++stats.flushTarget;
++            flushFor(0u);
++        }
++        const auto write = color | depth;
+ 
+         std::bitset<kPages> read;
+         if (state.prim.tme)
+@@ -1800,6 +1814,8 @@
+             }
+         }
+         writePages |= write;
++        colorPages |= color;
++        depthAccessPages |= depth;
+         readPages |= read;
+         targetKey = key;
+         hasTarget = true;
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -17,6 +17,58 @@
+ 
+ namespace
+ {
++// GOW-Port: color/Z con la misma base tienen swizzles distintos. Dos medias
++// paginas se afectan entre primitivas aunque sus rectangulos XY sean disjuntos.
++void gpuTargetAliasing(TestCase &t,bool hardware)
++{
++    std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
++    auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
++    raw->SetHardwareRasterAllowed(hardware);raw->SetFeedbackSnapshotEnabled(false);
++    GSThreadedBackend backend(std::move(gpu));
++    for(unsigned fixture=0;fixture<5;++fixture) {
++        const bool wide=fixture==4,disjoint=fixture==1,noDepth=fixture==2,readOnly=fixture==3;
++        const bool hazard=!disjoint && !noDepth;
++        std::vector<uint8_t> seed(vram.size());
++        for(size_t i=0;i<seed.size();i+=4) {
++            const uint32_t word=wide?0x00123456u:0xA5123456u;
++            std::memcpy(seed.data()+i,&word,4);
++        }
++        auto cpuVram=seed;GSCpuBackend cpu;cpu.Initialize(cpuVram.data(),uint32_t(cpuVram.size()));
++        std::vector<GSPrimitiveBatch> draws;
++        for(unsigned i=0;i<2;++i) {
++            GSPrimitiveBatch b{};b.vertexCount=2;b.state.prim.type=GS_PRIM_SPRITE;b.state.colclamp=1;
++            auto &c=b.state.context;c.frame={320,1,uint8_t(wide?GS_PSM_CT32:GS_PSM_CT24),0};
++            c.zbuf={disjoint?104u:320u,uint8_t(wide?GS_PSM_Z32:GS_PSM_Z24),noDepth||readOnly};
++            c.scissor={0,63,0,63};c.test=noDepth?0x30000:0x70000;
++            b.vertices[0].x=float(i*32);b.vertices[1].x=float((i+1)*32);b.vertices[1].y=64;
++            b.vertices[1].z=0x808080;b.vertices[1].r=i?0xAA:0x11;b.vertices[1].g=i?0xBB:0x22;
++            b.vertices[1].b=i?0xCC:0x33;b.vertices[1].a=128;
++            draws.push_back(b);cpu.Submit(b);
++        }
++        std::vector<uint8_t> expected;cpu.SnapshotVram(expected);
++        t.IsTrue(expected!=seed,"El control de alias produce escrituras reales");
++        bool observedHardware=false;unsigned pass=0;
++        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(12);
++        do {
++            backend.Sync(GSSyncReason::Finish);std::copy(seed.begin(),seed.end(),vram.begin());
++            backend.Initialize(vram.data(),uint32_t(vram.size()));
++            if(dynamic_cast<GSGpuBackend*>(&backend.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
++            backend.Sync(GSSyncReason::Finish);const auto before=raw->GetStats();
++            for(const auto &draw:draws)backend.Submit(draw);
++            backend.Sync(GSSyncReason::DebugReadback);std::vector<uint8_t> actual;backend.SnapshotVram(actual);
++            const auto after=raw->GetStats();
++            t.IsTrue(actual==expected,"Orden color/Z conserva los 4 MiB frente a CPU");
++            t.IsTrue(after.batches-before.batches==(hazard?2u:1u),"Alias separa lotes; buffers disjuntos y Z inactivo no");
++            t.IsTrue(after.flushTarget-before.flushTarget==(hazard?1u:0u),"Separacion por destino, sin inventar textura");
++            t.IsTrue(after.flushTexture-before.flushTexture==0u,"El control no lee texturas");
++            t.IsTrue(after.prims-before.prims==2u,"Ambos sprites se ejecutan en OpenGL");
++            if(after.tiles-before.tiles==0 && after.prims-before.prims==2u)observedHardware=true;
++            if(!hardware)t.IsTrue(after.tiles>before.tiles,"Compute real requerido");
++            ++pass;if(hardware && !observedHardware)std::this_thread::sleep_for(std::chrono::milliseconds(20));
++        } while(pass<4 || (hardware && !observedHardware && std::chrono::steady_clock::now()<deadline));
++        if(hardware)t.IsTrue(observedHardware,"Hardware efectivo, sin tiles compute");
++    }
++}
+ // GOW-Port: la cache de paginas de lectura no debe inventar feedback fuera de CLAMP.
+ // Tres fuentes distintas prueban la clave; la cuarta vuelve a una pagina escrita.
+ void gpuRegionPages(TestCase &t,bool hardware)
+@@ -1584,6 +1636,8 @@
+         const char *gpu=std::getenv("GOW_GS_GPU_TEST");
+         if(gpu && *gpu && *gpu!='0')
+         {
++            t.Run("OpenGL compute orders color and depth aliases between primitives",[](TestCase &t){gpuTargetAliasing(t,false);});
++            t.Run("OpenGL hardware orders color and depth aliases between primitives",[](TestCase &t){gpuTargetAliasing(t,true);});
+             t.Run("OpenGL compute region pages batch only true texture hazards in all 13 formats",[](TestCase &t){gpuRegionPages(t,false);});
+             t.Run("OpenGL hardware region pages batch only true texture hazards in all 13 formats",[](TestCase &t){gpuRegionPages(t,true);});
+             t.Run("OpenGL compute region edges preserve page crossings and VRAM wrap",[](TestCase &t){gpuRegionEdges(t,false);});

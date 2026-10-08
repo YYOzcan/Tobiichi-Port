@@ -1,0 +1,264 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -5,6 +5,7 @@
+ #include "runtime/gs/ps2_gs_psmt4.h"
+ #include "runtime/gs/ps2_gs_psmt8.h"
+ #include "runtime/gs/ps2_gs_memory.h"
++#include "gs_triangle_rules.h"
+ #include "ps2_log.h"
+ #include <atomic>
+ #include <chrono>
+@@ -1421,49 +1422,37 @@
+     const GSVertex &v2 = batch.vertices[2];
+     const auto &ctx = state.context;
+ 
+-    int ofx = ctx.xyoffset.ofx >> 4;
+-    int ofy = ctx.xyoffset.ofy >> 4;
+-
+-    float fx0 = v0.x - static_cast<float>(ofx);
+-    float fy0 = v0.y - static_cast<float>(ofy);
+-    float fx1 = v1.x - static_cast<float>(ofx);
+-    float fy1 = v1.y - static_cast<float>(ofy);
+-    float fx2 = v2.x - static_cast<float>(ofx);
+-    float fy2 = v2.y - static_cast<float>(ofy);
+-
+-    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
+-    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
+-    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
+-    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
+-
+-    minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
+-    maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
+-    minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
+-    maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
+-
+-    float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
+-    if (std::fabs(denom) < 0.001f)
++    // GOW-Port: mismas reglas enteras de OpenGL, adaptadas de sotc-port
++    // ac9efa070638ad3b3accd284de6f898d5ab271d1 (Taylor N. Albarnaz / LightVelox).
++    // El centro GS es (x,y), no (x+0.5,y+0.5); conservar todo XYOFFSET 12.4.
++    GSTriangleRaster triangle;
++    if (!gsTriangleSetup(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y,
++                         ctx.xyoffset.ofx, ctx.xyoffset.ofy, triangle))
+         return;
+-
+-    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
+-    const float invAbsDenom = 1.0f / std::fabs(denom);
+-    constexpr float kEdgeEpsilon = 1.0e-4f;
++    const int minX = std::max(triangle.minX, static_cast<int>(ctx.scissor.x0));
++    const int maxX = std::min(triangle.maxX, static_cast<int>(ctx.scissor.x1));
++    const int minY = std::max(triangle.minY, static_cast<int>(ctx.scissor.y0));
++    const int maxY = std::min(triangle.maxY, static_cast<int>(ctx.scissor.y1));
++    if (minX > maxX || minY > maxY)
++        return;
+ 
+     for (int y = minY; y <= maxY; ++y)
+     {
+-        float py = static_cast<float>(y) + 0.5f;
++        int64_t edge[3] = {gsTriangleEdge(triangle, 0, minX, y),
++                           gsTriangleEdge(triangle, 1, minX, y),
++                           gsTriangleEdge(triangle, 2, minX, y)};
+         for (int x = minX; x <= maxX; ++x)
+         {
+-            float px = static_cast<float>(x) + 0.5f;
+-
+-            float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
+-            float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
+-            float w2 = 1.0f - w0 - w1;
+-
+-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
++            const int64_t e[3] = {edge[0], edge[1], edge[2]};
++            for (int i = 0; i < 3; ++i)
++                edge[i] += triangle.a[i] * 16;
++            if (!gsTriangleCovers(triangle, e))
+                 continue;
+-
+-            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
++            const float w0 = gsTriangleWeight(triangle, e[0]);
++            const float w1 = gsTriangleWeight(triangle, e[1]);
++            const float w2 = gsTriangleWeight(triangle, e[2]);
++            // Conservar una Z plana de 32 bits incluso cuando los pesos se redondean.
++            const double z = v0.z + (v1.z - v0.z) * w1 + (v2.z - v0.z) * w2;
+ 
+             uint8_t r, g, b, a;
+             if (state.prim.iip)
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -112,6 +112,46 @@
+         b.vertices[1].x = 12; b.vertices[1].y = 14;
+         for(auto &v : b.vertices) { v.r = 25; v.g = 51; v.b = 99; v.a = 128; v.z = 7; }
+         return b;
++    }
++    // GOW-Port: manual GS 2.4.4/3.2.9: centro entero y lados superior/izquierdo incluidos.
++    void triangleSampling(TestCase &t, GSRasterBackend &backend, unsigned fixture)
++    {
++        auto draw=sprite(); draw.vertexCount=3; draw.state.prim.type=GS_PRIM_TRIANGLE;
++        draw.vertices[0].x=20;draw.vertices[0].y=20;
++        draw.vertices[1].x=36;draw.vertices[1].y=20;
++        draw.vertices[2].x=20;draw.vertices[2].y=36;
++        if(fixture==0u) {
++            backend.ClearFramebuffer(draw.state.context,0);
++            draw.state.prim.iip=true; draw.vertices[0].r=128;draw.vertices[1].g=128;draw.vertices[2].b=128;
++            backend.Submit(draw);
++            t.Equals(backend.ReadVram(0,0,1,24,24),0x806a464cu,
++                     "Pesos GS en (24,24): 1/2,1/4,1/4; no desplazar medio pixel");
++        } else if(fixture==1u) {
++            for(const uint16_t offset : {uint16_t(4),uint16_t(12)}) {
++                backend.ClearFramebuffer(draw.state.context,0x80332211u);
++                draw.state.context.xyoffset.ofx=offset; draw.state.context.xyoffset.ofy=offset;
++                for(unsigned i=0;i<3u;++i) {draw.vertices[i].x=(i==1u ? 36.5f:20.5f);draw.vertices[i].y=(i==2u ? 36.5f:20.5f);}
++                backend.Submit(draw); const uint32_t start=offset==4u ? 21u:20u;
++                t.Equals(backend.ReadVram(0,0,1,start-1u,start-1u),0x80332211u,"Conservar XYOFFSET fraccional y excluir el centro exterior");
++                t.Equals(backend.ReadVram(0,0,1,start,start),0x80633319u,"Incluir el primer centro entero dentro del triangulo");
++            }
++        } else {
++            draw.state.prim.abe=true; draw.state.context.alpha=(1ull<<2)|(1ull<<6);
++            for(auto &v : draw.vertices) {v.r=128;v.g=128;v.b=128;v.a=64;}
++            for(const bool reverse : {false,true}) {
++                backend.ClearFramebuffer(draw.state.context,0);
++                auto first=draw,second=draw;
++                second.vertices[0].x=36;second.vertices[0].y=20;
++                second.vertices[1].x=36;second.vertices[1].y=36;
++                second.vertices[2].x=20;second.vertices[2].y=36;
++                if(reverse) {std::swap(first.vertices[0],first.vertices[2]);std::swap(second.vertices[0],second.vertices[2]);}
++                backend.Submit(first);backend.Submit(second);
++                for(uint32_t y=20;y<36u;++y) for(uint32_t x=20;x<36u;++x)
++                    if(backend.ReadVram(0,0,1,x,y)!=0x40404040u) {
++                        t.Fail("Lado compartido se dibuja exactamente una vez, sin huecos: x="+std::to_string(x)+" y="+std::to_string(y));return;
++                    }
++            }
++        }
+     }
+     void transferRoundtrip(TestCase &t, GSRasterBackend &b)
+     {
+@@ -668,6 +708,18 @@
+             std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
+             backend.Initialize(vram.data(),uint32_t(vram.size())); transfer24Reset(t,backend);
+         });
++        t.Run("CPU triangle colors sample at the GS integer pixel center", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size())); triangleSampling(t,backend,0);
++        });
++        t.Run("CPU triangles retain fractional XYOFFSET and coverage", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size())); triangleSampling(t,backend,1);
++        });
++        t.Run("CPU shared triangle edges draw exactly once for both windings", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size())); triangleSampling(t,backend,2);
++        });
+         t.Run("GPU swizzle matches existing GS memory for all 13 formats", [](TestCase &t) {
+             GSMem::InitLookupTables();
+             const uint32_t formats[]={0,1,2,10,19,20,27,36,44,48,49,50,58};
+@@ -715,6 +767,15 @@
+                     t.Equals(backend.GetTransferSnapshot().direction,3u,"La transferencia importada termina");
+                 }
+             });
++            t.Run("OpenGL compute and hardware follow GS triangle sampling rules",[](TestCase &t){
++                for(const bool hardware : {false,true}) {
++                    std::vector<uint8_t> vram(GSSwizzle::kMemorySize); auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();
++                    raw->SetHardwareRasterAllowed(hardware); GSThreadedBackend backend(std::move(gpu));
++                    backend.Initialize(vram.data(),uint32_t(vram.size()));
++                    if(dynamic_cast<GSGpuBackend *>(&backend.Inner())!=raw || !raw->IsReady()) {t.Fail("OpenGL requerido");return;}
++                    for(unsigned fixture=0;fixture<3u;++fixture) triangleSampling(t,backend,fixture);
++                }
++            });
+         }
+     });
+ }
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -3471,7 +3471,9 @@
+                 gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
+                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
+                 gs.writeRegister(GS_REG_XYZ2, 0ull);
+-                gs.writeRegister(GS_REG_ST, packSt(1.0f, 0.0f));
++                // GOW-Port: en el centro GS (1,1), S=0.375 y U=0.75;
++                // queda entre texels incluso tras quitar el desplazamiento de medio pixel.
++                gs.writeRegister(GS_REG_ST, packSt(1.5f, 0.0f));
+                 gs.writeRegister(GS_REG_XYZ2, (64ull << 0) | (0ull << 16));
+                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
+                 gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
+@@ -3638,7 +3640,9 @@
+             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
+             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+-            gs.writeRegister(GS_REG_ST, packSt(2.0f, 0.0f));
++            // GOW-Port: centro GS (1,1), pesos 1/2,1/4,1/4. S/Q da texel 2;
++            // interpolar S/Q por vertice daria texel 1 y debe seguir fallando.
++            gs.writeRegister(GS_REG_ST, packSt(3.0f, 0.0f));
+             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(2.0f));
+             gs.writeRegister(GS_REG_XYZ2, 64ull);
+             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
+@@ -3648,7 +3652,7 @@
+             const uint32_t pixel =
+                 readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+             t.Equals(pixel, kHomogeneousTexel,
+-                     "the DDA should interpolate S=0.75 and Q=1.375, selecting texel 2 after S/Q");
++                     "DDA en (1,1): S=0.75 y Q=1.25; selecciona texel 2 despues de S/Q");
+         });
+ 
+         tc.Run("GS alpha-test AFAIL independently masks framebuffer and depth", [](TestCase &t)
+@@ -3847,47 +3851,23 @@
+             gs.writeRegister(GS_REG_XYZF2, makeXyzf(420u, 420u));
+             gs.writeRegister(GS_REG_XYZF2, makeXyzf(102u, 420u));
+ 
+-            bool sawFilledRow = false;
+-            for (uint32_t y = 6u; y <= 26u; ++y)
+-            {
+-                int first = -1;
+-                int last = -1;
+-                for (uint32_t x = 6u; x <= 26u; ++x)
++            // GOW-Port: VRAM CT32 es swizzled; leerla como filas lineales inventaba
++            // huecos y no comprobaba el quad de [6.375,26.25] en centros enteros.
++            for (uint32_t y = 0u; y <= 31u; ++y)
++            {
++                for (uint32_t x = 0u; x <= 31u; ++x)
+                 {
+-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
+-                    uint32_t pixel = 0u;
+-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+-                    if ((pixel & 0x00FFFFFFu) != 0u)
++                    const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, x, y);
++                    const uint32_t expected = x >= 7u && x <= 26u && y >= 7u && y <= 26u
++                                                  ? 0x80FFFFFFu : 0u;
++                    if (pixel != expected)
+                     {
+-                        if (first < 0)
+-                        {
+-                            first = static_cast<int>(x);
+-                        }
+-                        last = static_cast<int>(x);
+-                    }
+-                }
+-
+-                if (first < 0 || last < 0)
+-                {
+-                    continue;
+-                }
+-
+-                sawFilledRow = true;
+-                for (int x = first; x <= last; ++x)
+-                {
+-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
+-                    uint32_t pixel = 0u;
+-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+-                    if ((pixel & 0x00FFFFFFu) == 0u)
+-                    {
+-                        t.Fail("triangle fan quad should not leave interior holes within a covered row");
+-                        break;
++                        t.Fail("Quad subpixel debe cubrir solo centros enteros interiores: x=" +
++                               std::to_string(x) + " y=" + std::to_string(y));
++                        return;
+                     }
+                 }
+             }
+-
+-            t.IsTrue(sawFilledRow,
+-                     "triangle fan quad should light at least one framebuffer row");
+         });
+ 
+         tc.Run("sceGsExecLoadImage and sceGsExecStoreImage roundtrip and free guest packets", [](TestCase &t)

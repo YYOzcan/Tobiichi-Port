@@ -6,6 +6,8 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <vector>
+#include <algorithm>
 
 namespace ps2x::iop::detail
 {
@@ -54,6 +56,30 @@ namespace ps2x::iop::detail
                 RpcResult result;
                 if (request.sid != kDbcManSid)
                 {
+                    // GOW-Port: servidores secundarios de dbcman (puertos/sockets del DualShock).
+                    // Responden con un buffer en cero para que libdbc pueda enlazarse y seguir.
+                    if (request.sid == 0x8000131cu || request.sid == 0x8000131eu || request.sid == 0x8000131fu)
+                    {
+                        result.handled = true;
+                        result.resultAddress = request.receive.address;
+                        if (request.receive.address != 0u && request.receive.size != 0u)
+                        {
+                            std::vector<uint32_t> zeros(std::min<uint32_t>(request.receive.size / 4u, 256u), 0u);
+                            (void)writeRpcWords(m_host, request.receive, zeros);
+                        }
+                        bool shouldLog = false;
+                        {
+                            std::lock_guard<std::mutex> lock(m_mutex);
+                            if (m_unknownRpcLogCount < kMaxUnknownRpcLogs) { ++m_unknownRpcLogCount; shouldLog = true; }
+                        }
+                        if (shouldLog)
+                        {
+                            std::ostringstream message;
+                            message << "[DBCMAN:sub] sid=0x" << std::hex << request.sid << " rpc=0x" << request.function
+                                    << " sendSize=0x" << request.send.size << " recvSize=0x" << request.receive.size;
+                            m_host.log(LogLevel::Info, message.str());
+                        }
+                    }
                     return result;
                 }
 
@@ -120,7 +146,7 @@ namespace ps2x::iop::detail
             }
 
         private:
-            inline static constexpr std::array<uint32_t, 1> kSids{kDbcManSid};
+            inline static constexpr std::array<uint32_t, 4> kSids{kDbcManSid, 0x8000131cu, 0x8000131eu, 0x8000131fu};
             inline static constexpr std::array<std::string_view, 3> kModuleAliases{"dbcman", "dbcm", "dbcmserv"};
 
             IopHost &m_host;

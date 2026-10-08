@@ -1,0 +1,126 @@
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+@@ -743,7 +743,9 @@
+     uvec4 color;
+     if ((flags & F_IIP) != 0u)
+     {
+-        precise vec4 mixed = vec4(c0) * w0 + vec4(c1) * w1 + vec4(c2) * w2;
++        // GOW-Port: diferencias firmadas antes de ponderar; un alpha constante de 128
++        // no puede caer a 127 por el redondeo de la suma de pesos y fallar el alpha-test.
++        precise vec4 mixed = vec4(c0) + (vec4(c1) - vec4(c0)) * w1 + (vec4(c2) - vec4(c0)) * w2;
+         color = uvec4(clampU8(int(mixed.r)), clampU8(int(mixed.g)), clampU8(int(mixed.b)), clampU8(int(mixed.a)));
+     }
+     else
+@@ -771,7 +773,9 @@
+         color = combineTexture(s, color, texel);
+     }
+     uint fogs = pw(p, 32u);
+-    precise float ffog = float(fogs & 0xFFu) * w0 + float((fogs >> 8u) & 0xFFu) * w1 + float((fogs >> 16u) & 0xFFu) * w2;
++    // GOW-Port: mantener F constante; las restas son float, no uint con underflow.
++    float fog0 = float(fogs & 0xFFu);
++    precise float ffog = fog0 + (float((fogs >> 8u) & 0xFFu) - fog0) * w1 + (float((fogs >> 16u) & 0xFFu) - fog0) * w2;
+     uint fog = clampU8(int(ffog));
+     double zc = clamp(z + 0.5, 0.0, 4294967295.0);
+     writePixel(s, x, y, uint(zc), color, fog);
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1443,10 +1443,12 @@
+             uint8_t r, g, b, a;
+             if (state.prim.iip)
+             {
+-                r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
+-                g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
+-                b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
+-                a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
++                // GOW-Port: diferencias entre vertices conservan un atributo constante
++                // incluso si los tres pesos float no suman exactamente uno (alpha 128).
++                r = clampU8(static_cast<int>(v0.r + (v1.r - v0.r) * w1 + (v2.r - v0.r) * w2));
++                g = clampU8(static_cast<int>(v0.g + (v1.g - v0.g) * w1 + (v2.g - v0.g) * w2));
++                b = clampU8(static_cast<int>(v0.b + (v1.b - v0.b) * w1 + (v2.b - v0.b) * w2));
++                a = clampU8(static_cast<int>(v0.a + (v1.a - v0.a) * w1 + (v2.a - v0.a) * w2));
+             }
+             else
+             {
+@@ -1500,7 +1502,8 @@
+                 a = color.a;
+             }
+ 
+-            const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
++            // GOW-Port: F constante conserva el mismo coeficiente que una primitiva sin DDA.
++            const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * w1 + (v2.fog - v0.fog) * w2));
+             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+         }
+     }
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -222,6 +222,37 @@
+                             t.Fail("Sprite invertido/recortado conserva texels: x="+std::to_string(x)+" y="+std::to_string(y));return;
+                         }
+                     }
++                }
++            }
++        }
++    }
++
++    // GOW-Port: atributos constantes no cambian con pesos baricentricos redondeados.
++    void triangleConstants(TestCase &t,GSRasterBackend &backend,bool fog)
++    {
++        auto draw=sprite();draw.vertexCount=3;draw.state.prim.type=GS_PRIM_TRIANGLE;
++        draw.state.prim.iip=!fog;draw.state.prim.fge=fog;
++        // Alpha 128 debe pasar GEQUAL 128 en todo el triangulo, sin huecos de alpha 127.
++        if(!fog)draw.state.context.test|=1ull|(5ull<<1)|(128ull<<4);
++        draw.vertices[0].x=20;draw.vertices[0].y=20;
++        draw.vertices[1].x=37;draw.vertices[1].y=20;
++        draw.vertices[2].x=20;draw.vertices[2].y=39;
++        for(auto &v:draw.vertices){v.r=255;v.g=127;v.b=63;v.a=128;v.fog=255;v.z=7;}
++        auto point=draw;point.vertexCount=1;point.state.prim.type=GS_PRIM_POINT;
++        point.vertices[0].x=24;point.vertices[0].y=24;
++        backend.ClearFramebuffer(draw.state.context,0x80332211u);backend.Submit(point);
++        const uint32_t expected=backend.ReadVram(0,0,1,24,24);
++        if(!fog)t.Equals(expected,0x803f7fffu,"Control sin interpolacion conserva RGBA exacto");
++        for(const bool reverse : {false,true}) {
++            backend.ClearFramebuffer(draw.state.context,0x80332211u);
++            auto submitted=draw;if(reverse)std::swap(submitted.vertices[0],submitted.vertices[2]);
++            backend.Submit(submitted);
++            for(uint32_t y=20;y<39u;++y)for(uint32_t x=20;x<37u;++x){
++                if((x-20u)*19u+(y-20u)*17u>=323u)continue;
++                const uint32_t actual=backend.ReadVram(0,0,1,x,y);
++                if(actual!=expected){
++                    t.Fail(std::string(fog?"FOG constante":"RGBA constante")+" difiere del control: x="+
++                           std::to_string(x)+" y="+std::to_string(y)+" valor="+std::to_string(actual));return;
+                 }
+             }
+         }
+@@ -810,6 +841,14 @@
+             std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
+             backend.Initialize(vram.data(),uint32_t(vram.size())); spriteSampling(t,backend,3);
+         });
++        t.Run("CPU Gouraud triangles preserve constant RGBA",[](TestCase &t){
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size()));triangleConstants(t,backend,false);
++        });
++        t.Run("CPU triangles preserve constant FOG against a non-interpolated control",[](TestCase &t){
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size()));triangleConstants(t,backend,true);
++        });
+         t.Run("GPU swizzle matches existing GS memory for all 13 formats", [](TestCase &t) {
+             GSMem::InitLookupTables();
+             const uint32_t formats[]={0,1,2,10,19,20,27,36,44,48,49,50,58};
+@@ -866,6 +905,14 @@
+                     for(unsigned fixture=0;fixture<4u;++fixture) spriteSampling(t,backend,fixture);
+                 }
+             });
++            t.Run("OpenGL compute and hardware preserve constant triangle RGBA and FOG",[](TestCase &t){
++                for(const bool hardware:{false,true}){
++                    std::vector<uint8_t> vram(GSSwizzle::kMemorySize);auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
++                    raw->SetHardwareRasterAllowed(hardware);GSThreadedBackend backend(std::move(gpu));backend.Initialize(vram.data(),uint32_t(vram.size()));
++                    if(dynamic_cast<GSGpuBackend *>(&backend.Inner())!=raw||!raw->IsReady()){t.Fail("OpenGL requerido");return;}
++                    triangleConstants(t,backend,false);triangleConstants(t,backend,true);
++                }
++            });
+             t.Run("OpenGL compute and hardware follow GS triangle sampling rules",[](TestCase &t){
+                 for(const bool hardware : {false,true}) {
+                     std::vector<uint8_t> vram(GSSwizzle::kMemorySize); auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();

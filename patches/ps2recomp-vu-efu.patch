@@ -1,0 +1,50 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+index c7a744a..75b0f03 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+@@ -16,7 +16,8 @@ namespace
+             0.999999344348907f,
+             -0.333298563957214f,
+             0.199465364217758f,
+-            -0.13085337519646f,
++            // GOW-Port: el coeficiente de t^7 es -0.139085..., como en PCSX2 (antes -0.130853..., una errata).
++            -0.139085337519646f,
+             0.096420042216778f,
+             -0.055909886956215f,
+             0.021861229091883f,
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index 7ac122d..6f5149c 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -790,6 +790,31 @@ void register_ps2_vu1_tests()
+                       "RNEXT should advance the 23-bit R LFSR and write a 1.x value");
+         });
+ 
++        tc.Run("EATAN evaluates the arctangent series used by PCSX2", [](TestCase &t)
++        {
++            // GOW-Port: EATAN suma pi/4 a la serie de atan(t); con t = 1 el resultado es pi/2.
++            Vu1Fixture fx;
++            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++
++            writeVuInstructionPair(
++                fx.code, 0u,
++                makeVuLowerSpecial(0x7Cu, 1u),
++                kVuUpperNop); // EATAN P, vf1.x
++            writeVuInstructionPair(
++                fx.code, 8u,
++                makeVuLowerSpecial(0x7Bu, 0u),
++                kVuUpperNop); // WAITP
++
++            VU1Interpreter vu1;
++            vu1.state().vf[1][0] = 1.0f;
++            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
++                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
++                        0u, 0u, 0u, 64u);
++
++            t.IsTrue(std::fabs(vu1.state().p - 1.5707964f) < 1e-5f,
++                     "EATAN(1) should be pi/2 with the PCSX2 coefficients");
++        });
++
+         tc.Run("EFU resource observes throughput separately from P visibility", [](TestCase &t)
+         {
+             Vu1Fixture fx;

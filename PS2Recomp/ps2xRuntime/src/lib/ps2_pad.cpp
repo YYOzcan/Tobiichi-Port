@@ -1,5 +1,6 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include <cstdlib>
 #include <cstring>
 
 namespace
@@ -43,6 +44,22 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
 
+    // Tobiichi DMC5 Control Layout:
+    // When enabled (via TOBIICHI_DMC5_CONTROLS=1, default 1):
+    // Gamepad:
+    //   Y (Triangle) -> Light/Normal Melee Attack (Square in GoW)
+    //   B (Circle)   -> Heavy Melee Attack (Triangle in GoW)
+    //   X (Square)   -> Grab / Special Interact (Circle in GoW)
+    //   A (Cross)    -> Jump (Cross in GoW)
+    //   LB (L1)      -> Parry / Block (L1 in GoW)
+    //   RB (R1)      -> Lock-on / Combat Stance (R1 in GoW)
+    //   LT (L2)      -> Magic / Devil Trigger (R2 in GoW)
+    //   RT (R2)      -> Sub-weapon switch / Magic toggle (L2 in GoW)
+    static const bool dmc5Controls = [] {
+        const char *val = std::getenv("TOBIICHI_DMC5_CONTROLS");
+        return val == nullptr || std::strcmp(val, "0") != 0;
+    }();
+
     if (useGamepad)
     {
         if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
@@ -53,22 +70,50 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_LEFT);
         if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
             clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
-            clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
-            clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
-            clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
-            clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
-            clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
-            clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
-            clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
-            clearBit(PAD_R2);
+
+        if (dmc5Controls)
+        {
+            // DMC5 mapping
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN)) // A -> Jump
+                clearBit(PAD_CROSS);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)) // B -> Heavy Attack
+                clearBit(PAD_TRIANGLE);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT)) // X -> Grab / Interact
+                clearBit(PAD_CIRCLE);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP)) // Y -> Light Attack
+                clearBit(PAD_SQUARE);
+
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1)) // LB -> Block / Parry
+                clearBit(PAD_L1);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1)) // RB -> Stance / Charge
+                clearBit(PAD_R1);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2)) // LT -> Magic
+                clearBit(PAD_R2);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2)) // RT -> Magic Toggle / Secondary
+                clearBit(PAD_L2);
+        }
+        else
+        {
+            // Classic PS2 GoW layout
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+                clearBit(PAD_CROSS);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
+                clearBit(PAD_CIRCLE);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
+                clearBit(PAD_SQUARE);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+                clearBit(PAD_TRIANGLE);
+
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+                clearBit(PAD_L1);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+                clearBit(PAD_R1);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
+                clearBit(PAD_L2);
+            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
+                clearBit(PAD_R2);
+        }
+
         if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
             clearBit(PAD_START);
         if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
@@ -97,22 +142,55 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_LEFT);
         if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
             clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
+
+        if (dmc5Controls)
+        {
+            // DMC5 PC style keyboard layout:
+            // Space -> Jump
+            // J -> Light Attack (Square)
+            // I -> Heavy Attack (Triangle)
+            // K -> Grab / Special (Circle)
+            // Shift -> Block / Parry (L1)
+            // E -> Lock-on / Combat (R1)
+            // Q -> Magic (R2)
+            if (IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_X))
+                clearBit(PAD_CROSS);
+            if (IsKeyDown(KEY_I) || IsKeyDown(KEY_V))
+                clearBit(PAD_TRIANGLE);
+            if (IsKeyDown(KEY_K) || IsKeyDown(KEY_C))
+                clearBit(PAD_CIRCLE);
+            if (IsKeyDown(KEY_J) || IsKeyDown(KEY_Z))
+                clearBit(PAD_SQUARE);
+
+            if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))
+                clearBit(PAD_L1);
+            if (IsKeyDown(KEY_E))
+                clearBit(PAD_R1);
+            if (IsKeyDown(KEY_Q))
+                clearBit(PAD_R2);
+            if (IsKeyDown(KEY_R))
+                clearBit(PAD_L2);
+        }
+        else
+        {
+            if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+                clearBit(PAD_CROSS);
+            if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+                clearBit(PAD_CIRCLE);
+            if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+                clearBit(PAD_SQUARE);
+            if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+                clearBit(PAD_TRIANGLE);
+            if (IsKeyDown(KEY_Q))
+                clearBit(PAD_L1);
+            if (IsKeyDown(KEY_E))
+                clearBit(PAD_R1);
+            if (IsKeyDown(KEY_LEFT_SHIFT))
+                clearBit(PAD_L2);
+            if (IsKeyDown(KEY_RIGHT_SHIFT))
+                clearBit(PAD_R2);
+        }
+
         if (IsKeyDown(KEY_ENTER))
             clearBit(PAD_START);
         if (IsKeyDown(KEY_TAB))

@@ -222,7 +222,6 @@ namespace ps2_syscalls
 
         trackSifModuleLoadExternal(modulePath, loaded.moduleId);
         logSifModuleAction("load-emulated", loaded.moduleId, modulePath, 1u);
-        std::cerr << "[GoW SifLoadModule] path=" << modulePath << " -> id=" << loaded.moduleId << std::endl;
         setReturnS32(ctx, loaded.moduleId);
     }
 
@@ -296,8 +295,7 @@ namespace ps2_syscalls
             g_rpc_clients[clientPtr].sid = rpcId;
         }
 
-        const bool isKnownHleRpc = (rpcId != 0);
-        if (!serverPtr && (isKnownHleRpc || PS2IopTransport::canBindRpc(runtime, rpcId)))
+        if (!serverPtr && PS2IopTransport::canBindRpc(runtime, rpcId))
         {
             // EE-side servers and HLE routes need a descriptor in guest RAM.
             // With an emulated IOP, only publish it after the IRX has actually
@@ -605,14 +603,6 @@ namespace ps2_syscalls
                 else if (!handled)
                 {
                     rpcZeroRdram(rdram, receiveBuffer, receiveSize);
-                    if ((sid >= 0x80000590u && sid <= 0x800005AFu) && receiveSize >= 4)
-                    {
-                        *reinterpret_cast<uint32_t *>(rdram + receiveBuffer) = 1u;
-                    }
-                    else if (sid == 0x80001300u && receiveSize >= 4)
-                    {
-                        *reinterpret_cast<uint32_t *>(rdram + receiveBuffer) = 0x0310u;
-                    }
                     zeroedFallback = true;
                 }
             }

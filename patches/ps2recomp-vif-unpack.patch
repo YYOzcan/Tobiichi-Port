@@ -1,0 +1,126 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index b02c7ca..827ed17 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -697,19 +697,26 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     }
+                     else if (vl == 3u && vn == 3u)
+                     {
+-                        // V4-5: packed color-like format in a single 16-bit value.
++                        // V4-5 expands RGB to bits 3..7 and alpha to bit 7.
+                         uint16_t packed = 0;
+                         std::memcpy(&packed, srcVec, sizeof(packed));
+-                        decompressed[0] = packed & 0x1Fu;
+-                        decompressed[1] = (packed >> 5) & 0x1Fu;
+-                        decompressed[2] = (packed >> 10) & 0x1Fu;
+-                        decompressed[3] = (packed >> 15) & 0x01u;
++                        decompressed[0] = (packed & 0x001Fu) << 3u;
++                        decompressed[1] = (packed & 0x03E0u) >> 2u;
++                        decompressed[2] = (packed & 0x7C00u) >> 7u;
++                        decompressed[3] = (packed & 0x8000u) >> 8u;
+                     }
+                     else
+                     {
+                         handledFormat = false;
+                     }
+ 
++                    // V2 writes XYXY on hardware, before masks and STMOD apply.
++                    if (handledFormat && components == 2)
++                    {
++                        decompressed[2] = decompressed[0];
++                        decompressed[3] = decompressed[1];
++                    }
++
+                     // Unknown compressed format fallback: preserve legacy raw-copy behavior.
+                     if (!handledFormat && decoded && !maskEnable && (vif1_regs.mode == 0u || vif1_regs.mode == 3u))
+                     {
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 0b22fe0..c639626 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -531,6 +531,85 @@ void register_ps2_memory_tests()
+             t.Equals(sw, 0x00008001u, "zero-extend w");
+         });
+ 
++        tc.Run("VIF V2 unpacks expand both pairs for every component width", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "memory should initialize");
++            for (uint32_t vl = 0; vl < 3; ++vl)
++                for (uint32_t usn = 0; usn < 2; ++usn)
++                {
++                    std::memset(mem.getVU1Data(), 0xa5, 32);
++                    std::vector<uint8_t> packet;
++                    appendU32(packet, makeVifCmd(uint8_t(0x64 + vl), 2, uint16_t(usn << 14)));
++                    const uint32_t bytes = 4u >> vl;
++                    for (uint32_t i = 0; i < 4; ++i)
++                    {
++                        const uint32_t raw = i % 2 == 0 ? 0xfffffffdu : 2u;
++                        const size_t pos = packet.size();
++                        packet.resize(pos + bytes);
++                        std::memcpy(packet.data() + pos, &raw, bytes);
++                    }
++                    mem.processVIF1Data(packet.data(), uint32_t(packet.size()));
++                    const uint32_t negative = !usn || vl == 0 ? 0xfffffffdu :
++                                              vl == 1 ? 0xfffdu : 0xfdu;
++                    for (uint32_t v = 0; v < 2; ++v)
++                    {
++                        uint32_t lanes[4];
++                        std::memcpy(lanes, mem.getVU1Data() + v * 16, 16);
++                        t.Equals(lanes[0], negative, "X sign/zero extension");
++                        t.Equals(lanes[1], 2u, "Y extension");
++                        t.Equals(lanes[2], negative, "Z must repeat X");
++                        t.Equals(lanes[3], 2u, "W must repeat Y");
++                    }
++                }
++        });
++
++        tc.Run("VIF V2 replication precedes row addition and write protection", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "memory should initialize");
++            std::memset(mem.getVU1Data(), 0xa5, 16);
++            std::vector<uint8_t> packet;
++            appendU32(packet, makeVifCmd(0x05, 0, 1)); // STMOD: row addition
++            appendU32(packet, makeVifCmd(0x30, 0, 0));
++            for (uint32_t row : {10u, 20u, 30u, 40u}) appendU32(packet, row);
++            appendU32(packet, makeVifCmd(0x20, 0, 0));
++            appendU32(packet, 0x4cu); // protect Y, select row W
++            appendU32(packet, makeVifCmd(0x74, 1, 0)); // masked V2-32
++            appendU32(packet, 3); appendU32(packet, 5);
++            mem.processVIF1Data(packet.data(), uint32_t(packet.size()));
++            uint32_t lanes[4];
++            std::memcpy(lanes, mem.getVU1Data(), 16);
++            t.Equals(lanes[0], 13u, "X adds row X");
++            t.Equals(lanes[1], 0xa5a5a5a5u, "Y stays protected");
++            t.Equals(lanes[2], 33u, "replicated X adds row Z");
++            t.Equals(lanes[3], 40u, "W selects row W without addition");
++        });
++
++        tc.Run("VIF V4-5 expands RGB and alpha to their upper bits without STMOD", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "memory should initialize");
++            std::vector<uint8_t> packet;
++            appendU32(packet, makeVifCmd(0x05, 0, 2));
++            appendU32(packet, makeVifCmd(0x30, 0, 0));
++            for (uint32_t row : {10u, 20u, 30u, 40u}) appendU32(packet, row);
++            appendU32(packet, makeVifCmd(0x6f, 2, 0));
++            const uint32_t rgb = 31u | (17u << 5) | (9u << 10);
++            appendU32(packet, (rgb | 0x8000u) | (rgb << 16));
++            mem.processVIF1Data(packet.data(), uint32_t(packet.size()));
++            uint32_t lanes[8];
++            std::memcpy(lanes, mem.getVU1Data(), sizeof(lanes));
++            for (uint32_t v = 0; v < 2; ++v)
++            {
++                t.Equals(lanes[v*4], 248u, "red shifts by three");
++                t.Equals(lanes[v*4+1], 136u, "green shifts by three");
++                t.Equals(lanes[v*4+2], 72u, "blue shifts by three");
++                t.Equals(lanes[v*4+3], v == 0 ? 128u : 0u, "alpha shifts to bit seven");
++            }
++            t.Equals(mem.vif1_regs.row[0], 10u, "V4-5 must not update STMOD row state");
++        });
++
+         tc.Run("VIF UNPACK bit15 adds TOPS to destination address", [](TestCase &t)
+         {
+             PS2Memory mem;

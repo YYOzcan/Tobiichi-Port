@@ -1,0 +1,181 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "runtime/gs/gs_backend.h"
++#include "runtime/gs/gs_backend_state.h" // GOW-Port: estado para repetir los mismos comandos.
+ #include "runtime/gs/gs_texture_page_cache.h"
+ #include "runtime/gs/gs_upload24.h" // GOW-Port: continuacion del pixel entre cargas.
+ 
+@@ -8,7 +9,7 @@
+ #include <mutex>
+ #include <vector>
+ 
+-class GSCpuBackend final : public GSRasterBackend
++class GSCpuBackend final : public GSRasterBackend, public GSBackendStateAccess
+ {
+ public:
+     GSCpuBackend();
+@@ -33,6 +34,9 @@
+     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
+     void SnapshotVram(std::vector<uint8_t> &out) const override;
+     GSTransferSnapshot GetTransferSnapshot() const override;
++
++    bool ExportState(GSBackendState &out) override;
++    bool ImportState(const GSBackendState &state) override;
+ 
+ private:
+     void ResetUnlocked();
+diff --git a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+--- a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
++++ b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+@@ -30,6 +30,15 @@
+             return m_bytes.data() + (byteAddress & (kPageSize - 1u));
+         }
+ 
++        // GOW-Port: Taylor N. Albarnaz / LightVelox, SotC ac9efa070638ad3b3accd284de6f898d5ab271d1.
++        uint32_t PageBase() const noexcept { return m_pageBase; }
++        const uint8_t* Bytes() const noexcept { return m_bytes.data(); }
++        void Restore(uint32_t pageBase, const uint8_t* bytes) noexcept
++        {
++            std::memcpy(m_bytes.data(), bytes, kPageSize);
++            m_pageBase = pageBase;
++        }
++
+     private:
+         alignas(64) std::array<uint8_t, kPageSize> m_bytes{};
+         uint32_t m_pageBase = UINT32_MAX;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -447,6 +447,46 @@
+         }
+         return count;
+     }
++}
++
++// GOW-Port: exportación/importación adaptada de Taylor N. Albarnaz / LightVelox,
++// PS2Recomp sotc-port ac9efa070638ad3b3accd284de6f898d5ab271d1 (GPL-3.0).
++// Mantener la caché original y los bytes CT24 pendientes añadidos por este port.
++bool GSCpuBackend::ExportState(GSBackendState &out)
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++    out.clut = m_clut;
++    out.clutCbp = m_clutCbp;
++    out.cachePageBase = m_texturePageCache.PageBase();
++    std::memcpy(out.cacheBytes.data(), m_texturePageCache.Bytes(), out.cacheBytes.size());
++    out.transfer = m_transfer;
++    out.transferState = m_transferState;
++    out.upload24 = m_upload24;
++    out.localToHost = m_localToHostBuffer;
++    out.localToHostReadPos = m_localToHostReadPos;
++    return true;
++}
++
++bool GSCpuBackend::ImportState(const GSBackendState &state)
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (state.upload24.size >= 3u || state.localToHostReadPos > state.localToHost.size() ||
++        (state.cachePageBase != UINT32_MAX &&
++         ((state.cachePageBase % GSMem::TexturePageCache::kPageSize) != 0u ||
++          m_vramSize < GSMem::TexturePageCache::kPageSize ||
++          state.cachePageBase > m_vramSize - GSMem::TexturePageCache::kPageSize)))
++        return false;
++    // Copiar antes de modificar el backend: una asignación fallida no lo deja a medias.
++    auto localToHost = state.localToHost;
++    m_clut = state.clut;
++    m_clutCbp = state.clutCbp;
++    m_texturePageCache.Restore(state.cachePageBase, state.cacheBytes.data());
++    m_transfer = state.transfer;
++    m_transferState = state.transferState;
++    m_upload24 = state.upload24;
++    m_localToHostBuffer = std::move(localToHost);
++    m_localToHostReadPos = static_cast<size_t>(state.localToHostReadPos);
++    return true;
+ }
+ 
+ GSCpuBackend::GSCpuBackend()
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -482,6 +482,78 @@
+ void register_ps2_gs_backend_tests()
+ {
+     MiniTest::Case("GOW GS backends", [](TestCase &t) {
++        // GOW-Port: exportación CPU adaptada de SotC ac9efa0 para repetir comandos GS.
++        t.Run("CPU and threaded CPU restore an incomplete CT24 transfer",[](TestCase &t) {
++            for(bool threaded:{false,true}) {
++                std::vector<uint8_t> vram(GSSwizzle::kMemorySize),otherVram(vram.size());
++                std::unique_ptr<GSRasterBackend> source=std::make_unique<GSCpuBackend>();
++                if(threaded) source=std::make_unique<GSThreadedBackend>(std::move(source));
++                source->Initialize(vram.data(),uint32_t(vram.size()));
++                auto *access=dynamic_cast<GSBackendStateAccess*>(source.get());
++                GSBackendState saved;
++                if(!access || !access->ExportState(saved)) {t.Fail("CPU debe exportar estado además de VRAM");return;}
++                GSTransferCommand transfer{}; transfer.direction=0;
++                transfer.bitbltbuf.dbw=1; transfer.bitbltbuf.dpsm=1; transfer.trxreg={2,1};
++                source->BeginTransfer(transfer); const uint8_t first[]={0x12,0x34}; source->UploadImage(first,2);
++                t.IsTrue(access->ExportState(saved),"Exportar pixel CT24 incompleto");
++                t.IsTrue(saved.upload24.size==2,"Conservar ambos bytes pendientes");
++                source->SnapshotVram(otherVram);
++                GSCpuBackend destination; destination.Initialize(otherVram.data(),uint32_t(otherVram.size()));
++                auto *restored=dynamic_cast<GSBackendStateAccess*>(static_cast<GSRasterBackend*>(&destination));
++                if(!restored || !restored->ImportState(saved)) {t.Fail("CPU debe importar la transferencia");return;}
++                const uint8_t tail[]={0x56,0x78,0x9a,0xbc};
++                source->UploadImage(tail,4); destination.UploadImage(tail,4);
++                t.IsTrue(destination.ReadVram(0,0,1,0,0)==0x00563412u &&
++                         destination.ReadVram(0,0,1,1,0)==0x00bc9a78u,"Pixels exactos tras reanudar");
++                std::vector<uint8_t> expected,actual; source->SnapshotVram(expected); destination.SnapshotVram(actual);
++                t.IsTrue(expected==actual,"La VRAM completa coincide tras reanudar");
++            }
++        });
++        t.Run("CPU state restores CLUT texture cache and pending readback",[](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend cpu;
++            cpu.Initialize(vram.data(),uint32_t(vram.size()));
++            auto *access=dynamic_cast<GSBackendStateAccess*>(static_cast<GSRasterBackend*>(&cpu));
++            if(!access) {t.Fail("Falta acceso al estado CPU");return;}
++            GSBackendState initial; for(unsigned i=0;i<512;++i) initial.clut[i]=uint16_t(i*67u);
++            initial.clutCbp={256u,512u}; initial.cachePageBase=256u*256u; // TBP0 en bloques de 256 B.
++            const uint32_t cached=0x80654321u; std::memcpy(initial.cacheBytes.data(),&cached,4);
++            initial.localToHost={1,2,3,4,5}; initial.localToHostReadPos=1;
++            t.IsTrue(access->ImportState(initial),"Importar estado CPU completo");
++            GSBackendState roundtrip; t.IsTrue(access->ExportState(roundtrip),"Exportar sin pérdidas");
++            t.IsTrue(initial.clut==roundtrip.clut && initial.clutCbp==roundtrip.clutCbp &&
++                     initial.cachePageBase==roundtrip.cachePageBase && initial.cacheBytes==roundtrip.cacheBytes,
++                     "Paleta y página cacheada exactas");
++            uint8_t bytes[2]{}; t.IsTrue(cpu.ConsumeLocalToHostBytes(bytes,2)==2 && bytes[0]==2 && bytes[1]==3,
++                                      "Readback continúa en el cursor exportado");
++            GSPrimitiveBatch sprite{}; sprite.vertexCount=2; sprite.state.prim.type=GS_PRIM_SPRITE;
++            sprite.state.prim.tme=true; sprite.state.prim.fst=true; sprite.state.context.frame.fbw=1;
++            sprite.state.context.tex0.tbp0=256; sprite.state.context.tex0.tbw=1;
++            sprite.state.context.tex0.tfx=1; sprite.state.context.tex0.tcc=1;
++            sprite.state.context.scissor={0,1,0,1}; sprite.state.context.zbuf.zmask=true;
++            sprite.state.context.test=1ull<<17; sprite.state.colclamp=1;
++            sprite.vertices[1].x=1; sprite.vertices[1].y=1; cpu.Submit(sprite);
++            t.IsTrue(cpu.ReadVram(0,0,1,0,0)==cached,"La muestra conserva el texel cacheado del origen");
++        });
++        t.Run("CPU rejects invalid snapshots without changing its state",[](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend cpu;
++            cpu.Initialize(vram.data(),uint32_t(vram.size()));
++            auto *access=dynamic_cast<GSBackendStateAccess*>(static_cast<GSRasterBackend*>(&cpu));
++            if(!access) {t.Fail("Falta acceso al estado CPU");return;}
++            GSBackendState original; original.clut[5]=123; original.localToHost={4,8};
++            t.IsTrue(access->ImportState(original),"Estado inicial válido");
++            for(unsigned fixture=0;fixture<4;++fixture) {
++                auto invalid=original; invalid.clut[5]=999;
++                if(fixture==0) invalid.upload24.size=3;
++                if(fixture==1) invalid.cachePageBase=1;
++                if(fixture==2) invalid.cachePageBase=GSSwizzle::kMemorySize;
++                if(fixture==3) invalid.localToHostReadPos=3;
++                t.IsTrue(!access->ImportState(invalid),"Rechazar snapshot inválido");
++                GSBackendState actual; access->ExportState(actual);
++                t.IsTrue(actual.clut==original.clut && actual.localToHost==original.localToHost &&
++                         actual.upload24.size==0 && actual.cachePageBase==UINT32_MAX,
++                         "Un rechazo no modifica el estado anterior");
++            }
++        });
+         // GOW-Port: continuidad GIF entre envios, incluidos cortes dentro de etiquetas y registros.
+         t.Run("PACKED GIF resumes A+D registers across every byte split", [](TestCase &t) {
+             const uint64_t packet[]={2ull|(1ull<<15)|(1ull<<46)|(uint64_t(GS_PRIM_SPRITE)<<47)|(1ull<<60),0xeull,

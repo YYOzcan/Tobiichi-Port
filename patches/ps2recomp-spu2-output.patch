@@ -1,0 +1,277 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 68fec81..3e4548b 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -43,6 +43,10 @@ namespace ps2x::iop
+ 
+         [[nodiscard]] DebugSnapshot debugSnapshot() const;
+ 
++        // GOW-Port: salida del SPU2 emulado, estereo intercalado a 48 kHz. Puede llamarse desde el hilo de audio del
++        // host. Si hay mas de maxLatencyFrames acumulados, se descartan los mas antiguos.
++        size_t drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames = SIZE_MAX);
++
+     private:
+         class Impl;
+         std::unique_ptr<Impl> m_impl;
+diff --git a/ps2xIOP/src/emulator/core/spu2.cpp b/ps2xIOP/src/emulator/core/spu2.cpp
+index 79d582e..5883746 100644
+--- a/ps2xIOP/src/emulator/core/spu2.cpp
++++ b/ps2xIOP/src/emulator/core/spu2.cpp
+@@ -37,7 +37,10 @@ namespace ps2x::iop::detail
+             for (auto &voice : core)
+                 voice = VoiceState{};
+         m_endx.fill(0);
+-        m_output.clear();
++        {
++            std::lock_guard<std::mutex> lock(m_outputMutex);
++            m_output.clear();
++        }
+         m_lastCycle = 0;
+         m_interrupt = false;
+         reg(RegStatx) = StatxDmaReady;
+@@ -433,6 +436,7 @@ namespace ps2x::iop::detail
+         {
+             return volumeFromRegister(reg(RegMvolBase + core * RegMvolStride + side * 2u));
+         };
++        std::lock_guard<std::mutex> lock(m_outputMutex);
+         for (uint32_t side = 0; side < 2u; ++side)
+         {
+             const int32_t core0 = (coreOut[0][side] * master(0u, side)) >> 14;
+@@ -453,8 +457,21 @@ namespace ps2x::iop::detail
+         m_lastCycle += samples * CyclesPerSample;
+     }
+ 
+-    size_t Spu2::drainOutput(int16_t *stereo, size_t maxFrames)
++    size_t Spu2::pendingFrames() const
+     {
++        std::lock_guard<std::mutex> lock(m_outputMutex);
++        return m_output.size() / 2u;
++    }
++
++    size_t Spu2::drainOutput(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames)
++    {
++        std::lock_guard<std::mutex> lock(m_outputMutex);
++        const size_t available = m_output.size() / 2u;
++        if (maxLatencyFrames != SIZE_MAX && available > maxFrames + maxLatencyFrames)
++        {
++            const size_t drop = available - maxFrames - maxLatencyFrames;
++            m_output.erase(m_output.begin(), m_output.begin() + static_cast<std::ptrdiff_t>(drop * 2u));
++        }
+         const size_t frames = std::min(maxFrames, m_output.size() / 2u);
+         std::copy_n(m_output.begin(), frames * 2u, stereo);
+         m_output.erase(m_output.begin(), m_output.begin() + static_cast<std::ptrdiff_t>(frames * 2u));
+diff --git a/ps2xIOP/src/emulator/core/spu2.h b/ps2xIOP/src/emulator/core/spu2.h
+index 9efa830..341e652 100644
+--- a/ps2xIOP/src/emulator/core/spu2.h
++++ b/ps2xIOP/src/emulator/core/spu2.h
+@@ -2,12 +2,14 @@
+ 
+ // GOW-Port: emulacion del SPU2 (dos nucleos de 24 voces, 2 MB de RAM de sonido).
+ // Fase 1: registros, RAM, transferencias manuales y DMA, voces ADPCM con tono, ADSR, volumen fijo y mezcla seca,
+-// ENDX/ENVX/NAX legibles e interrupcion por IRQA. Pendiente: reverb, barrido de volumen, ADMA y salida al host.
++// ENDX/ENVX/NAX legibles e interrupcion por IRQA. Fase 2: la mezcla sale por el audio del host (ps2_runtime.cpp).
++// Pendiente: reverb, barrido de volumen e interpolacion gaussiana y ADMA.
+ // Referencias: PCSX2 (pcsx2/SPU2) y la documentacion "psx-spx" del SPU (ADPCM y ADSR son iguales que en la PS1).
+ 
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <mutex>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+@@ -60,9 +62,11 @@ namespace ps2x::iop::detail
+         void step(); // una muestra de 48 kHz
+         [[nodiscard]] bool takeInterrupt() noexcept;
+ 
+-        // Muestras estereo intercaladas (L, R) producidas desde la ultima llamada.
+-        [[nodiscard]] size_t pendingFrames() const noexcept { return m_output.size() / 2u; }
+-        size_t drainOutput(int16_t *stereo, size_t maxFrames);
++        // Muestras estereo intercaladas (L, R) producidas desde la ultima llamada. Productor (IOP) y consumidor (hilo de
++        // audio del host) pueden estar en hilos distintos. Con maxLatencyFrames se descartan las mas antiguas si se ha
++        // acumulado mas retraso (la emulacion puede ir mas rapida que el tiempo real).
++        [[nodiscard]] size_t pendingFrames() const;
++        size_t drainOutput(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames = SIZE_MAX);
+ 
+         // Estado de una voz, para pruebas y diagnostico
+         struct VoiceState
+@@ -110,6 +114,7 @@ namespace ps2x::iop::detail
+         std::array<std::array<VoiceState, VoicesPerCore>, 2> m_voices{};
+         std::array<uint32_t, 2> m_endx{};
+         std::vector<int16_t> m_output;
++        mutable std::mutex m_outputMutex;
+         uint64_t m_lastCycle = 0;
+         bool m_interrupt = false;
+     };
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 6d3cabe..ae77127 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -689,6 +689,7 @@ namespace ps2x::iop::detail
+                     if (totalCycles == before)
+                         ++totalCycles;
+                 }
++                serviceSpu2(); // GOW-Port: al dia tambien tras saltar ciclos ociosos hasta el final
+             }
+             catch (...)
+             {
+@@ -938,6 +939,11 @@ namespace ps2x::iop::detail
+         return physical <= IopMemory::RamSize && size <= IopMemory::RamSize - physical;
+     }
+ 
++    size_t IopEmulator::drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames)
++    {
++        return m_impl->memory.spu2().drainOutput(stereo, maxFrames, maxLatencyFrames);
++    }
++
+     uint64_t IopEmulator::cycles() const noexcept
+     {
+         return m_impl->totalCycles;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 01b48df..cb2621c 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -36,6 +36,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool zeroMemory(uint32_t address, size_t size);
+         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
+ 
++        // GOW-Port: muestras estereo de 48 kHz que ha producido el SPU2 (ver Spu2::drainOutput).
++        size_t drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames);
+         [[nodiscard]] uint64_t cycles() const noexcept;
+         [[nodiscard]] uint64_t instructions() const noexcept;
+         [[nodiscard]] uint32_t loadedModuleCount() const noexcept;
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index fa4be18..b9d3a36 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -250,6 +250,11 @@ namespace ps2x::iop
+         return m_impl->emulator.isMemoryRange(address, size);
+     }
+ 
++    size_t IopSubsystem::drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames)
++    {
++        return m_impl->emulator.drainAudio(stereo, maxFrames, maxLatencyFrames);
++    }
++
+     DebugSnapshot IopSubsystem::debugSnapshot() const
+     {
+         DebugSnapshot snapshot;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index f69cf4f..b50d4ce 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -26,6 +26,55 @@
+ #include <thread>
+ #include <unordered_map>
+ #include <sstream>
++#include <cstdlib>
++
++#if !defined(PLATFORM_VITA)
++namespace
++{
++    // GOW-Port: salida del SPU2 emulado por el IOP. raylib pide las muestras desde su hilo de audio; el IOP las
++    // produce en el hilo del EE (IopSubsystem::drainAudio usa un mutex). GOW_AUDIO=0 desactiva la salida.
++    std::atomic<ps2x::iop::IopSubsystem *> g_spu2AudioSource{nullptr};
++    AudioStream g_spu2Stream{};
++    bool g_spu2StreamActive = false;
++    constexpr size_t kSpu2MaxLatencyFrames = 4800u; // 100 ms a 48 kHz
++
++    void spu2AudioCallback(void *buffer, unsigned int frames)
++    {
++        int16_t *out = static_cast<int16_t *>(buffer);
++        size_t produced = 0u;
++        if (ps2x::iop::IopSubsystem *source = g_spu2AudioSource.load(std::memory_order_acquire))
++            produced = source->drainAudio(out, frames, kSpu2MaxLatencyFrames);
++        std::fill(out + produced * 2u, out + static_cast<size_t>(frames) * 2u, int16_t{0}); // sin datos: silencio
++    }
++
++    void startSpu2Audio(ps2x::iop::IopSubsystem *source)
++    {
++        const char *setting = std::getenv("GOW_AUDIO");
++        if (g_spu2StreamActive || source == nullptr || !IsAudioDeviceReady() || (setting && setting[0] == '0'))
++            return;
++        SetAudioStreamBufferSizeDefault(1024);
++        g_spu2Stream = LoadAudioStream(48000u, 16u, 2u);
++        SetAudioStreamBufferSizeDefault(0); // el resto de flujos conserva el tamano por defecto
++        if (!IsAudioStreamValid(g_spu2Stream))
++            return;
++        g_spu2AudioSource.store(source, std::memory_order_release);
++        SetAudioStreamCallback(g_spu2Stream, spu2AudioCallback);
++        PlayAudioStream(g_spu2Stream);
++        g_spu2StreamActive = true;
++        std::cerr << "[SPU2] salida de audio a 48 kHz activa (GOW_AUDIO=0 la desactiva)" << std::endl;
++    }
++
++    void stopSpu2Audio()
++    {
++        if (!g_spu2StreamActive)
++            return;
++        StopAudioStream(g_spu2Stream);
++        UnloadAudioStream(g_spu2Stream); // raylib espera a que termine el callback en curso
++        g_spu2AudioSource.store(nullptr, std::memory_order_release);
++        g_spu2StreamActive = false;
++    }
++}
++#endif
+ 
+ namespace ps2_stubs
+ {
+@@ -529,6 +578,9 @@ PS2Runtime::~PS2Runtime()
+     try
+     {
+         requestStop();
++#if !defined(PLATFORM_VITA)
++        stopSpu2Audio(); // GOW-Port: antes de destruir el IOP que produce las muestras
++#endif
+         m_iopSubsystem.reset();
+         m_iopHost.reset();
+ #if defined(PLATFORM_VITA)
+@@ -735,6 +787,7 @@ bool PS2Runtime::initialize(const char *title)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
++        startSpu2Audio(m_iopSubsystem.get()); // GOW-Port
+ #endif
+         SetTargetFPS(60);
+         if (m_debugUiInitCallback)
+diff --git a/ps2xTest/src/ps2_spu2_tests.cpp b/ps2xTest/src/ps2_spu2_tests.cpp
+index 27eb58a..3ff7e65 100644
+--- a/ps2xTest/src/ps2_spu2_tests.cpp
++++ b/ps2xTest/src/ps2_spu2_tests.cpp
+@@ -2,6 +2,8 @@
+ #include "MiniTest.h"
+ #include "../../ps2xIOP/src/emulator/core/iop_memory.h"
+ #include "../../ps2xIOP/src/emulator/core/spu2.h"
++#include "../../ps2xIOP/tests/iop_compat_test_support.h"
++#include "ps2x/iop/iop_subsystem.h"
+ 
+ #include <cstdint>
+ #include <vector>
+@@ -176,6 +178,27 @@ void register_ps2_spu2_tests()
+             t.Equals(spu.pendingFrames(), static_cast<size_t>(0u), "drained frames should be removed");
+         });
+ 
++        tc.Run("draining with a latency limit drops the oldest frames", [](TestCase &t)
++        {
++            Spu2 spu;
++            for (int i = 0; i < 100; ++i)
++                spu.step();
++            std::vector<int16_t> out(20u);
++            t.Equals(spu.drainOutput(out.data(), 10u, 30u), static_cast<size_t>(10u), "ten frames should be returned");
++            t.Equals(spu.pendingFrames(), static_cast<size_t>(30u),
++                     "frames beyond the latency limit should be discarded, keeping the newest");
++        });
++
++        tc.Run("the IOP subsystem exposes one SPU2 frame per 768 IOP cycles", [](TestCase &t)
++        {
++            iop_test::Host host;
++            ps2x::iop::IopSubsystem subsystem(host);
++            subsystem.runEeCycles(8u * Spu2::CyclesPerSample * 100u); // 8 ciclos del EE por ciclo del IOP
++            std::vector<int16_t> out(400u);
++            t.Equals(subsystem.drainAudio(out.data(), 200u), static_cast<size_t>(100u),
++                     "an idle IOP should still produce audio frames up to the last cycle run");
++        });
++
+         tc.Run("reaching IRQA with IRQs enabled raises the SPU2 interrupt", [](TestCase &t)
+         {
+             Spu2 spu;

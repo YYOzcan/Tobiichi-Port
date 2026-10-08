@@ -1,6 +1,7 @@
 #ifndef PS2_GIF_ARBITER_H
 #define PS2_GIF_ARBITER_H
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -24,11 +25,15 @@ class GifArbiter
 {
 public:
     using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t)>;
+    // GOW-Port: identificar el flujo sin romper los callbacks existentes de dos argumentos.
+    using ProcessPathPacketFn = std::function<void(GifPathId, const uint8_t *, uint32_t)>;
 
     GifArbiter() = default;
     explicit GifArbiter(ProcessPacketFn processFn);
 
-    void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
+    void setProcessPacketFn(ProcessPacketFn fn);
+    void setProcessPathPacketFn(ProcessPathPacketFn fn) { m_processFn = std::move(fn); }
+    void reset() { m_queue.clear(); m_path3Input = {}; }
 
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
@@ -36,10 +41,19 @@ public:
     bool empty() const { return m_queue.empty(); }
 
 private:
-    ProcessPacketFn m_processFn;
+    ProcessPathPacketFn m_processFn;
     std::vector<GifArbiterPacket> m_queue;
 
-    static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
+    // GOW-Port: el primer quadword de un bloque DMA puede ser payload, no una GIFtag.
+    struct Path3InputState
+    {
+        std::array<uint8_t, 16> tag{};
+        uint32_t tagBytes = 0u;
+        uint32_t payloadBytes = 0u;
+        uint8_t format = 0u;
+    } m_path3Input;
+
+    bool trackPath3Packet(const uint8_t *data, uint32_t sizeBytes);
     static uint8_t pathPriority(GifPathId id);
 };
 

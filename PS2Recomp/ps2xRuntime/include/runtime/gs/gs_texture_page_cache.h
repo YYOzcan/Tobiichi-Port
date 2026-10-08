@@ -30,6 +30,15 @@ namespace GSMem
             return m_bytes.data() + (byteAddress & (kPageSize - 1u));
         }
 
+        // GOW-Port: Taylor N. Albarnaz / LightVelox, SotC ac9efa070638ad3b3accd284de6f898d5ab271d1.
+        uint32_t PageBase() const noexcept { return m_pageBase; }
+        const uint8_t* Bytes() const noexcept { return m_bytes.data(); }
+        void Restore(uint32_t pageBase, const uint8_t* bytes) noexcept
+        {
+            std::memcpy(m_bytes.data(), bytes, kPageSize);
+            m_pageBase = pageBase;
+        }
+
     private:
         alignas(64) std::array<uint8_t, kPageSize> m_bytes{};
         uint32_t m_pageBase = UINT32_MAX;

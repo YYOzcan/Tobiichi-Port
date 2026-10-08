@@ -1,0 +1,75 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -657,7 +657,7 @@
+ {
+     uint8_t laneFlags[4]{};
+     normalizeFmacResult(result, dest, laneFlags);
+-    updateFmacFlags(laneFlags, dest, m_statusUnread ? 0u : calculateFmacProductSticky(dest));
++    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
+     applyDest(dst, result, dest);
+ }
+ 
+@@ -665,7 +665,7 @@
+ {
+     uint8_t laneFlags[4]{};
+     normalizeFmacResult(result, dest, laneFlags);
+-    updateFmacFlags(laneFlags, dest, m_statusUnread ? 0u : calculateFmacProductSticky(dest));
++    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
+     applyDestAcc(result, dest);
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl b/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl
+@@ -244,10 +244,12 @@
+                 // DeadFlags: el generador comprobó que, en este bloque, otra FMAC posterior escribe los flags
+                 // antes de que nadie pueda leer estos. Con m_statusQuiet solo cuentan sus bits pegajosos,
+                 // que el estado acumula en cualquier orden (y quedan igual al final del bloque).
++                // GOW-Port: no leer status ahora no hace muertos sus bits persistentes.
++                const uint32_t productSticky = calculateFmacProductSticky(static_cast<uint8_t>(dest));
+                 if (DeadFlags && m_statusQuiet)
+-                    m_state.status |= static_cast<uint32_t>((laneFlags[0] | laneFlags[1] | laneFlags[2] | laneFlags[3]) & 0xFu) << 6;
++                    m_state.status |= static_cast<uint32_t>((laneFlags[0] | laneFlags[1] | laneFlags[2] | laneFlags[3] | productSticky) & 0xFu) << 6;
+                 else
+-                    updateFmacFlags(laneFlags, static_cast<uint8_t>(dest), m_statusUnread ? 0u : calculateFmacProductSticky(static_cast<uint8_t>(dest)));
++                    updateFmacFlags(laneFlags, static_cast<uint8_t>(dest), productSticky);
+             }
+         }
+         float *target = info.toAcc ? m_state.acc : m_state.vf[fd];
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -1897,6 +1897,32 @@
+                      "underflow should flush to signed zero before writeback");
+         });
+ 
++        // GOW-Port: PR #17/#18 omitían el producto si el programa actual no leía status.
++        // Los bits persisten y puede leerlos el siguiente microprograma (o el diagnóstico).
++        tc.Run("direct VU1 preserves product sticky flags without a status reader", [](TestCase &t)
++        {
++            Vu1Fixture fx;
++            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++            writeVuInstructionPair(fx.code, 0u, 0u, makeVuUpper(0x29u, 0x8u, 2u, 1u, 3u) | 0x40000000u);
++            writeVuInstructionPair(fx.code, 8u, 0u, kVuUpperNop);
++            for (bool direct : {false, true}) {
++                VU1Interpreter vu;
++                vu.setDirectRegisterWrites(direct);
++                vu.state().acc[0] = 1.0f;
++                vu.state().vf[1][0] = std::numeric_limits<float>::min();
++                vu.state().vf[2][0] = 0.5f;
++                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem);
++                t.Equals(vu.state().vf[3][0], 1.0f, "the accumulated result remains normal");
++                t.Equals(vu.state().status, 0x140u, "product Z/U sticky bits survive the program end");
++                // Cargar FSAND después: el lector no existía al calcular los productos.
++                writeVuInstructionPair(fx.code, 16u, (0x16u << 25) | (1u << 16) | 0xFFFu, kVuUpperNop | 0x40000000u);
++                writeVuInstructionPair(fx.code, 24u, 0u, kVuUpperNop);
++                vu.execute(fx.code+16u, 16u, fx.data, PS2_VU1_DATA_SIZE, fx.gs, nullptr);
++                t.Equals(vu.state().vi[1], 0x140, "a subsequent status reader observes the earlier product");
++                std::memset(fx.code+16u, 0, 16u);
++            }
++        });
++
+         tc.Run("FMAC product contributes Z/S/U/O sticky flags", [](TestCase &t)
+         {
+             Vu1Fixture fx;

@@ -1,0 +1,223 @@
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+@@ -351,7 +351,7 @@
+     bool feedbackSnapshot = false; // GOW-Port: politica experimental, desactivada por defecto.
+     bool fastTriangleSetup = true;
+     bool texturePagesValid = false;
+-    std::array<uint32_t, 6> texturePagesKey{};
++    std::array<uint32_t, 8> texturePagesKey{};
+     std::bitset<kPages> texturePages;
+     uint64_t targetKey = 0u;
+     bool hasTarget = false;
+@@ -1747,17 +1747,29 @@
+         if (state.prim.tme)
+         {
+             const uint64_t clamp = ctx.clamp;
+-            const bool regionU = (clamp & 0x2u) != 0u;
+-            const bool regionV = ((clamp >> 2) & 0x2u) != 0u;
+-            const int maxU = regionU ? 1023 : state.textureWidth - 1;
+-            const int maxV = regionV ? 1023 : state.textureHeight - 1;
+-            const std::array<uint32_t, 6> key{ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw,
+-                                             static_cast<uint32_t>(maxU), static_cast<uint32_t>(maxV), 0u};
++            // GOW-Port: REGION_CLAMP lee MIN..MAX; REGION_REPEAT produce MAX..(MIN|MAX).
++            // Conservar los huecos dentro del rectangulo y el rango completo si MIN>MAX.
++            const auto bounds = [](uint32_t mode, int size, uint32_t minimum, uint32_t maximum)
++            {
++                if (mode == 2u && minimum <= maximum)
++                    return std::array<int, 2>{static_cast<int>(minimum), static_cast<int>(maximum)};
++                if (mode == 3u)
++                    return std::array<int, 2>{static_cast<int>(maximum), static_cast<int>(minimum | maximum)};
++                return std::array<int, 2>{0, mode == 2u ? 1023 : size - 1};
++            };
++            const auto u = bounds(static_cast<uint32_t>(clamp & 3u), state.textureWidth,
++                                  static_cast<uint32_t>((clamp >> 4) & 1023u), static_cast<uint32_t>((clamp >> 14) & 1023u));
++            const auto v = bounds(static_cast<uint32_t>((clamp >> 2) & 3u), state.textureHeight,
++                                  static_cast<uint32_t>((clamp >> 24) & 1023u), static_cast<uint32_t>((clamp >> 34) & 1023u));
++            // GOW-Port: ambos extremos invalidan la clave, tambien cuando solo cambia MIN.
++            const std::array<uint32_t, 8> key{ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw,
++                                             static_cast<uint32_t>(u[0]), static_cast<uint32_t>(u[1]),
++                                             static_cast<uint32_t>(v[0]), static_cast<uint32_t>(v[1]), 0u};
+             if (cacheTexturePages && texturePagesValid && key == texturePagesKey)
+                 read = texturePages;
+             else
+             {
+-                markPages(read, ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw, 0, 0, maxU, maxV);
++                markPages(read, ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw, u[0], v[0], u[1], v[1]);
+                 texturePages = read;
+                 texturePagesKey = key;
+                 texturePagesValid = true;
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -17,6 +17,158 @@
+ 
+ namespace
+ {
++// GOW-Port: la cache de paginas de lectura no debe inventar feedback fuera de CLAMP.
++// Tres fuentes distintas prueban la clave; la cuarta vuelve a una pagina escrita.
++void gpuRegionPages(TestCase &t,bool hardware)
++{
++    struct Restore {unsigned csr=_mm_getcsr();~Restore(){_mm_setcsr(csr);}} restore;
++    _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++    const unsigned formats[]={0,1,2,10,19,20,27,36,44,48,49,50,58};
++    const unsigned coordinates[]={500,200,700};
++    const uint32_t colors[]={0x80123456u,0x806789abu,0x80cdef31u};
++    std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
++    auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
++    raw->SetHardwareRasterAllowed(hardware);raw->SetFeedbackSnapshotEnabled(false);
++    GSThreadedBackend backend(std::move(gpu));
++    for(unsigned psm:formats) for(unsigned mode:{2u,3u}) for(bool linear:{false,true})
++    for(bool cache:{false,true}) for(bool alias:{false,true}) {
++        const auto &format=GSSwizzle::GetFormat(psm);
++        const bool indexed=format.kind==GSSwizzle::Kind::Bits8 || format.kind==GSSwizzle::Kind::Bits4;
++        std::vector<uint8_t> seed(vram.size());
++        for(unsigned i=0;i<3;++i) {
++            const auto loc=GSSwizzle::Locate(format,0,8,coordinates[i],coordinates[i]);
++            const uint32_t color=indexed?i+1:format.kind==GSSwizzle::Kind::Bits16?0x8421u+i*0x123u:colors[i];
++            GSSwizzle::StoreAt(format,seed.data()+loc.byte,loc.shift,color);
++        }
++        // Paleta CSM2 con entradas de color, incluidos los indices de un framebuffer.
++        const auto &rgba=GSSwizzle::GetFormat(GS_PSM_CT32);
++        for(unsigned i=0;i<256;++i) {
++            const auto loc=GSSwizzle::Locate(rgba,8192,1,i,0);
++            const uint32_t color=0x80000000u|((i*37u+13u)&255u)|(((i*11u+29u)&255u)<<8)|(((i*53u+47u)&255u)<<16);
++            GSSwizzle::StoreAt(rgba,seed.data()+loc.byte,loc.shift,color);
++        }
++        auto cpuVram=seed;
++        GSCpuBackend cpu;cpu.Initialize(cpuVram.data(),uint32_t(cpuVram.size()));
++        std::vector<GSPrimitiveBatch> draws;
++        for(unsigned i=0;i<(alias?4u:3u);++i) {
++            const unsigned limit=i<3?coordinates[i]:0u,minimum=mode==2?limit:0;
++            const unsigned maximum=mode==2?700:limit;
++            GSPrimitiveBatch b{};b.vertexCount=2;b.state.prim.type=GS_PRIM_SPRITE;
++            b.state.prim.tme=true;b.state.prim.fst=true;b.state.linearFilter=linear;
++            b.state.textureWidth=b.state.textureHeight=4;b.state.colclamp=1;
++            b.state.texa.ta0=b.state.texa.ta1=128;b.state.texclut.cbw=1;
++            auto &c=b.state.context;c.frame.fbw=8;c.scissor={0,15,0,15};c.zbuf.zbp=104;
++            c.zbuf.psm=GS_PSM_Z24;c.zbuf.zmask=true;c.test=0x30000;c.tex1=linear?0x60:0;
++            c.tex0.psm=uint8_t(psm);c.tex0.tbw=8;c.tex0.tw=c.tex0.th=2;c.tex0.tcc=1;c.tex0.tfx=1;
++            c.tex0.csm=1;c.tex0.cld=1;c.tex0.cbp=8192;
++            c.clamp=mode|(uint64_t(mode)<<2)|(uint64_t(minimum)<<4)|(uint64_t(maximum)<<14)|
++                (uint64_t(minimum)<<24)|(uint64_t(maximum)<<34);
++            for(auto &v:b.vertices){v.r=v.g=v.b=v.a=128;v.z=7;v.q=1;v.u=v.v=uint16_t(limit*16);}
++            b.vertices[0].x=float(i);b.vertices[1].x=float(i+1);b.vertices[1].y=1;
++            draws.push_back(b);
++        }
++        if(indexed)cpu.LoadClut(draws.front().state.context.tex0,draws.front().state.texclut);
++        for(const auto &b:draws)cpu.Submit(b);
++        std::vector<uint8_t> expected;cpu.SnapshotVram(expected);
++        const uint32_t a=cpu.ReadVram(0,0,8,0,0),b=cpu.ReadVram(0,0,8,1,0),c=cpu.ReadVram(0,0,8,2,0);
++        t.IsTrue((a&0xffffffu)!=0 && a!=b && a!=c && b!=c,"Tres texels distintos, sin oraculo vacio");
++        bool observedHardware=false;
++        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(12);
++        unsigned pass=0;
++        do {
++            backend.Sync(GSSyncReason::Finish);
++            std::copy(seed.begin(),seed.end(),vram.begin());
++            raw->SetTexturePageCacheEnabled(cache);
++            backend.Initialize(vram.data(),uint32_t(vram.size()));
++            if(dynamic_cast<GSGpuBackend*>(&backend.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
++            if(indexed)backend.LoadClut(draws.front().state.context.tex0,draws.front().state.texclut);
++            backend.Sync(GSSyncReason::Finish);
++            const auto before=raw->GetStats();
++            for(const auto &draw:draws)backend.Submit(draw);
++            backend.Sync(GSSyncReason::DebugReadback);
++            std::vector<uint8_t> actual;backend.SnapshotVram(actual);
++            const auto after=raw->GetStats();
++            t.IsTrue(actual==expected,"Region conserva los 4 MiB frente al renderer CPU");
++            t.IsTrue(after.batches-before.batches==(alias?2u:1u),"Solo el solapamiento real separa lotes");
++            t.IsTrue(after.flushTexture-before.flushTexture==(alias?1u:0u),"Cambio de region invalida la clave de lectura");
++            t.IsTrue(after.prims-before.prims==draws.size(),"Todos los sprites se rasterizan en OpenGL");
++            if(after.tiles-before.tiles==0 && after.prims-before.prims==draws.size())observedHardware=true;
++            if(!hardware)t.IsTrue(after.tiles>before.tiles,"Compute requerido, sin fallback CPU");
++            ++pass;
++            if(hardware && !observedHardware)std::this_thread::sleep_for(std::chrono::milliseconds(20));
++        } while(hardware && !observedHardware && std::chrono::steady_clock::now()<deadline);
++        if(hardware)t.IsTrue(observedHardware,"Hardware efectivo, sin tiles compute");
++    }
++}
++// GOW-Port: limites que atraviesan paginas, TBP no alineado y vuelta de los 4 MiB.
++// Cada sprite escribe un pixel; TEXFLUSH del control CPU renueva la fuente por Submit.
++void gpuRegionEdges(TestCase &t,bool hardware)
++{
++    struct Restore {unsigned csr=_mm_getcsr();~Restore(){_mm_setcsr(csr);}} restore;
++    _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++    std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
++    auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
++    raw->SetHardwareRasterAllowed(hardware);
++    GSThreadedBackend backend(std::move(gpu));
++    for(unsigned psm:{0u,1u,2u,10u,48u,49u,50u,58u}) for(unsigned mode:{2u,3u})
++    for(unsigned base:{0u,31u,16383u}) for(bool linear:{false,true})
++    for(bool cache:{false,true}) for(bool snapshot:{false,true}) {
++        const auto &format=GSSwizzle::GetFormat(psm);
++        const unsigned highU=mode==2?64:127,highV=mode==2?32:63;
++        std::vector<uint8_t> seed(vram.size());
++        for(unsigned y:{31u,highV})for(unsigned x:{63u,highU}) {
++            const auto loc=GSSwizzle::Locate(format,base,8,x,y);
++            const uint32_t color=format.kind==GSSwizzle::Kind::Bits16?0x8421u+x+y*17u:
++                0x80000000u|((x*37u+y*13u)&255u)|(((x*11u+y*29u)&255u)<<8)|(((x*53u+y*47u)&255u)<<16);
++            GSSwizzle::StoreAt(format,seed.data()+loc.byte,loc.shift,color);
++        }
++        const auto endpoint=GSSwizzle::Locate(format,base,8,highU,highV);
++        std::vector<GSPrimitiveBatch> draws;
++        for(unsigned i=0;i<3;++i) {
++            GSPrimitiveBatch b{};b.vertexCount=2;b.state.prim.type=GS_PRIM_SPRITE;
++            b.state.prim.tme=true;b.state.prim.fst=true;b.state.linearFilter=linear;
++            b.state.textureWidth=b.state.textureHeight=4;b.state.colclamp=1;
++            b.state.texa.ta0=b.state.texa.ta1=128;
++            auto &c=b.state.context;c.frame.fbp=endpoint.byte/8192u;c.frame.fbw=8;
++            c.scissor={0,15,0,15};c.zbuf.zbp=104;c.zbuf.psm=GS_PSM_Z24;c.zbuf.zmask=true;
++            c.test=0x30000;c.tex1=linear?0x60:0;c.tex0.psm=uint8_t(psm);c.tex0.tbp0=base;
++            c.tex0.tbw=8;c.tex0.tw=c.tex0.th=2;c.tex0.tcc=1;c.tex0.tfx=1;
++            const unsigned minU=mode==2?63:64,maxU=mode==2?64:63;
++            const unsigned minV=mode==2?31:32,maxV=mode==2?32:31;
++            c.clamp=mode|(uint64_t(mode)<<2)|(uint64_t(minU)<<4)|(uint64_t(maxU)<<14)|
++                (uint64_t(minV)<<24)|(uint64_t(maxV)<<34);
++            for(auto &v:b.vertices){v.r=v.g=v.b=v.a=128;v.z=7;v.q=1;v.u=64*16;v.v=32*16;}
++            b.vertices[0].x=float(i);b.vertices[1].x=float(i+1);b.vertices[1].y=1;
++            draws.push_back(b);
++        }
++        auto cpuVram=seed;GSCpuBackend cpu;cpu.Initialize(cpuVram.data(),uint32_t(cpuVram.size()));
++        for(const auto &b:draws){cpu.TextureFlush();cpu.Submit(b);}
++        std::vector<uint8_t> expected;cpu.SnapshotVram(expected);
++        t.IsTrue(seed!=expected,"El control de borde realmente cambia VRAM");
++        bool observedHardware=false;
++        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(12);
++        do {
++            backend.Sync(GSSyncReason::Finish);std::copy(seed.begin(),seed.end(),vram.begin());
++            raw->SetTexturePageCacheEnabled(cache);raw->SetFeedbackSnapshotEnabled(snapshot);
++            backend.Initialize(vram.data(),uint32_t(vram.size()));
++            if(dynamic_cast<GSGpuBackend*>(&backend.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
++            const auto before=raw->GetStats();
++            for(const auto &draw:draws)backend.Submit(draw);
++            backend.Sync(GSSyncReason::DebugReadback);
++            std::vector<uint8_t> actual;backend.SnapshotVram(actual);
++            const auto after=raw->GetStats();
++            t.IsTrue(actual==expected,"Cruce de pagina y wrap preservan toda la VRAM");
++            t.IsTrue(after.batches-before.batches==3,"El borde realmente leido conserva tres lotes");
++            t.IsTrue(after.flushTexture-before.flushTexture==2,"Dos riesgos reales fuerzan sincronizacion");
++            t.IsTrue(after.prims-before.prims==3,"Tres sprites realmente dibujados");
++            if(after.tiles-before.tiles==0 && after.prims-before.prims==3)observedHardware=true;
++            if(!hardware)t.IsTrue(after.tiles>before.tiles,"Compute efectivo en los bordes");
++            if(hardware && !observedHardware)std::this_thread::sleep_for(std::chrono::milliseconds(20));
++        } while(hardware && !observedHardware && std::chrono::steady_clock::now()<deadline);
++        if(hardware)t.IsTrue(observedHardware,"Hardware efectivo en los bordes");
++    }
++}
++
+     // GOW-Port: RGB externo de PCSX2 v2.8.2 SW sobre texels procedurales 64x416.
+     // SCISSOR fuera de la cobertura separa los dos draws; fuente de ambos validada.
+     // SHA256 split: 75fb49353fd21ec38c8d4b413f657b57d5fc168bb24c9eba8279edc747079197.
+@@ -1432,6 +1584,11 @@
+         const char *gpu=std::getenv("GOW_GS_GPU_TEST");
+         if(gpu && *gpu && *gpu!='0')
+         {
++            t.Run("OpenGL compute region pages batch only true texture hazards in all 13 formats",[](TestCase &t){gpuRegionPages(t,false);});
++            t.Run("OpenGL hardware region pages batch only true texture hazards in all 13 formats",[](TestCase &t){gpuRegionPages(t,true);});
++            t.Run("OpenGL compute region edges preserve page crossings and VRAM wrap",[](TestCase &t){gpuRegionEdges(t,false);});
++            t.Run("OpenGL hardware region edges preserve page crossings and VRAM wrap",[](TestCase &t){gpuRegionEdges(t,true);});
++
+             t.Run("OpenGL compute feedback snapshot is repeatable and matches a split-draw reference",[](TestCase &t){
+                 gpuFeedbackSnapshot(t,false);
+             });

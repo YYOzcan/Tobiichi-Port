@@ -1,0 +1,162 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index b32d214..e48d1f4 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -25,6 +25,7 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::reset()
+     {
++        ++m_version; // GOW-Port: invalida la caché de beginNextReady
+         m_threads.clear();
+         m_semaphores.clear();
+         m_eventFlags.clear();
+@@ -36,6 +37,7 @@ namespace ps2x::iop::detail
+ 
+     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+     {
++        ++m_version; // GOW-Port: invalida la caché de beginNextReady
+         const auto setV0 = [&](int32_t value)
+         {
+             cpu.gpr[2] = static_cast<uint32_t>(value);
+@@ -352,6 +354,7 @@ namespace ps2x::iop::detail
+ 
+     bool IopKernel::dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu)
+     {
++        ++m_version; // GOW-Port: invalida la caché de beginNextReady
+         const auto setV0 = [&](int32_t value)
+         {
+             cpu.gpr[2] = static_cast<uint32_t>(value);
+@@ -527,6 +530,7 @@ namespace ps2x::iop::detail
+ 
+     int IopKernel::createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits)
+     {
++        ++m_version; // GOW-Port: invalida la caché de beginNextReady
+         EventFlag event;
+         event.id = static_cast<int>(m_nextEventFlagId++);
+         event.attr = attr;
+@@ -539,6 +543,7 @@ namespace ps2x::iop::detail
+ 
+     bool IopKernel::setInternalEventFlag(int id, uint32_t bits)
+     {
++        ++m_version; // GOW-Port: invalida la caché de beginNextReady
+         const auto event = m_eventFlags.find(id);
+         if (event == m_eventFlags.end())
+             return false;
+@@ -549,6 +554,7 @@ namespace ps2x::iop::detail
+ 
+     bool IopKernel::dispatchEventImport(uint16_t ordinal, IopCpuState &cpu)
+     {
++        ++m_version; // GOW-Port: invalida la caché de beginNextReady
+         const auto setV0 = [&](int32_t value)
+         {
+             cpu.gpr[2] = static_cast<uint32_t>(value);
+@@ -702,6 +708,7 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::sleepCurrent(IopCpuState &cpu)
+     {
++        ++m_version; // GOW-Port: invalida la caché de beginNextReady
+         if (m_currentThread == nullptr)
+             return;
+         m_currentThread->state = IopThreadState::Sleep;
+@@ -710,6 +717,7 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu)
+     {
++        ++m_version; // GOW-Port: invalida la caché de beginNextReady
+         if (m_currentThread == nullptr)
+             return;
+         m_currentThread->wakeCycle = wakeCycle;
+@@ -719,15 +727,24 @@ namespace ps2x::iop::detail
+ 
+     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+     {
+-        for (auto &[id, thread] : m_threads)
+-        {
+-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
+-                thread.state = IopThreadState::Ready;
+-        }
++        if (m_idleVersion == m_version && currentCycle < m_idleUntil)
++            return nullptr; // GOW-Port: nada cambió y ningún hilo en Delay despierta todavía
+ 
++        // GOW-Port: un solo recorrido. Despertar los Delay vencidos y elegir el listo de menor prioridad (y
++        // menor id) no dependen del orden; los que siguen en Delay dan el próximo despertar.
+         IopThread *next = nullptr;
++        uint64_t idleUntil = UINT64_MAX;
+         for (auto &[id, thread] : m_threads)
+         {
++            if (thread.state == IopThreadState::Delay)
++            {
++                if (thread.wakeCycle > currentCycle)
++                {
++                    idleUntil = std::min(idleUntil, thread.wakeCycle);
++                    continue;
++                }
++                thread.state = IopThreadState::Ready;
++            }
+             if (thread.state != IopThreadState::Ready)
+                 continue;
+             if (next == nullptr || thread.priority < next->priority ||
+@@ -735,8 +752,13 @@ namespace ps2x::iop::detail
+                 next = &thread;
+         }
+         if (next == nullptr)
++        {
++            m_idleVersion = m_version;
++            m_idleUntil = idleUntil;
+             return nullptr;
++        }
+ 
++        ++m_version;
+         m_currentThread = next;
+         next->state = IopThreadState::Running;
+         next->cpu.stopped = false;
+@@ -746,6 +768,8 @@ namespace ps2x::iop::detail
+ 
+     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
+     {
++        if (m_idleVersion == m_version) // GOW-Port: calculado por el último beginNextReady sin hilos listos
++            return std::min(fallback, m_idleUntil);
+         uint64_t nextWake = fallback;
+         for (const auto &[id, thread] : m_threads)
+         {
+@@ -757,6 +781,7 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
+     {
++        ++m_version; // GOW-Port: invalida la caché de beginNextReady
+         if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
+             thread.state = IopThreadState::Dormant;
+         else if (thread.state == IopThreadState::Running)
+@@ -767,6 +792,7 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::cleanupDeadThreads()
+     {
++        ++m_version; // GOW-Port: invalida la caché de beginNextReady
+         for (auto thread = m_threads.begin(); thread != m_threads.end();)
+         {
+             if (thread->second.state != IopThreadState::Dead)
+@@ -782,6 +808,7 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
+     {
++        ++m_version; // GOW-Port: invalida la caché de beginNextReady
+         for (auto &[id, thread] : m_threads)
+         {
+             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 92e820a..b20f870 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -114,5 +114,12 @@ namespace ps2x::iop::detail
+         uint32_t m_nextEventFlagId = 1;
+         IopThread *m_currentThread = nullptr;
+         OutsideThreadWait m_outsideThreadWait;
++        // GOW-Port: el EE avanza el IOP ~1,5 millones de veces por segundo de a pocos ciclos, casi siempre
++        // sin hilos listos. m_version cambia con cada operación que puede cambiar los hilos; si no cambió
++        // desde el último beginNextReady sin hilos listos, el resultado es el mismo hasta m_idleUntil (el
++        // primer despertar de un hilo en Delay) y no hace falta recorrer m_threads.
++        uint64_t m_version = 1;
++        uint64_t m_idleVersion = 0;
++        uint64_t m_idleUntil = 0;
+     };
+ }

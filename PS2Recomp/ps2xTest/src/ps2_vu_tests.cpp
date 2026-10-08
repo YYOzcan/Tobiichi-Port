@@ -1041,5 +1041,87 @@ void register_ps2_vu_tests()
             readMat4(env, kDst, out);
             t.IsTrue(nearlyEqual(out[0], 0.0f), "DropShadowMatrix point mode should subtract d before scaling by k");
         });
+
+        // GOW-Port: VRSQRT de VU0 en modo macro es FS/sqrt(|FT|) (antes se ignoraba FS) y dividir por cero satura.
+        tc.Run("VU0 Q-unit VRSQRT uses FS and saturates on zero divisors", [](TestCase &t)
+        {
+            uint16_t status = 0u;
+            t.IsTrue(nearlyEqual(ps2VuRsqrt(status, 6.0f, 9.0f), 2.0f), "VRSQRT should compute FS/sqrt(FT)");
+            t.IsTrue(nearlyEqual(ps2VuRsqrt(status, 6.0f, -9.0f), 2.0f), "VRSQRT should use |FT|");
+            t.IsTrue((status & PS2_VU_STATUS_I) != 0u, "a negative radicand should set the invalid flag");
+            const float saturated = ps2VuDivide(status, -1.0f, 0.0f);
+            t.IsTrue(std::isfinite(saturated) && saturated < -3.0e38f, "division by zero should give -FLT_MAX, not infinity");
+            t.IsTrue((status & PS2_VU_STATUS_D) != 0u, "division by zero should set the D flag");
+            uint32_t fcr31 = 0u;
+            t.IsTrue(std::isfinite(ps2FpuDivide(fcr31, 1.0f, 0.0f)), "EE DIV.S by zero should stay finite");
+            t.IsTrue(std::isfinite(FPU_MUL_S(3.0e38f, 3.0e38f)), "EE MUL.S overflow should saturate");
+        });
+
+        // GOW-Port: pruebas del fork de SotC (c419f26, 9bb389e) para la FPU del EE y LQ/SQ.
+        tc.Run("EE FPU compares extended finite values", [](TestCase &t)
+        {
+            const auto fromBits = [](uint32_t bits) { float value; std::memcpy(&value, &bits, sizeof(value)); return value; };
+            const float sentinel = fromBits(0x7FFFFFFFu);
+            const float negativeSentinel = fromBits(0xFFFFFFFFu);
+            t.IsTrue(FPU_C_EQ_S(sentinel, sentinel), "the horse steering sentinel compares equal to itself");
+            t.IsTrue(FPU_C_OLT_S(3.0f, sentinel), "the extended positive value exceeds ordinary finite values");
+            t.IsTrue(FPU_C_OLT_S(negativeSentinel, -3.0f), "the extended negative value is below ordinary finite values");
+            t.IsTrue(FPU_C_EQ_S(-0.0f, 0.0f), "signed zeros compare equal");
+            t.IsTrue(!FPU_C_UN_S(sentinel, sentinel), "the EE does not classify extended values as unordered");
+        });
+
+        tc.Run("EE FPU add/sub drops operand bits shifted out of the aligned mantissa", [](TestCase &t)
+        {
+            const auto bits = [](float v) { uint32_t b; std::memcpy(&b, &v, sizeof(b)); return b; };
+            const auto fromBits = [](uint32_t b) { float v; std::memcpy(&v, &b, sizeof(v)); return v; };
+            const uint32_t savedCsr = _mm_getcsr();
+            _mm_setcsr((savedCsr & ~0x6000u) | 0x6000u);
+            const float oneMinusTiny = FPU_SUB_S(1.0f, 4.6e-9f);
+            const float oneMinusSmall = FPU_SUB_S(1.0f, fromBits(0x339DD4C2u));
+            const float tinyPlusOne = FPU_ADD_S(fromBits(0xB39DD4C2u), 1.0f);
+            const float sameExponent = FPU_ADD_S(1.5f, 1.25f);
+            const float withZero = FPU_ADD_S(0.0f, -2.0f);
+            _mm_setcsr(savedCsr);
+            t.Equals(bits(oneMinusTiny), 0x3F800000u, "exponent difference >= 25 leaves the larger operand unchanged");
+            t.Equals(bits(oneMinusSmall), 0x3F7FFFFFu, "difference 24 truncates the smaller operand to its leading bit before subtracting");
+            t.Equals(bits(tinyPlusOne), 0x3F7FFFFFu, "the smaller operand may be either source");
+            t.Equals(bits(sameExponent), bits(2.75f), "equal exponents add normally");
+            t.Equals(bits(withZero), bits(-2.0f), "zero operands are harmless");
+        });
+
+        tc.Run("EE FPU div/sqrt round to nearest under a round-toward-zero MXCSR", [](TestCase &t)
+        {
+            const auto bits = [](float v) { uint32_t b; std::memcpy(&b, &v, sizeof(b)); return b; };
+            const uint32_t savedCsr = _mm_getcsr();
+            _mm_setcsr((savedCsr & ~0x6000u) | 0x6000u);
+            uint32_t fcr31 = 0u;
+            const float third = ps2FpuDivide(fcr31, 1.0f, 3.0f);
+            const float root5 = ps2FpuSqrt(fcr31, 5.0f);
+            volatile float three = 3.0f;
+            const float chopped = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(1.0f), _mm_set_ss(three)));
+            const uint32_t csrAfter = _mm_getcsr();
+            _mm_setcsr(savedCsr);
+            t.Equals(bits(third), 0x3EAAAAABu, "DIV.S rounds to nearest");
+            t.Equals(bits(root5), 0x400F1BBDu, "SQRT.S rounds to nearest");
+            t.Equals(bits(chopped), 0x3EAAAAAAu, "other operations keep round toward zero");
+            t.Equals(csrAfter & 0x6000u, 0x6000u, "the rounding mode is restored");
+        });
+
+        tc.Run("LQ/SQ ignore the low four address bits", [](TestCase &t)
+        {
+            VuEnv env;
+            uint8_t *rdram = env.rdram.data();
+            R5900Context *ctx = &env.ctx;
+            PS2Runtime *runtime = &env.runtime;
+            const __m128i value = _mm_set_epi32(0x44444444, 0x33333333, 0x22222222, 0x11111111);
+            WRITE128(kA + 0xCu, value);
+            const __m128i back = READ128(kA + 0x7u);
+            t.Equals(static_cast<uint32_t>(_mm_cvtsi128_si32(back)), 0x11111111u, "read uses the aligned quadword");
+            uint32_t word = 0;
+            std::memcpy(&word, rdram + kA, sizeof(word));
+            t.Equals(word, 0x11111111u, "write lands on the aligned quadword");
+            std::memcpy(&word, rdram + kA + 0x10u, sizeof(word));
+            t.Equals(word, 0u, "the next quadword is untouched");
+        });
     });
 }

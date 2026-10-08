@@ -1,0 +1,265 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_gpu_backend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_gpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_backend.h
+@@ -60,6 +60,8 @@
+     void SetTexturePageCacheEnabled(bool enabled);
+     void SetFastTriangleSetupEnabled(bool enabled);
+     void SetHardwareRasterAllowed(bool allowed);
++    // GOW-Port: configurar antes de Initialize; diagnostico por Submit, no cache PS2.
++    void SetFeedbackSnapshotEnabled(bool enabled);
+ 
+ private:
+     struct Impl;
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+@@ -348,6 +348,7 @@
+     GLuint pageMapBuffer = 0;
+     std::bitset<kPages> readPages;
+     bool cacheTexturePages = true;
++    bool feedbackSnapshot = false; // GOW-Port: politica experimental, desactivada por defecto.
+     bool fastTriangleSetup = true;
+     bool texturePagesValid = false;
+     std::array<uint32_t, 6> texturePagesKey{};
+@@ -1679,7 +1680,7 @@
+         resetBatch();
+     }
+ 
+-    uint32_t addState(const GSDrawState &state)
++    uint32_t addState(const GSDrawState &state, uint32_t textureEpoch)
+     {
+         const GSContext &ctx = state.context;
+         std::array<uint32_t, kStateWords> s{};
+@@ -1709,7 +1710,7 @@
+             s[SClampHi] = static_cast<uint32_t>(ctx.clamp >> 32u);
+             s[STexa] = static_cast<uint32_t>(state.texa.ta0) | (state.texa.aem ? 0x100u : 0u) | (static_cast<uint32_t>(state.texa.ta1) << 16u);
+             s[SClut] = clutSlot;
+-            s[SEpoch] = epoch;
++            s[SEpoch] = textureEpoch;
+         }
+         s[SAlpha] = static_cast<uint32_t>(ctx.alpha);
+         s[SAlphaFix] = static_cast<uint32_t>(ctx.alpha >> 32u);
+@@ -1723,7 +1724,7 @@
+         return stateCount++;
+     }
+ 
+-    bool prepareTarget(const GSDrawState &state, int x0, int y0, int x1, int y1)
++    uint32_t prepareTarget(const GSDrawState &state, int x0, int y0, int x1, int y1)
+     {
+         const GSContext &ctx = state.context;
+         const uint64_t key = static_cast<uint64_t>(ctx.frame.fbp) | (static_cast<uint64_t>(ctx.frame.fbw) << 9u) |
+@@ -1769,11 +1770,28 @@
+         }
+         if (clutKeyValid && (write & clutSourcePages).any())
+             clutKeyValid = false;
++        uint32_t textureEpoch = epoch;
++        const auto feedback = read & write;
++        if (feedbackSnapshot && feedback.any())
++        {
++            // GOW-Port: fuente disjunta para este Submit, no una emulacion de la cache PS2.
++            // Completar dibujos anteriores antes de copiar; preservar el epoch ANTERIOR
++            // en el estado evita que el sampler vuelva a leer la VRAM que escribe.
++            if (primCount != 0u || !clutOps.empty())
++                flushFor(1u);
++            textureEpoch = epoch;
++            if (!copyOnWrite(feedback))
++            {
++                flushFor(1u);
++                textureEpoch = epoch;
++                copyOnWrite(feedback); // Tras reset caben las 512 paginas posibles.
++            }
++        }
+         writePages |= write;
+         readPages |= read;
+         targetKey = key;
+         hasTarget = true;
+-        return true;
++        return textureEpoch;
+     }
+ 
+     void binTriangle(uint32_t prim, const GSTriangleRaster &tri, int x0, int y0, int x1, int y1)
+@@ -1852,8 +1870,8 @@
+         const GSContext &ctx = state.context;
+         if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
+             return;
+-        prepareTarget(state, x, y, x, y);
+-        const uint32_t s = addState(state);
++        const uint32_t textureEpoch = prepareTarget(state, x, y, x, y);
++        const uint32_t s = addState(state, textureEpoch);
+         uint32_t *p = newPrim(PrimPoint, s);
+         p[1] = static_cast<uint32_t>(x);
+         p[2] = static_cast<uint32_t>(y);
+@@ -1884,8 +1902,8 @@
+         const int drawX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
+         const int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
+ 
+-        prepareTarget(state, drawX0, drawY0, drawX1, drawY1);
+-        const uint32_t s = addState(state);
++        const uint32_t textureEpoch = prepareTarget(state, drawX0, drawY0, drawX1, drawY1);
++        const uint32_t s = addState(state, textureEpoch);
+         uint32_t *p = newPrim(PrimSprite, s);
+         p[1] = static_cast<uint32_t>(drawX0) | (static_cast<uint32_t>(drawX1) << 16u);
+         p[2] = static_cast<uint32_t>(drawY0) | (static_cast<uint32_t>(drawY1) << 16u);
+@@ -1940,8 +1958,8 @@
+         if (minX > maxX || minY > maxY)
+             return;
+ 
+-        prepareTarget(state, minX, minY, maxX, maxY);
+-        const uint32_t s = addState(state);
++        const uint32_t textureEpoch = prepareTarget(state, minX, minY, maxX, maxY);
++        const uint32_t s = addState(state, textureEpoch);
+         uint32_t *p = newPrim(PrimTriangle, s);
+         p[1] = static_cast<uint32_t>(minX) | (static_cast<uint32_t>(maxX) << 16u);
+         p[2] = static_cast<uint32_t>(minY) | (static_cast<uint32_t>(maxY) << 16u);
+@@ -2473,6 +2491,8 @@
+     m_impl->cacheTexturePages = !setting || std::string_view(setting) != "0";
+     setting = std::getenv("PS2X_GS_FAST_TRIANGLE_SETUP");
+     m_impl->fastTriangleSetup = !setting || std::string_view(setting) != "0";
++    setting = std::getenv("PS2X_GS_FEEDBACK_SNAPSHOT");
++    m_impl->feedbackSnapshot = setting && std::string_view(setting) == "1";
+ }
+ 
+ GSGpuBackend::~GSGpuBackend() = default;
+@@ -2485,6 +2505,11 @@
+ void GSGpuBackend::SetFastTriangleSetupEnabled(bool enabled)
+ {
+     m_impl->fastTriangleSetup = enabled;
++}
++
++void GSGpuBackend::SetFeedbackSnapshotEnabled(bool enabled)
++{
++    m_impl->feedbackSnapshot = enabled;
+ }
+ 
+ void GSGpuBackend::SetHardwareRasterAllowed(bool allowed)
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -17,6 +17,114 @@
+ 
+ namespace
+ {
++    // GOW-Port: RGB externo de PCSX2 v2.8.2 SW sobre texels procedurales 64x416.
++    // SCISSOR fuera de la cobertura separa los dos draws; fuente de ambos validada.
++    // SHA256 split: 75fb49353fd21ec38c8d4b413f657b57d5fc168bb24c9eba8279edc747079197.
++    // Esta prueba valida la politica opcional por Submit, no una cache de PS2.
++    void gpuFeedbackSnapshot(TestCase &t,bool hardware)
++    {
++        struct Restore {unsigned csr=_mm_getcsr();~Restore(){_mm_setcsr(csr);}} restore;
++        _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++        constexpr unsigned width=64,height=416,sourceBytes=1u<<20,disjointBytes=2u<<20;
++        const auto &fmt=GSSwizzle::GetFormat(GS_PSM_CT32);
++        std::vector<uint8_t> seed(GSSwizzle::kMemorySize),vram(seed.size());
++        for(unsigned y=0;y<height;++y) for(unsigned x=0;x<width;++x) {
++            const uint32_t rgba=0x80000000u|((x*37u+y*13u+x*y*3u)&255u)|
++                (((x*11u+y*29u)&255u)<<8)|(((x*x*5u+y*47u)&255u)<<16);
++            const auto loc=GSSwizzle::Locate(fmt,0,8,x,y);
++            std::memcpy(seed.data()+loc.byte,&rgba,4);
++        }
++        auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
++        raw->SetHardwareRasterAllowed(hardware);raw->SetFeedbackSnapshotEnabled(true);
++        GSThreadedBackend backend(std::move(gpu));
++        for(unsigned fixture=0;fixture<3;++fixture) {
++            const bool disjoint=fixture==1,linear=fixture!=2;
++            auto initial=seed;
++            if(disjoint) std::memcpy(initial.data()+disjointBytes,initial.data(),sourceBytes);
++            std::vector<uint8_t> previous;
++            bool observedHardware=false;
++            const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(12);
++            unsigned pass=0;
++            do {
++                backend.Sync(GSSyncReason::Finish);
++                std::copy(initial.begin(),initial.end(),vram.begin());
++                backend.Initialize(vram.data(),uint32_t(vram.size()));
++                if(dynamic_cast<GSGpuBackend*>(&backend.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
++                const auto before=raw->GetStats();
++                for(unsigned slice=0;slice<2;++slice) {
++                    GSPrimitiveBatch b{};b.vertexCount=2;b.state.prim.type=GS_PRIM_SPRITE;
++                    b.state.prim.tme=true;b.state.prim.fst=true;b.state.linearFilter=linear;
++                    b.state.textureWidth=b.state.textureHeight=1024;b.state.colclamp=1;
++                    auto &c=b.state.context;c.frame.fbw=8;c.frame.psm=GS_PSM_CT32;c.frame.fbmsk=0xff000000u;
++                    c.scissor={0,511,0,447};c.zbuf.zbp=104;c.zbuf.psm=GS_PSM_Z24;c.zbuf.zmask=true;
++                    c.test=0x31001;c.clamp=5;c.tex1=linear?0x60:0;
++                    c.tex0.psm=GS_PSM_CT32;c.tex0.tbw=8;c.tex0.tw=c.tex0.th=10;c.tex0.tcc=1;
++                    c.tex0.tbp0=disjoint?disjointBytes/256u:0;
++                    for(auto &v:b.vertices){v.r=v.g=v.b=v.a=128;v.z=7;}
++                    b.vertices[0].x=float(slice*32);b.vertices[0].u=slice*32*16;
++                    b.vertices[1].x=float((slice+1)*32);b.vertices[1].y=height;
++                    b.vertices[1].u=(slice+1)*32*16;b.vertices[1].v=height*16;
++                    backend.Submit(b);
++                }
++                backend.Sync(GSSyncReason::DebugReadback);
++                std::vector<uint8_t> actual;backend.SnapshotVram(actual);
++                if(actual.size()!=initial.size()){t.Fail("VRAM completa requerida");return;}
++                uint64_t hash=14695981039346656037ull;
++                unsigned alphaWrong=0;
++                for(unsigned y=0;y<height;++y) for(unsigned x=0;x<width;++x) {
++                    const auto loc=GSSwizzle::Locate(fmt,0,8,x,y);
++                    for(unsigned c=0;c<3;++c) hash=(hash^actual[loc.byte+c])*1099511628211ull;
++                    alphaWrong+=actual[loc.byte+3]!=128;
++                }
++                const uint64_t expected=fixture==0?0xf1dd4b246679e740ull:
++                    fixture==1?0x547572d4082f5a22ull:0x7d8780bb885694a5ull;
++                t.IsTrue(hash==expected,"RGB coincide con la referencia independiente de la politica por Submit");
++                t.IsTrue(alphaWrong==0,"FBMSK conserva alpha sin depender del formato PNG de referencia");
++                if(!previous.empty())t.IsTrue(previous==actual,"Toda la VRAM es estable entre pasadas restauradas");
++                if(disjoint)t.IsTrue(std::equal(initial.begin()+disjointBytes,initial.begin()+disjointBytes+sourceBytes,
++                                               actual.begin()+disjointBytes),"La fuente disjunta no cambia");
++                previous=std::move(actual);
++                const auto after=raw->GetStats();
++                t.IsTrue(after.prims-before.prims==2,"Dos sprites realmente rasterizados en OpenGL");
++                if(after.tiles-before.tiles==0 && after.prims-before.prims==2)observedHardware=true;
++                if(!hardware)t.IsTrue(after.tiles>before.tiles,"Se ejecuta compute, sin fallback CPU");
++                ++pass;
++                if(hardware && !observedHardware)std::this_thread::sleep_for(std::chrono::milliseconds(20));
++            } while(pass<8 || (hardware && !observedHardware && std::chrono::steady_clock::now()<deadline));
++            if(hardware)t.IsTrue(observedHardware,"Al menos una pasada usa hardware sin tiles compute");
++        }
++        // GOW-Port: tambien puntos y triangulos: mismos texels desde una copia disjunta.
++        // No usar la cache CPU sobre el framebuffer mutable como oraculo del snapshot.
++        for(bool triangle:{false,true}) {
++            auto initial=seed;
++            std::memcpy(initial.data()+disjointBytes,initial.data(),sourceBytes);
++            auto cpuVram=initial;
++            GSCpuBackend cpu;cpu.Initialize(cpuVram.data(),uint32_t(cpuVram.size()));
++            GSPrimitiveBatch b{};b.vertexCount=triangle?3:1;
++            b.state.prim.type=triangle?GS_PRIM_TRIANGLE:GS_PRIM_POINT;
++            b.state.prim.tme=true;b.state.prim.fst=true;b.state.linearFilter=true;
++            b.state.textureWidth=b.state.textureHeight=1024;b.state.colclamp=1;
++            auto &c=b.state.context;c.frame.fbw=8;c.frame.fbmsk=0xff000000u;
++            c.scissor={0,63,0,63};c.zbuf.zbp=104;c.zbuf.psm=GS_PSM_Z24;c.zbuf.zmask=true;
++            c.test=0x30000;c.clamp=5;c.tex1=0x60;
++            c.tex0.tbw=8;c.tex0.tw=c.tex0.th=10;c.tex0.tcc=1;
++            for(auto &vertex:b.vertices){vertex.u=vertex.v=12;vertex.r=vertex.g=vertex.b=vertex.a=128;vertex.z=7;}
++            b.vertices[1].x=16;b.vertices[2].y=16;
++            auto control=b;control.state.context.tex0.tbp0=disjointBytes/256u;
++            cpu.Submit(control);
++            std::vector<uint8_t> expected;cpu.SnapshotVram(expected);
++            for(unsigned pass=0;pass<4;++pass) {
++                backend.Sync(GSSyncReason::Finish);
++                std::copy(initial.begin(),initial.end(),vram.begin());
++                backend.Initialize(vram.data(),uint32_t(vram.size()));
++                if(dynamic_cast<GSGpuBackend*>(&backend.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
++                backend.Submit(b);backend.Sync(GSSyncReason::DebugReadback);
++                std::vector<uint8_t> actual;backend.SnapshotVram(actual);
++                t.IsTrue(actual==expected,"Puntos y triangulos usan la fuente congelada del control disjunto");
++            }
++        }
++    }
++
+     // GOW-Port: el GS recibe datos, no debe heredar el redondeo SSE del EE/VU.
+     void cpuRoundingIndependent(TestCase &t, bool threaded)
+     {
+@@ -1246,6 +1354,12 @@
+         const char *gpu=std::getenv("GOW_GS_GPU_TEST");
+         if(gpu && *gpu && *gpu!='0')
+         {
++            t.Run("OpenGL compute feedback snapshot is repeatable and matches a split-draw reference",[](TestCase &t){
++                gpuFeedbackSnapshot(t,false);
++            });
++            t.Run("OpenGL hardware feedback snapshot matches the external split-draw reference",[](TestCase &t){
++                gpuFeedbackSnapshot(t,true);
++            });
+             t.Run("OpenGL triangle depth keeps large-area precision independently of SSE",[](TestCase &t){
+                 gpuTrianglePrecision(t,false);gpuTrianglePrecision(t,true);
+             });

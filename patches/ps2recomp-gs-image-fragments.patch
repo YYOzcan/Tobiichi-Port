@@ -1,0 +1,302 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_backend_state.h b/ps2xRuntime/include/runtime/gs/gs_backend_state.h
+--- a/ps2xRuntime/include/runtime/gs/gs_backend_state.h
++++ b/ps2xRuntime/include/runtime/gs/gs_backend_state.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include "runtime/gs/gs_types.h"
++#include "runtime/gs/gs_upload24.h" // GOW-Port: exportar tambien el pixel pendiente.
+ 
+ #include <array>
+ #include <cstdint>
+@@ -18,6 +19,7 @@
+     std::array<uint8_t, kCachePageSize> cacheBytes{};
+     GSTransferCommand transfer{};
+     GSTransferSnapshot transferState{};
++    GSUpload24State upload24{};
+     std::vector<uint8_t> localToHost;
+     uint64_t localToHostReadPos = 0u;
+ };
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -2,6 +2,7 @@
+ 
+ #include "runtime/gs/gs_backend.h"
+ #include "runtime/gs/gs_texture_page_cache.h"
++#include "runtime/gs/gs_upload24.h" // GOW-Port: continuacion del pixel entre cargas.
+ 
+ #include <array>
+ #include <mutex>
+@@ -35,6 +36,7 @@
+ 
+ private:
+     void ResetUnlocked();
++    void UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes);
+     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+     uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
+@@ -76,6 +78,7 @@
+ 
+     GSTransferCommand m_transfer{};
+     GSTransferSnapshot m_transferState{};
++    GSUpload24State m_upload24{};
+     std::vector<uint8_t> m_localToHostBuffer;
+     size_t m_localToHostReadPos = 0;
+ };
+diff --git a/ps2xRuntime/include/runtime/gs/gs_upload24.h b/ps2xRuntime/include/runtime/gs/gs_upload24.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_upload24.h
+@@ -0,0 +1,35 @@
++// GOW-Port: preservar el pixel CT24/Z24 que atraviesa dos bloques de IMAGE.
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstring>
++
++struct GSUpload24State
++{
++    std::array<uint8_t, 3> bytes{};
++    uint32_t size = 0u;
++
++    // El receptor devuelve false cuando termina la transferencia; su padding se descarta.
++    // Solo copiar hasta dos bytes pendientes; entregar el resto directamente al backend.
++    template <typename Receiver>
++    void consume(const uint8_t *data, uint32_t length, Receiver receive)
++    {
++        uint32_t offset = 0u;
++        if (size)
++        {
++            const uint32_t copy = std::min(3u - size, length);
++            std::memcpy(bytes.data() + size, data, copy);
++            size += copy;
++            offset += copy;
++            if (size < 3u) return;
++            size = 0u;
++            if (!receive(bytes.data(), 3u)) return;
++        }
++        const uint32_t aligned = ((length - offset) / 3u) * 3u;
++        if (aligned && !receive(data + offset, aligned)) return;
++        offset += aligned;
++        size = length - offset;
++        if (size) std::memcpy(bytes.data(), data + offset, size);
++    }
++};
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+@@ -529,6 +529,7 @@
+ 
+     GSTransferCommand transfer{};
+     GSTransferSnapshot transferState{};
++    GSUpload24State upload24{}; // GOW-Port: pixel de 24 bits pendiente entre bloques IMAGE.
+     std::vector<uint8_t> localToHost;
+     size_t localToHostReadPos = 0u;
+     std::vector<uint32_t> scratch;
+@@ -2205,6 +2206,19 @@
+ 
+     void uploadImage(const uint8_t *data, uint32_t sizeBytes)
+     {
++        if (!data || !sizeBytes || transferState.direction != 0u || !transferState.totalPixels)
++            return;
++        if (transfer.bitbltbuf.dpsm == GS_PSM_CT24 || transfer.bitbltbuf.dpsm == GS_PSM_Z24)
++            upload24.consume(data, sizeBytes, [&](const uint8_t *aligned, uint32_t bytes) {
++                uploadImageAligned(aligned, bytes);
++                return transferState.direction == 0u;
++            });
++        else
++            uploadImageAligned(data, sizeBytes);
++    }
++
++    void uploadImageAligned(const uint8_t *data, uint32_t sizeBytes)
++    {
+         if (!data || sizeBytes == 0u || transferState.direction != 0u)
+             return;
+         if (transfer.trxreg.rrw == 0u || transfer.trxreg.rrh == 0u || transferState.totalPixels == 0u)
+@@ -2485,6 +2499,7 @@
+     d.transfer.direction = 3u;
+     d.transferState = {};
+     d.transferState.direction = 3u;
++    d.upload24 = {}; // GOW-Port: reset descarta el pixel incompleto.
+     d.localToHost.clear();
+     d.localToHostReadPos = 0u;
+     if (d.hostVram && d.hostVramSize && d.ensure())
+@@ -2572,6 +2587,7 @@
+         d.flushFor(3u);
+     }
+     d.transfer = command;
++    d.upload24 = {}; // GOW-Port: no heredar datos de otra transferencia.
+     d.transferState.x = command.trxpos.dsax;
+     d.transferState.y = command.trxpos.dsay;
+     d.transferState.totalPixels = static_cast<uint32_t>(command.trxreg.rrw) * static_cast<uint32_t>(command.trxreg.rrh);
+@@ -2861,6 +2877,7 @@
+     out.cacheBytes.fill(0u);
+     out.transfer = d.transfer;
+     out.transferState = d.transferState;
++    out.upload24 = d.upload24;
+     out.localToHost = d.localToHost;
+     out.localToHostReadPos = d.localToHostReadPos;
+     return true;
+@@ -2869,6 +2886,7 @@
+ bool GSGpuBackend::ImportState(const GSBackendState &state)
+ {
+     Impl &d = *m_impl;
++    if (state.upload24.size >= 3u) return false; // GOW-Port: solo hay uno o dos bytes pendientes.
+     if (!d.ensure())
+         return false;
+     d.flushBatch();
+@@ -2876,6 +2894,7 @@
+     d.clutCbp = state.clutCbp;
+     d.transfer = state.transfer;
+     d.transferState = state.transferState;
++    d.upload24 = state.upload24;
+     d.localToHost = state.localToHost;
+     d.localToHostReadPos = static_cast<size_t>(state.localToHostReadPos);
+     return true;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -544,6 +544,7 @@
+     m_transfer.direction = 3u;
+     m_transferState = {};
+     m_transferState.direction = 3u;
++    m_upload24 = {}; // GOW-Port: reset descarta la continuacion del pixel.
+     m_localToHostBuffer.clear();
+     m_localToHostReadPos = 0u;
+ }
+@@ -1601,6 +1602,7 @@
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+     m_transfer = command;
++    m_upload24 = {}; // GOW-Port: una nueva transferencia no hereda bytes de la anterior.
+     m_transferState.x = command.trxpos.dsax;
+     m_transferState.y = command.trxpos.dsay;
+     m_transferState.totalPixels = static_cast<uint32_t>(command.trxreg.rrw) * static_cast<uint32_t>(command.trxreg.rrh);
+@@ -1617,6 +1619,20 @@
+ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    if (!data || !sizeBytes || !m_vram || m_transferState.direction != 0u || !m_transferState.totalPixels)
++        return;
++    if (m_transfer.bitbltbuf.dpsm == GS_PSM_CT24 || m_transfer.bitbltbuf.dpsm == GS_PSM_Z24)
++        m_upload24.consume(data, sizeBytes, [&](const uint8_t *aligned, uint32_t bytes) {
++            UploadImageUnlocked(aligned, bytes);
++            return m_transferState.direction == 0u;
++        });
++    else
++        UploadImageUnlocked(data, sizeBytes);
++}
++
++// GOW-Port: el wrapper conserva el pixel parcial bajo el mismo lock que la escritura.
++void GSCpuBackend::UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes)
++{
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -46,6 +46,57 @@
+         void SnapshotVram(std::vector<uint8_t> &out) const override { out = r.uploaded; }
+         GSTransferSnapshot GetTransferSnapshot() const override { return {}; }
+     };
++    // GOW-Port: un pixel de 24 bits puede atravesar el limite de un quadword IMAGE.
++    void transfer24Fragments(TestCase &t, GSRasterBackend &backend)
++    {
++        uint8_t bytes[48]; for(uint32_t i=0;i<48u;++i) bytes[i]=uint8_t(i+1u);
++        for(const uint8_t format : {uint8_t(GS_PSM_CT24),uint8_t(GS_PSM_Z24)})
++        {
++            GSTransferCommand cmd{}; cmd.direction=0; cmd.bitbltbuf.dbp=96; cmd.bitbltbuf.dbw=1;
++            cmd.bitbltbuf.dpsm=format; cmd.trxreg={16,1};
++            const uint32_t rawFormat=format==GS_PSM_CT24 ? GS_PSM_CT32 : GS_PSM_Z32;
++            auto clear=[&] {for(uint32_t x=0;x<16u;++x) backend.WriteVram(rawFormat,96,1,x,0,0xa5000000u);};
++            clear(); backend.BeginTransfer(cmd); backend.UploadImage(bytes,48);
++            std::vector<uint8_t> expected; backend.SnapshotVram(expected);
++            for(uint32_t x=0;x<16u;++x) {
++                const uint32_t i=x*3u,value=0xa5000000u|bytes[i]|(uint32_t(bytes[i+1u])<<8)|(uint32_t(bytes[i+2u])<<16);
++                t.Equals(backend.ReadVram(rawFormat,96,1,x,0),value,"CT24/Z24 conserva el byte alto de VRAM");
++            }
++            for(uint32_t cut=0;cut<=48u;++cut)
++            {
++                clear(); backend.BeginTransfer(cmd);
++                backend.UploadImage(bytes,cut); backend.UploadImage(bytes+cut,48u-cut);
++                std::vector<uint8_t> actual; backend.SnapshotVram(actual);
++                const auto s=backend.GetTransferSnapshot();
++                if(actual!=expected || s.direction!=3u || s.copiedPixels!=16u) {
++                    t.Fail("Pixel perdido entre cargas: PSM="+std::to_string(format)+" corte="+std::to_string(cut)+
++                           " copiados="+std::to_string(s.copiedPixels)); return;
++                }
++            }
++            for(const uint32_t chunk : {1u,16u})
++            {
++                clear(); backend.BeginTransfer(cmd);
++                for(uint32_t offset=0;offset<48u;offset+=chunk) backend.UploadImage(bytes+offset,chunk);
++                std::vector<uint8_t> actual; backend.SnapshotVram(actual);
++                t.IsTrue(actual==expected && backend.GetTransferSnapshot().copiedPixels==16u,
++                         "Cargas repetidas de un byte o un quadword conservan todos los pixels");
++            }
++        }
++    }
++    void transfer24Reset(TestCase &t, GSRasterBackend &backend)
++    {
++        for(const bool reset : {false,true}) for(const uint32_t partial : {1u,2u})
++        {
++            GSTransferCommand cmd{}; cmd.direction=0; cmd.bitbltbuf.dbp=96; cmd.bitbltbuf.dbw=1;
++            cmd.bitbltbuf.dpsm=GS_PSM_CT24; cmd.trxreg={1,1};
++            const uint8_t old[]={0x11,0x22},fresh[]={0x33,0x44,0x55};
++            backend.BeginTransfer(cmd); backend.UploadImage(old,partial);
++            if(reset) backend.Reset();
++            backend.BeginTransfer(cmd); backend.UploadImage(fresh,3);
++            t.Equals(backend.ReadVram(GS_PSM_CT24,96,1,0,0),0x554433u,
++                     "Reset y nueva transferencia descartan bytes de la carga anterior");
++        }
++    }
+     GSPrimitiveBatch sprite()
+     {
+         GSPrimitiveBatch b{};
+@@ -609,6 +660,14 @@
+             std::vector<uint8_t> actual; thread.SnapshotVram(actual);
+             t.IsTrue(a == actual,"Cola CPU reproduce la VRAM de la ruta directa");
+         });
++        t.Run("CPU CT24 and Z24 retain pixels across every upload byte cut", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size())); transfer24Fragments(t,backend);
++        });
++        t.Run("CPU reset and new transfer discard partial CT24 pixels", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size())); transfer24Reset(t,backend);
++        });
+         t.Run("GPU swizzle matches existing GS memory for all 13 formats", [](TestCase &t) {
+             GSMem::InitLookupTables();
+             const uint32_t formats[]={0,1,2,10,19,20,27,36,44,48,49,50,58};
+@@ -634,6 +693,28 @@
+         {
+             t.Run("OpenGL compute agrees with synthetic CPU fixture",[](TestCase &t){gpuComparison(t,false);});
+             t.Run("OpenGL hardware or compute fallback agrees with CPU fixture",[](TestCase &t){gpuComparison(t,true);});
++            t.Run("OpenGL CT24 and Z24 retain pixels across every upload byte cut",[](TestCase &t){
++                std::vector<uint8_t> vram(GSSwizzle::kMemorySize); auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();
++                GSThreadedBackend backend(std::move(gpu)); backend.Initialize(vram.data(),uint32_t(vram.size()));
++                if(dynamic_cast<GSGpuBackend *>(&backend.Inner())!=raw || !raw->IsReady()) {t.Fail("OpenGL requerido");return;}
++                transfer24Fragments(t,backend); transfer24Reset(t,backend);
++            });
++            t.Run("OpenGL state handoff preserves a partial CT24 pixel",[](TestCase &t){
++                std::vector<uint8_t> vram(GSSwizzle::kMemorySize); auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();
++                GSThreadedBackend backend(std::move(gpu)); backend.Initialize(vram.data(),uint32_t(vram.size()));
++                if(dynamic_cast<GSGpuBackend *>(&backend.Inner())!=raw || !raw->IsReady()) {t.Fail("OpenGL requerido");return;}
++                GSTransferCommand cmd{}; cmd.direction=0; cmd.bitbltbuf.dbp=96; cmd.bitbltbuf.dbw=1;
++                cmd.bitbltbuf.dpsm=GS_PSM_CT24; cmd.trxreg={1,1};
++                const uint8_t pixel[]={0x33,0x44,0x55};
++                for(const uint32_t partial : {1u,2u}) {
++                    backend.BeginTransfer(cmd); backend.UploadImage(pixel,partial); GSBackendState state;
++                    t.IsTrue(backend.ExportState(state),"Exportar el estado pendiente"); backend.Reset();
++                    t.IsTrue(backend.ImportState(state),"Restaurar el estado pendiente");
++                    backend.UploadImage(pixel+partial,3u-partial);
++                    t.Equals(backend.ReadVram(GS_PSM_CT24,96,1,0,0),0x554433u,"Importar conserva los bytes del pixel incompleto");
++                    t.Equals(backend.GetTransferSnapshot().direction,3u,"La transferencia importada termina");
++                }
++            });
+         }
+     });
+ }

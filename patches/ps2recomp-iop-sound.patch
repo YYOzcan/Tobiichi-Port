@@ -1,0 +1,241 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..804bd21 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -415,6 +415,29 @@ namespace ps2x::iop::detail
+                 cpu.yielded = true;
+                 setV0(0);
+             }
++            else
++            {
++                // GOW-Port: sin hilo actual (servidor RPC llamado desde el EE) no se puede bloquear. Antes se
++                // devolvia como si se hubiera obtenido el semaforo: 989snd tomaba asi su candado del tick mientras
++                // el hilo del tick lo tenia, el candado quedaba con un dueno imposible y el sonido se paraba
++                // ("Sound System Tick locked out"). Ahora corren los demas hilos hasta que el semaforo se libera.
++                const auto available = [this, id]
++                {
++                    const auto semaphore = m_semaphores.find(id);
++                    return semaphore == m_semaphores.end() || semaphore->second.current > 0;
++                };
++                const bool acquired = m_outsideThreadWait && m_outsideThreadWait(available);
++                const auto semaphore = m_semaphores.find(id);
++                if (acquired && semaphore != m_semaphores.end())
++                {
++                    --semaphore->second.current;
++                    setV0(0);
++                }
++                else
++                {
++                    setV0(static_cast<uint32_t>(-419)); // KE_SEMA_ZERO: se agoto la espera o se borro el semaforo
++                }
++            }
+             return true;
+         }
+         case 11:
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index a5b7f7a..92e820a 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -4,6 +4,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
+ #include <map>
+ 
+ namespace ps2x::iop::detail
+@@ -66,6 +67,11 @@ namespace ps2x::iop::detail
+         void cleanupDeadThreads();
+         void terminateThreadsInRange(uint32_t base, uint32_t size);
+ 
++        // GOW-Port: espera fuera de un hilo (servidor RPC o callback ejecutado sin hilo actual). El emulador
++        // deja correr a los hilos listos hasta que la condicion se cumple; devuelve si se cumplio.
++        using OutsideThreadWait = std::function<bool(const std::function<bool()> &)>;
++        void setOutsideThreadWait(OutsideThreadWait wait) { m_outsideThreadWait = std::move(wait); }
++
+         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+         // GOW-Port: hay algun hilo listo para ejecutar (lo usa IopRpcBridge tras cada RPC).
+         [[nodiscard]] bool hasReadyThread() const noexcept
+@@ -107,5 +113,6 @@ namespace ps2x::iop::detail
+         uint32_t m_nextSemaphoreId = 1;
+         uint32_t m_nextEventFlagId = 1;
+         IopThread *m_currentThread = nullptr;
++        OutsideThreadWait m_outsideThreadWait;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index ac4b26e..fcfec39 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -115,6 +115,7 @@ namespace ps2x::iop::detail
+               loadcore(memory, imports)
+         {
+             reset();
++            kernel.setOutsideThreadWait([this](const std::function<bool()> &ready) { return waitOutsideThread(ready); });
+             // GOW-Port: memory card del SIO2. Puerto 1: GOW_MC0 o Mcd001.ps2 junto al ELF (formato de PCSX2);
+             // puerto 2: solo con GOW_MC1. GOW_MC0=0 deja el puerto 1 vacio.
+             memory.sio2().setCardPathProvider([this](uint32_t port) -> std::string
+@@ -568,6 +569,27 @@ namespace ps2x::iop::detail
+             settlingThreads = false;
+         }
+         bool settlingThreads = false;
++
++        // GOW-Port: una espera sin hilo actual (p. ej. WaitSema en un servidor RPC) deja correr a los hilos del IOP,
++        // como haria el IOP real al bloquear al hilo RPC, hasta que la condicion se cumple o pasa kMaxOutsideWaitCycles.
++        bool waitOutsideThread(const std::function<bool()> &ready)
++        {
++            if (ready())
++                return true;
++            if (waitingOutsideThread)
++                return false;
++            waitingOutsideThread = true;
++            const uint64_t start = totalCycles;
++            while (!ready() && totalCycles - start < kMaxOutsideWaitCycles)
++                runCycles(kDefaultSlice);
++            waitingOutsideThread = false;
++            const bool satisfied = ready();
++            if (!satisfied)
++                log(LogLevel::Warning, "[IOP] wait outside a thread timed out");
++            return satisfied;
++        }
++        bool waitingOutsideThread = false;
++        static constexpr uint64_t kMaxOutsideWaitCycles = 36864000u; // ~1 s de reloj del IOP
+         const unsigned long long pcEvery = []
+         {
+             const char *v = std::getenv("PS2X_IOP_PC_EVERY");
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index 46b82e5..18605b1 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -262,9 +262,33 @@ namespace ps2x::iop::detail
+             m_kernel.sleepCurrent(cpu);
+             setV0(0);
+             return true;
+-        case 23:
++        case 23: // sceSifGetOtherData(rd, eeSrc, iopDest, size, mode)
++        {
++            // GOW-Port: el IOP copia datos de la RAM del EE (smpd/989snd cargan así los bancos de sonido
++            // que el juego tiene en memoria del EE). Antes no copiaba nada y los bancos no llegaban al SPU2.
++            const uint32_t receiveData = cpu.gpr[4];
++            const uint32_t source = cpu.gpr[5];
++            const uint32_t destination = cpu.gpr[6];
++            const int32_t size = static_cast<int32_t>(cpu.gpr[7]);
++            if (size > 0)
++            {
++                std::vector<uint8_t> buffer(static_cast<size_t>(size));
++                if (!m_host.readGuest(source, buffer.data(), buffer.size()) ||
++                    !m_memory.writeRam(destination, buffer.data(), buffer.size()))
++                {
++                    setV0(static_cast<uint32_t>(-1));
++                    return true;
++                }
++            }
++            // SifRpcReceiveData_t: cabecera de 16 bytes y luego src, dest, size (como sifcmd).
++            if (receiveData != 0u)
++            {
++                const uint32_t fields[3] = {source, destination, static_cast<uint32_t>(size)};
++                (void)m_memory.writeRam(receiveData + 0x10u, fields, sizeof(fields));
++            }
+             setV0(0);
+             return true;
++        }
+         case 24: // RemoveRpc
+         {
+             const uint32_t serverData = cpu.gpr[4];
+diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
+index f1172e9..aabcbb3 100644
+--- a/ps2xTest/src/ps2_iop_tests.cpp
++++ b/ps2xTest/src/ps2_iop_tests.cpp
+@@ -1,6 +1,9 @@
+ #include "MiniTest.h"
+ #include "ps2x/iop/ps2_path.h"
+ #include "../../ps2xIOP/tests/iop_compat_test_support.h"
++#include "../../ps2xIOP/src/emulator/core/iop_kernel.h"
++#include "../../ps2xIOP/src/emulator/core/iop_memory.h"
++#include "../../ps2xIOP/src/emulator/services/iop_rpc.h"
+ 
+ void register_ps2_iop_tests()
+ {
+@@ -54,6 +57,82 @@ void register_ps2_iop_tests()
+                       "stopping LIBSD should deactivate its RPC endpoint");
+         });
+ 
++        // GOW-Port: 989snd toma su candado del tick con WaitSema desde el servidor RPC (sin hilo actual).
++        tc.Run("WaitSema outside a thread waits for the semaphore instead of faking success", [](TestCase &t)
++        {
++            using namespace ps2x::iop::detail;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            kernel.reset();
++            constexpr uint32_t kDescriptor = 0x2000u;
++            memory.write32(kDescriptor + 0u, 0u);
++            memory.write32(kDescriptor + 4u, 0u);
++            memory.write32(kDescriptor + 8u, 0u); // ocupado por otro hilo
++            memory.write32(kDescriptor + 12u, 1u);
++            IopCpuState create{};
++            create.gpr[4] = kDescriptor;
++            t.IsTrue(kernel.dispatchSemaphoreImport(4u, create), "CreateSema should be handled");
++            const uint32_t id = create.gpr[2];
++
++            IopCpuState wait{};
++            wait.gpr[4] = id;
++            t.IsTrue(kernel.dispatchSemaphoreImport(8u, wait), "WaitSema should be handled");
++            t.Equals(static_cast<int32_t>(wait.gpr[2]), -419, "without anyone to release it, WaitSema must not report success");
++
++            uint32_t waits = 0u;
++            kernel.setOutsideThreadWait([&](const std::function<bool()> &ready)
++            {
++                ++waits;
++                IopCpuState signal{};
++                signal.gpr[4] = id; // el hilo que lo tenia lo libera
++                (void)kernel.dispatchSemaphoreImport(6u, signal);
++                return ready();
++            });
++            wait = {};
++            wait.gpr[4] = id;
++            t.IsTrue(kernel.dispatchSemaphoreImport(8u, wait), "WaitSema should be handled");
++            t.Equals(wait.gpr[2], 0u, "WaitSema should succeed once another thread signals");
++            t.Equals(waits, 1u, "WaitSema should let other threads run while it waits");
++            IopCpuState poll{};
++            poll.gpr[4] = id;
++            t.IsTrue(kernel.dispatchSemaphoreImport(9u, poll), "PollSema should be handled");
++            t.Equals(static_cast<int32_t>(poll.gpr[2]), -419, "the waiter should own the semaphore");
++        });
++
++        // GOW-Port: smpd y 989snd cargan los bancos de sonido desde la RAM del EE con sceSifGetOtherData.
++        tc.Run("sceSifGetOtherData copies EE memory into IOP RAM", [](TestCase &t)
++        {
++            using namespace ps2x::iop::detail;
++            iop_test::Host host;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            kernel.reset();
++            IopRpcBridge rpc(host, memory, kernel);
++            rpc.reset();
++            constexpr uint32_t kEeSource = 0x1000u;
++            constexpr uint32_t kIopDestination = 0x30000u;
++            constexpr uint32_t kReceiveData = 0x2800u;
++            for (uint32_t i = 0; i < 64u; ++i)
++            {
++                const uint8_t value = static_cast<uint8_t>(0x40u + i);
++                (void)host.writeGuest(kEeSource + i, &value, 1u);
++            }
++            IopCpuState cpu{};
++            cpu.gpr[4] = kReceiveData;
++            cpu.gpr[5] = kEeSource;
++            cpu.gpr[6] = kIopDestination;
++            cpu.gpr[7] = 64u;
++            t.IsTrue(rpc.dispatchSifCmdImport(23u, cpu), "sifcmd:23 should be handled");
++            t.Equals(cpu.gpr[2], 0u, "sceSifGetOtherData should succeed");
++            bool copied = true;
++            for (uint32_t i = 0; i < 64u; ++i)
++                copied = copied && memory.read8(kIopDestination + i) == static_cast<uint8_t>(0x40u + i);
++            t.IsTrue(copied, "the EE bytes should land at the IOP destination");
++            t.Equals(memory.read32(kReceiveData + 0x10u), kEeSource, "receive data should record the source");
++            t.Equals(memory.read32(kReceiveData + 0x14u), kIopDestination, "receive data should record the destination");
++            t.Equals(memory.read32(kReceiveData + 0x18u), 64u, "receive data should record the size");
++        });
++
+         tc.Run("unknown SID remains unhandled without a loaded IRX", [](TestCase &t)
+         {
+             iop_test::Host host;

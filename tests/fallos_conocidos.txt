@@ -1,0 +1,2 @@
+# Pruebas de ps2x_tests (PS2Recomp + patches/) que ya fallaban; formato "suite :: prueba".
+# tools/ci/comprobar_pruebas.py no falla por ellas, pero si por cualquier otra. Quita una linea cuando se arregle.

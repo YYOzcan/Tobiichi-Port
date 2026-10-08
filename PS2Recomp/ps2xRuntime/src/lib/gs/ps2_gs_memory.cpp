@@ -1,4 +1,5 @@
 #include <array>
+#include <mutex>
 
 #include "runtime/gs/ps2_gs_memory.h"
 
@@ -203,21 +204,57 @@ namespace GSMem
 
     void InitLookupTables()
     {
-        // 32 bit
-        PixelStorageTraits<C32>::InitPageLookupTable(PageTableC32, BlockTableC32, ColumnTable32);
-        PixelStorageTraits<Z32>::InitPageLookupTable(PageTableZ32, BlockTableZ32, ColumnTable32);
+        // GOW-Port: tablas inmutables compartidas entre CPU y el hilo OpenGL.
+        static std::once_flag once;
+        std::call_once(once, [] {
+            // 32 bit
+            PixelStorageTraits<C32>::InitPageLookupTable(PageTableC32, BlockTableC32, ColumnTable32);
+            PixelStorageTraits<Z32>::InitPageLookupTable(PageTableZ32, BlockTableZ32, ColumnTable32);
 
-        // 16 bit
-        PixelStorageTraits<C16>::InitPageLookupTable(PageTableC16, BlockTableC16, ColumnTable16);
-        PixelStorageTraits<C16S>::InitPageLookupTable(PageTableC16S, BlockTableC16S, ColumnTable16);
-        PixelStorageTraits<Z16>::InitPageLookupTable(PageTableZ16, BlockTableZ16, ColumnTable16);
-        PixelStorageTraits<Z16S>::InitPageLookupTable(PageTableZ16S, BlockTableZ16S, ColumnTable16);
+            // 16 bit
+            PixelStorageTraits<C16>::InitPageLookupTable(PageTableC16, BlockTableC16, ColumnTable16);
+            PixelStorageTraits<C16S>::InitPageLookupTable(PageTableC16S, BlockTableC16S, ColumnTable16);
+            PixelStorageTraits<Z16>::InitPageLookupTable(PageTableZ16, BlockTableZ16, ColumnTable16);
+            PixelStorageTraits<Z16S>::InitPageLookupTable(PageTableZ16S, BlockTableZ16S, ColumnTable16);
 
-        // 8 bit
-        PixelStorageTraits<P8>::InitPageLookupTable(PageTableP8, BlockTableP8, ColumnTable8);
+            // 8 bit
+            PixelStorageTraits<P8>::InitPageLookupTable(PageTableP8, BlockTableP8, ColumnTable8);
 
-        // 4 bit
-        PixelStorageTraits<P4>::InitPageLookupTable(PageTableP4, BlockTableP4, ColumnTable4);
+            // 4 bit
+            PixelStorageTraits<P4>::InitPageLookupTable(PageTableP4, BlockTableP4, ColumnTable4);
+        });
+    }
+
+    // GOW-Port: adaptado de Taylor N. Albarnaz / LightVelox (GPL-3.0).
+    // Origen: PS2Recomp sotc-port, ac9efa070638ad3b3accd284de6f898d5ab271d1.
+    const u16* PageTableData(PixelStorageMode psm)
+    {
+        switch (psm)
+        {
+        case C32:
+        case C24:
+        case P8H:
+        case P4HL:
+        case P4HH:
+            return &PageTableC32[0][0][0];
+        case Z32:
+        case Z24:
+            return &PageTableZ32[0][0][0];
+        case C16:
+            return &PageTableC16[0][0][0];
+        case C16S:
+            return &PageTableC16S[0][0][0];
+        case Z16:
+            return &PageTableZ16[0][0][0];
+        case Z16S:
+            return &PageTableZ16S[0][0][0];
+        case P8:
+            return &PageTableP8[0][0][0];
+        case P4:
+            return &PageTableP4[0][0][0];
+        default:
+            return nullptr;
+        }
     }
 
     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y)

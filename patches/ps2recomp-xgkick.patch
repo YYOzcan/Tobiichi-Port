@@ -1,0 +1,105 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index bd75bba..7390709 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -937,6 +937,15 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+     m_xgkick.sourceAddress = sourceAddress;
+     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
+     m_xgkick.issueCycle = m_cycle;
++    // Opt-in packet snapshot, following Scotho/socom-unzipped's XGKICK workaround.
++    // Capture before later VU instructions re-template the source buffer. Keep
++    // the existing bounded parser and circular-memory handling in both modes.
++    const char *immediate = std::getenv("GOW_XGKICK_IMMEDIATE");
++    if (immediate && std::strcmp(immediate, "1") == 0)
++    {
++        m_xgkick.cycleCredit = 0x40000000u;
++        progressXgkick();
++    }
+ }
+ 
+ void VU1Interpreter::advanceOneCycle()
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index 0754b69..dd44f07 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -7,14 +7,39 @@
+ 
+ #include <cmath>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
++#include <string>
+ #include <vector>
+ 
+ namespace
+ {
+     constexpr uint32_t kVuUpperNop = 0x000002FFu;
+ 
++    struct ScopedImmediateXgkick
++    {
++        bool hadValue;
++        std::string previous;
++        static void set(const char *value)
++        {
++#ifdef _WIN32
++            _putenv_s("GOW_XGKICK_IMMEDIATE", value ? value : "");
++#else
++            if (value) setenv("GOW_XGKICK_IMMEDIATE", value, 1);
++            else unsetenv("GOW_XGKICK_IMMEDIATE");
++#endif
++        }
++        ScopedImmediateXgkick()
++        {
++            const char *value = std::getenv("GOW_XGKICK_IMMEDIATE");
++            hadValue = value != nullptr;
++            if (value) previous = value;
++            set("1");
++        }
++        ~ScopedImmediateXgkick() { set(hadValue ? previous.c_str() : nullptr); }
++    };
++
+     struct Vu1Fixture
+     {
+         PS2Memory mem;
+@@ -1256,6 +1281,40 @@ void register_ps2_vu1_tests()
+             }
+         });
+ 
++        tc.Run("immediate XGKICK snapshots a packet before its payload is overwritten", [](TestCase &t)
++        {
++            ScopedImmediateXgkick mode;
++            Vu1Fixture fx;
++            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++            std::vector<std::vector<uint8_t>> captured;
++            fx.mem.setGifPacketCallback([&](const uint8_t *packet, uint32_t size) {
++                captured.emplace_back(packet, packet + size);
++            });
++            const uint64_t tag = makeGifTag(1u, GIF_FMT_IMAGE, 0u);
++            std::memcpy(fx.data, &tag, sizeof(tag));
++            std::memset(fx.data + 16, 0x5a, 16);
++            writeVuInstructionPair(fx.code, 0u, makeVuLowerSpecial(0x6Cu, 1u), kVuUpperNop);
++            writeVuInstructionPair(fx.code, 8u, makeVuSq(0xFu, 4u, 2u, 0), kVuUpperNop);
++            writeVuInstructionPair(fx.code, 16u, 0u, kVuUpperNop);
++            VU1Interpreter vu;
++            vu.state().vi[1] = 0;
++            vu.state().vi[2] = 1;
++            const float replacement[4] = {0, 0, 0, 1};
++            std::memcpy(vu.state().vf[4], replacement, sizeof(replacement));
++            vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
++                       fx.gs, &fx.mem, 0u, 0u, 0u, 3u);
++            t.Equals(captured.size(), size_t(1), "exactly one packet should be sent");
++            if (!captured.empty())
++            {
++                t.Equals(captured[0].size(), size_t(32), "the complete packet should be captured");
++                if (captured[0].size() == 32)
++                    for (size_t i = 16; i < 32; ++i)
++                        t.Equals(captured[0][i], uint8_t(0x5a), "sent payload must retain the original bytes");
++            }
++            t.IsTrue(std::memcmp(fx.data + 16, replacement, 16) == 0,
++                     "the later store must still update VU data memory");
++        });
++
+         tc.Run("a second XGKICK stalls until the active PATH1 transfer completes", [](TestCase &t)
+         {
+             PS2Memory mem;

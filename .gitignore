@@ -1,34 +1,60 @@
-# Oyun ROM/varlık dosyaları (telif hakkı - paylaşılamaz)
-SCUS_973.99
-PART1.PAK
+# --- Material con copyright: NUNCA subir ---
 *.iso
+*.ISO
+*.bin
+*.img
+*.IMG
+*.pak
+*.PAK
+*.irx
+*.IRX
+*.TOC
+*.wad
+*.WAD
+SCUS_*
+SYSTEM.CNF
+game/*
+!game/README.md
+GOW ISO extraida/
+mc0/
+mc1/
+PART1.PAK
 
-# Build çıktıları
+# --- Build çıktıları ve geçici kodlar ---
+generado/
+gowport/
+out/
+build/
 output/
 PS2Recomp/build/
 PS2Recomp/out/
-
-# Log/geçici dosyalar
-*.log
-*.txt
-imgui.ini
-*.bak*
-*.patch
-
-# PS2Recomp içindeki büyük recompile çıktıları
 PS2Recomp/ps2xRuntime/src/runner/
 PS2Recomp/ps2xRuntime/include/ps2_recompiled_functions.h
 PS2Recomp/ps2xRuntime/include/ps2_recompiled_stubs.h
 PS2Recomp/ps2xRuntime/include/ps2_all_declarations.h
 
-# PCSX2 kaynak (ayrı proje)
+# --- Logs y archivos locales ---
+logs/
+replay_*.ppm
+gow_pad_test_*.ppm
+gow_pad_test_*.png
+*.log
+ps2_log.txt
+imgui.ini
+trozos/
+*.bak*
+
+# --- PCSX2 kaynak ---
 pcsx2_source/
 
-# mc kartlar
-mc0/
-mc1/
-
-# IDE
+# --- Editores / sistema ---
 .vs/
 .vscode/
 .idea/
+*.user
+Thumbs.db
+desktop.ini
+.DS_Store
+__pycache__/
+PS2Recomp_backup/
+build_generar_vu1

@@ -1,0 +1,247 @@
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -453,6 +453,7 @@
+ 
+     std::array<EeTimer, 4> m_eeTimers{};
+     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
++    bool processScratchpadChain(uint32_t channelBase, uint32_t chcr); // GOW-Port
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+     void queueCompletedDmacCause(uint32_t cause);
+ };
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1604,6 +1604,12 @@
+         return false;
+ 
+     const uint32_t mode = (chcr >> 2u) & 0x3u;
++    // GOW-Port: modo cadena. fromSPR usa cadena de destino (etiquetas en el scratchpad que indican
++    // la dirección de RAM) y toSPR cadena de origen (etiquetas en RAM, datos seguidos en el scratchpad).
++    // God of War copia así la paleta de huesos que CalcSkinHierarchy deja en el scratchpad; sin esto
++    // los paquetes de VU1 quedaban a cero y los personajes se dibujaban como polígonos gigantes.
++    if (mode == 1u)
++        return processScratchpadChain(channelBase, chcr);
+     if (mode != 0u)
+         return false;
+ 
+@@ -1654,6 +1660,140 @@
+     completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
+     return true;
+ }
++
++// GOW-Port: cadenas DMA del scratchpad (canales 8 y 9), según la especificación del DMAC del EE.
++bool PS2Memory::processScratchpadChain(uint32_t channelBase, uint32_t chcr)
++{
++    static constexpr uint32_t kSprFromChannel = 0x1000D000u;
++    static constexpr int kMaxTags = 1 << 16;
++    const bool fromScratchpad = channelBase == kSprFromChannel;
++    const bool tieEnabled = (chcr & (1u << 7)) != 0u;
++    uint32_t sadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
++    uint32_t madr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
++    uint32_t lastTagUpper = (chcr >> 16u) & 0xFFFFu;
++    auto copyToSpr = [&](const uint8_t *src, uint32_t bytes)
++    {
++        for (uint32_t done = 0u; done < bytes;)
++        {
++            const uint32_t chunk = std::min(bytes - done, PS2_SCRATCHPAD_SIZE - sadr);
++            std::memcpy(m_scratchpad + sadr, src + done, chunk);
++            done += chunk;
++            sadr = (sadr + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
++        }
++    };
++    // Origen en RAM o en el propio scratchpad (bit 31 de la dirección de la etiqueta).
++    auto sourcePointer = [&](uint32_t address, uint32_t bytes) -> const uint8_t *
++    {
++        if ((address & 0x80000000u) != 0u || isScratchpad(address))
++        {
++            const uint32_t offset = address & (PS2_SCRATCHPAD_SIZE - 1u);
++            return offset + bytes <= PS2_SCRATCHPAD_SIZE ? m_scratchpad + offset : nullptr;
++        }
++        uint32_t offset = 0u;
++        try { offset = translateAddress(address); } catch (const std::exception &) { return nullptr; }
++        return offset < PS2_RAM_SIZE && bytes <= PS2_RAM_SIZE - offset ? m_rdram + offset : nullptr;
++    };
++
++    if (fromScratchpad)
++    {
++        // Cadena de destino: etiqueta {QWC, ID, IRQ, ADDR} en el scratchpad; ID 0 = cnts, 1 = cnt, 7 = end.
++        for (int tags = 0; tags < kMaxTags; ++tags)
++        {
++            uint64_t tag = 0u;
++            std::memcpy(&tag, m_scratchpad + sadr, sizeof(tag));
++            sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
++            const uint32_t qwc = static_cast<uint32_t>(tag & 0xFFFFu);
++            const uint32_t id = static_cast<uint32_t>((tag >> 28u) & 0x7u);
++            const bool irq = ((tag >> 31u) & 1u) != 0u;
++            lastTagUpper = static_cast<uint32_t>((tag >> 16u) & 0xFFFFu);
++            madr = static_cast<uint32_t>(tag >> 32u) & 0x7FFFFFF0u;
++            uint32_t offset = 0u;
++            bool valid = true;
++            try { offset = translateAddress(madr); } catch (const std::exception &) { valid = false; }
++            const uint32_t bytes = qwc * 16u;
++            if (valid && offset < PS2_RAM_SIZE && bytes <= PS2_RAM_SIZE - offset)
++            {
++                for (uint32_t done = 0u; done < bytes;)
++                {
++                    const uint32_t chunk = std::min(bytes - done, PS2_SCRATCHPAD_SIZE - sadr);
++                    std::memcpy(m_rdram + offset + done, m_scratchpad + sadr, chunk);
++                    done += chunk;
++                    sadr = (sadr + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
++                }
++                markModified(offset, bytes);
++            }
++            else
++            {
++                sadr = (sadr + bytes) & (PS2_SCRATCHPAD_SIZE - 1u);
++            }
++            madr += bytes;
++            if (id == 7u || (id != 0u && id != 1u) || (irq && tieEnabled))
++                break;
++        }
++    }
++    else
++    {
++        // Cadena de origen: etiquetas en RAM (como VIF/GIF); los datos se escriben seguidos en el scratchpad.
++        uint32_t tadr = m_ioRegisters[channelBase + 0x30u];
++        uint32_t asp = (chcr >> 4u) & 0x3u;
++        uint32_t asr[2] = {m_ioRegisters[channelBase + 0x40u], m_ioRegisters[channelBase + 0x50u]};
++        const bool transferTag = (chcr & 0x40u) != 0u;
++        for (int tags = 0; tags < kMaxTags; ++tags)
++        {
++            const uint8_t *tagPointer = sourcePointer(tadr, 16u);
++            if (!tagPointer)
++                break;
++            uint64_t tag = 0u;
++            std::memcpy(&tag, tagPointer, sizeof(tag));
++            const uint32_t qwc = static_cast<uint32_t>(tag & 0xFFFFu);
++            const uint32_t id = static_cast<uint32_t>((tag >> 28u) & 0x7u);
++            const bool irq = ((tag >> 31u) & 1u) != 0u;
++            const uint32_t addr = static_cast<uint32_t>(tag >> 32u) & 0xFFFFFFF0u;
++            lastTagUpper = static_cast<uint32_t>((tag >> 16u) & 0xFFFFu);
++            uint32_t data = tadr + 16u;
++            bool end = false;
++            switch (id)
++            {
++            case 0u: data = addr; tadr += 16u; end = true; break; // refe
++            case 1u: tadr = data + qwc * 16u; break;              // cnt
++            case 2u: tadr = addr; break;                          // next
++            case 3u: case 4u: data = addr; tadr += 16u; break;    // ref, refs
++            case 5u:                                              // call
++                if (asp < 2u) asr[asp++] = data + qwc * 16u;
++                tadr = addr;
++                break;
++            case 6u:                                              // ret
++                if (asp > 0u) tadr = asr[--asp];
++                else end = true;
++                break;
++            default: end = true; break;                           // end
++            }
++            if (transferTag)
++                copyToSpr(tagPointer, 16u);
++            if (qwc != 0u)
++            {
++                if (const uint8_t *source = sourcePointer(data, qwc * 16u))
++                    copyToSpr(source, qwc * 16u);
++                else
++                    sadr = (sadr + qwc * 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
++            }
++            madr = data + qwc * 16u;
++            if (end || (irq && tieEnabled))
++                break;
++        }
++        m_ioRegisters[channelBase + 0x30u] = tadr;
++        m_ioRegisters[channelBase + 0x40u] = asr[0];
++        m_ioRegisters[channelBase + 0x50u] = asr[1];
++        chcr = (chcr & ~(0x3u << 4u)) | ((asp & 0x3u) << 4u);
++    }
++
++    m_ioRegisters[channelBase + 0x00u] = (chcr & 0x0000FFFFu) | (lastTagUpper << 16u);
++    m_ioRegisters[channelBase + 0x10u] = madr & 0x7FFFFFF0u;
++    m_ioRegisters[channelBase + 0x20u] = 0u;
++    m_ioRegisters[channelBase + 0x80u] = sadr & 0x3FF0u;
++    completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
++    return true;
++}
+ 
+ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+ {
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -2130,6 +2130,78 @@
+                 t.Equals(causes[0], 9u, "SPR_TO completion should use DMAC cause 9");
+         });
+ 
++        // GOW-Port: God of War copia la paleta de huesos con fromSPR en cadena de destino (CHCR 0x104).
++        tc.Run("DMAC SPR_FROM destination chain writes each tag's data to its address", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            constexpr uint32_t kChannel = 0x1000D000u;
++            constexpr uint32_t kSadr = 0x00000200u;
++            uint8_t *spr = mem.getScratchpad();
++            auto putTag = [&](uint32_t offset, uint64_t qwc, uint64_t id, uint64_t address)
++            {
++                const uint64_t tag = qwc | (id << 28u) | (address << 32u);
++                std::memset(spr + offset, 0, 16u);
++                std::memcpy(spr + offset, &tag, sizeof(tag));
++            };
++            putTag(kSadr, 2u, 1u, 0x00029000u);                        // cnt: 2 QW -> 0x29000
++            for (uint32_t i = 0; i < 32u; ++i) spr[kSadr + 16u + i] = static_cast<uint8_t>(0xA0u + i);
++            putTag(kSadr + 48u, 1u, 7u, 0x00029400u);                  // end: 1 QW -> 0x29400
++            for (uint32_t i = 0; i < 16u; ++i) spr[kSadr + 64u + i] = static_cast<uint8_t>(0xC0u + i);
++
++            t.IsTrue(mem.writeIORegister(kChannel + 0x80u, kSadr), "write SPR_FROM SADR should succeed");
++            t.IsTrue(mem.writeIORegister(kChannel + 0x20u, 0u), "write SPR_FROM QWC should succeed");
++            t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x104u), "start SPR_FROM chain should succeed");
++
++            bool first = true, second = true;
++            for (uint32_t i = 0; i < 32u; ++i) first = first && mem.getRDRAM()[0x29000u + i] == static_cast<uint8_t>(0xA0u + i);
++            for (uint32_t i = 0; i < 16u; ++i) second = second && mem.getRDRAM()[0x29400u + i] == static_cast<uint8_t>(0xC0u + i);
++            t.IsTrue(first, "cnt tag should copy its QWs to the tag address");
++            t.IsTrue(second, "end tag should copy its QW to the tag address");
++            t.Equals(mem.readIORegister(kChannel + 0x80u), kSadr + 80u, "SADR should advance past tags and data");
++            t.Equals(mem.readIORegister(kChannel + 0x10u), 0x29410u, "MADR should end after the last tag's data");
++            t.IsTrue((mem.readIORegister(kChannel + 0x00u) & 0x100u) == 0u, "chain completion should clear CHCR.STR");
++            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
++            t.Equals(causes.size(), static_cast<size_t>(1u), "SPR_FROM chain should queue one completion");
++        });
++
++        tc.Run("DMAC SPR_TO source chain copies tagged RDRAM data to scratchpad", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            constexpr uint32_t kChannel = 0x1000D400u;
++            constexpr uint32_t kTadr = 0x0002A000u;
++            constexpr uint32_t kSadr = 0x00000300u;
++            uint8_t *ram = mem.getRDRAM();
++            auto putTag = [&](uint32_t offset, uint64_t qwc, uint64_t id, uint64_t address)
++            {
++                const uint64_t tag = qwc | (id << 28u) | (address << 32u);
++                std::memset(ram + offset, 0, 16u);
++                std::memcpy(ram + offset, &tag, sizeof(tag));
++            };
++            putTag(kTadr, 1u, 1u, 0u);                                   // cnt: data follows the tag
++            for (uint32_t i = 0; i < 16u; ++i) ram[kTadr + 16u + i] = static_cast<uint8_t>(0x10u + i);
++            putTag(kTadr + 32u, 1u, 3u, 0x0002B000u);                    // ref: data elsewhere
++            for (uint32_t i = 0; i < 16u; ++i) ram[0x2B000u + i] = static_cast<uint8_t>(0x50u + i);
++            putTag(kTadr + 48u, 0u, 7u, 0u);                             // end
++
++            t.IsTrue(mem.writeIORegister(kChannel + 0x30u, kTadr), "write SPR_TO TADR should succeed");
++            t.IsTrue(mem.writeIORegister(kChannel + 0x80u, kSadr), "write SPR_TO SADR should succeed");
++            t.IsTrue(mem.writeIORegister(kChannel + 0x20u, 0u), "write SPR_TO QWC should succeed");
++            t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x105u), "start SPR_TO chain should succeed");
++
++            bool copied = true;
++            for (uint32_t i = 0; i < 16u; ++i) copied = copied && mem.getScratchpad()[kSadr + i] == static_cast<uint8_t>(0x10u + i);
++            for (uint32_t i = 0; i < 16u; ++i) copied = copied && mem.getScratchpad()[kSadr + 16u + i] == static_cast<uint8_t>(0x50u + i);
++            t.IsTrue(copied, "cnt and ref data should land contiguously in the scratchpad");
++            t.Equals(mem.readIORegister(kChannel + 0x80u), kSadr + 32u, "SADR should advance by the copied QWs");
++            t.IsTrue((mem.readIORegister(kChannel + 0x00u) & 0x100u) == 0u, "chain completion should clear CHCR.STR");
++            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
++            t.Equals(causes.size(), static_cast<size_t>(1u), "SPR_TO chain should queue one completion");
++        });
++
+         tc.Run("sceDmaReset re-enables DMAC DMAE", [](TestCase &t)
+         {
+             PS2Runtime runtime;

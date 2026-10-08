@@ -1,0 +1,300 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_perf.h b/ps2xRuntime/include/runtime/ps2_perf.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_perf.h
+@@ -0,0 +1,113 @@
++#ifndef PS2_PERF_H
++#define PS2_PERF_H
++
++// GOW-Port: perfil opcional de tiempo transcurrido exclusivo, separado por hilo.
++// Los tiempos incluyen esperas del sistema; no representan muestras de uso de CPU.
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstdint>
++#include <cstring>
++
++namespace ps2_perf
++{
++    enum class Bucket : size_t { Ee, Vu, Gs, Iop, GuestWait, Upload, HostWait, Count, None = Count };
++    constexpr size_t bucketCount = static_cast<size_t>(Bucket::Count);
++
++    // Contabilidad con reloj inyectable para comprobar el anidamiento sin sleeps.
++    struct Accounting
++    {
++        Bucket active = Bucket::None;
++        uint64_t since = 0;
++
++        struct Charge { Bucket bucket; uint64_t nanos; };
++        Charge switchTo(Bucket next, uint64_t now)
++        {
++            const Charge charge{active, now >= since ? now - since : 0u};
++            active = next;
++            since = now;
++            return charge;
++        }
++    };
++
++    inline bool enabled()
++    {
++        static const bool on = [] {
++            const char *value = std::getenv("GOW_PERF_DIAG");
++            return value && std::strcmp(value, "1") == 0;
++        }();
++        return on;
++    }
++    inline bool countFrames()
++    {
++        static const bool on = [] {
++            const char *value = std::getenv("GOW_PERF_DIAG");
++            return value && (std::strcmp(value, "1") == 0 || std::strcmp(value, "frames") == 0);
++        }();
++        return on;
++    }
++    inline std::array<std::atomic<uint64_t>, bucketCount> nanos{};
++    inline std::atomic<uint64_t> guestFlips{0}, hostFrames{0};
++    inline thread_local Accounting accounting;
++    inline uint64_t nowNanos()
++    {
++        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()).count());
++    }
++    inline void switchTo(Bucket next)
++    {
++        const auto charge = accounting.switchTo(next, nowNanos());
++        if (charge.bucket != Bucket::None)
++            nanos[static_cast<size_t>(charge.bucket)].fetch_add(charge.nanos, std::memory_order_relaxed);
++    }
++    class Scope
++    {
++        bool on;
++        Bucket previous = Bucket::None;
++    public:
++        explicit Scope(Bucket bucket) : on(enabled())
++        {
++            if (on) { previous = accounting.active; switchTo(bucket); }
++        }
++        ~Scope() { if (on) switchTo(previous); }
++        Scope(const Scope &) = delete;
++        Scope &operator=(const Scope &) = delete;
++    };
++    inline void guestEntry(uint32_t pc)
++    {
++        if (!countFrames()) return;
++        static const uint32_t framePc = [] {
++            const char *value = std::getenv("GOW_PERF_FRAME_PC");
++            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
++        }();
++        // Solo entradas a la funciÃ³n elegida: las reanudaciones no cuentan como cuadros nuevos.
++        if (framePc != 0u && pc == framePc) guestFlips.fetch_add(1, std::memory_order_relaxed);
++    }
++    inline void report()
++    {
++        if (!countFrames()) return;
++        // Se llama Ãºnicamente desde el hilo de presentaciÃ³n. No lee RAM del juego.
++        const uint64_t now = nowNanos();
++        static uint64_t first = now, last = now;
++        static std::array<uint64_t, bucketCount> before{};
++        static uint64_t previousFlips = 0, previousFrames = 0;
++        if (now - last < 5000000000ull) return;
++        const double seconds = static_cast<double>(now - last) * 1e-9;
++        std::array<double, bucketCount> ms{};
++        for (size_t i = 0; i < bucketCount; ++i)
++        {
++            const uint64_t total = nanos[i].load(std::memory_order_relaxed);
++            ms[i] = static_cast<double>(total - before[i]) * 1e-6;
++            before[i] = total;
++        }
++        const uint64_t flips = guestFlips.load(std::memory_order_relaxed);
++        const uint64_t frames = hostFrames.load(std::memory_order_relaxed);
++        std::fprintf(stderr, "[gow-perf] t=%.2f window=%.2f ee_ms=%.2f vu_ms=%.2f gs_ms=%.2f iop_ms=%.2f guest_wait_ms=%.2f upload_ms=%.2f host_wait_ms=%.2f guest_flip_hz=%.2f host_hz=%.2f\n",
++            (now - first) * 1e-9, seconds, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6],
++            (flips - previousFlips) / seconds, (frames - previousFrames) / seconds);
++        previousFlips = flips; previousFrames = frames; last = now;
++    }
++}
++#endif
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/ee_scheduler.h"
+
+ #include "ps2_log.h"
++#include "runtime/ps2_perf.h"
+ #include "ps2_runtime_macros.h"
+
+ #include <algorithm>
+@@ -154,6 +155,7 @@
+
+ void EeScheduler::run()
+ {
++    ps2_perf::Scope perf(ps2_perf::Bucket::Ee); // GOW-Port: tiempos exclusivos del ejecutor.
+     assertExecutor();
+     m_running.store(true, std::memory_order_release);
+
+@@ -296,6 +298,7 @@
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+             m_guestExecuting.store(true, std::memory_order_release);
++            ps2_perf::guestEntry(context.pc);
+             function(m_rdram, &context, &m_runtime);
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+@@ -2024,6 +2027,7 @@
+
+ void EeScheduler::waitForEvent()
+ {
++    ps2_perf::Scope perf(ps2_perf::Bucket::GuestWait);
+     std::unique_lock lock(m_eventMutex);
+     if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,5 +1,6 @@
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
++#include "runtime/ps2_perf.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+ #include "game_overrides.h"
+@@ -648,17 +649,20 @@
+ {
+     auto scope = m_iopHost->enterCall(ctx, rdram);
+     request.callToken = scope.token();
++    ps2_perf::Scope perf(ps2_perf::Bucket::Iop);
+     return m_iopSubsystem->handleRpc(request);
+ }
+
+ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
+ {
+     auto scope = m_iopHost->enterCall(nullptr, rdram);
++    ps2_perf::Scope perf(ps2_perf::Bucket::Iop);
+     m_iopSubsystem->onSifTransfer(transfer);
+ }
+
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
++    ps2_perf::Scope perf(ps2_perf::Bucket::Iop);
+     m_iopSubsystem->runEeCycles(eeCycles);
+ }
+
+@@ -1465,6 +1469,7 @@
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
+     const uint64_t checkpointSerial = m_eeCheckpointSerial;
++    ps2_perf::guestEntry(targetPc); // GOW-Port: también cuenta llamadas que no vuelven al dispatcher.
+     targetFn(rdram, ctx, this);
+
+     if (isStopRequested() || ctx->pc == 0u)
+@@ -2544,7 +2549,10 @@
+         });
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+-        UploadFrame(frameTex, this, presentWidth, presentHeight);
++        {
++            ps2_perf::Scope perf(ps2_perf::Bucket::Upload);
++            UploadFrame(frameTex, this, presentWidth, presentHeight);
++        }
+
+         BeginDrawing();
+         ClearBackground(BLACK);
+@@ -2566,7 +2574,12 @@
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+         }
+-        EndDrawing();
++        {
++            ps2_perf::Scope perf(ps2_perf::Bucket::HostWait);
++            EndDrawing();
++        }
++        if (ps2_perf::countFrames()) ps2_perf::hostFrames.fetch_add(1, std::memory_order_relaxed);
++        ps2_perf::report();
+
+         if (WindowShouldClose())
+         {
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "ps2_log.h"
++#include "runtime/ps2_perf.h"
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+ #include <algorithm>
+@@ -642,6 +643,7 @@
+
+ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    ps2_perf::Scope perf(ps2_perf::Bucket::Gs); // GOW-Port: incluye rasterizado y transferencias GIF.
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -13,6 +13,7 @@
+ #include <filesystem>
+ #include <limits>
+ #include <ps2_log.h>
++#include "runtime/ps2_perf.h"
+
+ namespace
+ {
+@@ -1668,6 +1669,7 @@
+     m_activeGs = &gs;
+     m_activeMemory = memory;
+
++    ps2_perf::Scope perf(ps2_perf::Bucket::Vu); // GOW-Port: VU0/VU1; las llamadas al GS se descuentan.
+     const int previousRoundingMode = std::fegetround();
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/ps2_perf.h"
+ #include "MiniTest.h"
+ #include "runtime/ps2_memory.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -790,6 +791,35 @@
+             t.Equals(mem.vif1_regs.row[3], 103u, "difference mode should update row register for W");
+         });
+
++        // GOW-Port: los tiempos del GS anidado no deben sumarse también a VU/EE.
++        tc.Run("Perf scopes account nested work exclusively", [](TestCase &t)
++        {
++            using namespace ps2_perf;
++            Accounting clock;
++            std::array<uint64_t, bucketCount> totals{};
++            const auto step = [&](Bucket bucket, uint64_t now) {
++                const auto charge = clock.switchTo(bucket, now);
++                if (charge.bucket != Bucket::None) totals[static_cast<size_t>(charge.bucket)] += charge.nanos;
++            };
++            step(Bucket::Ee, 0); step(Bucket::Vu, 10); step(Bucket::Gs, 30);
++            step(Bucket::Vu, 35); step(Bucket::Ee, 50); step(Bucket::None, 80);
++            t.Equals(totals[0], uint64_t{40}, "EE excludes nested VU and GS");
++            t.Equals(totals[1], uint64_t{35}, "VU excludes nested GS");
++            t.Equals(totals[2], uint64_t{5}, "GS is charged only once");
++            t.Equals(totals[0]+totals[1]+totals[2], uint64_t{80}, "exclusive sum equals elapsed time");
++        });
++        tc.Run("Perf accounting ignores unmeasured gaps and supports repeated buckets", [](TestCase &t)
++        {
++            using namespace ps2_perf;
++            Accounting clock;
++            t.IsTrue(clock.switchTo(Bucket::Gs, 100).bucket == Bucket::None, "startup gap is unmeasured");
++            const auto recursive = clock.switchTo(Bucket::Gs, 120);
++            const auto returned = clock.switchTo(Bucket::Gs, 130);
++            const auto done = clock.switchTo(Bucket::None, 160);
++            t.Equals(recursive.nanos + returned.nanos + done.nanos, uint64_t{60}, "same bucket nesting does not double elapsed time");
++            t.IsTrue(clock.switchTo(Bucket::Ee, 1000).bucket == Bucket::None, "gap between tasks is unmeasured");
++        });
++
+         tc.Run("VIF fill write uses STMASK and STROW when WL>CL", [](TestCase &t)
+         {
+             PS2Memory mem;

@@ -1,0 +1,114 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+@@ -284,7 +284,9 @@
+     case 0x24: // JR
+     {
+         uint8_t is = VIS(instr);
+-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
++        // GOW-Port: JR/JALR leen el VI actual; el valor retrasado se usa
++        // solo en las comparaciones de ramas condicionales.
++        uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask;
+         m_state.branchPending = true;
+         m_state.branchTarget = target;
+         m_state.branchDelay = 1;
+@@ -294,7 +296,9 @@
+     {
+         uint8_t it = VIT(instr);
+         uint8_t is = VIS(instr);
+-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
++        // GOW-Port: JR/JALR leen el VI actual; el valor retrasado se usa
++        // solo en las comparaciones de ramas condicionales.
++        uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask;
+         if (it != 0)
+             m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
+         m_state.branchPending = true;
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -1078,41 +1078,50 @@
+                      "the flag-driven branch should arrive at its target");
+         });
+
+-        tc.Run("JR shares the one-instruction VI branch visibility rule", [](TestCase &t)
+-        {
+-            Vu1Fixture fx;
+-            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+-
+-            writeVuInstructionPair(
+-                fx.code, 0u, makeVuIaddiu(1u, 0u, 2),
+-                kVuUpperNop);
+-            writeVuInstructionPair(
+-                fx.code, 8u, makeVuJr(1u),
+-                kVuUpperNop);
+-            writeVuInstructionPair(
+-                fx.code, 16u, makeVuIaddiu(2u, 0u, 2),
+-                kVuUpperNop);
+-            writeVuInstructionPair(
+-                fx.code, 24u, makeVuIaddiu(3u, 0u, 3),
+-                kVuUpperNop);
+-            writeVuInstructionPair(
+-                fx.code, 32u, makeVuIaddiu(4u, 0u, 4),
+-                kVuUpperNop);
+-
+-            VU1Interpreter vu1;
+-            vu1.state().vi[1] = 4;
+-            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+-                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+-                        0u, 0u, 0u, 4u);
+-
+-            t.Equals(vu1.state().vi[1], 2,
+-                     "the pending IALU write should still commit normally");
+-            t.Equals(vu1.state().vi[2], 2,
+-                     "JR should execute exactly one delay-slot pair");
+-            t.Equals(vu1.state().vi[3], 0,
+-                     "JR should skip the sequential instruction after its delay slot");
+-            t.Equals(vu1.state().vi[4], 4,
+-                     "JR immediately after a VI write should branch using the previous VI value");
++        tc.Run("JR reads the current VI target after IADDIU", [](TestCase &t)
++        {
++            Vu1Fixture fx;
++            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++            writeVuInstructionPair(fx.code, 0u, makeVuIaddiu(1u, 0u, 4), kVuUpperNop);
++            writeVuInstructionPair(fx.code, 8u, makeVuJr(1u), kVuUpperNop);
++            writeVuInstructionPair(fx.code, 16u, makeVuIaddiu(2u, 0u, 2), kVuUpperNop);
++            writeVuInstructionPair(fx.code, 24u, makeVuIaddiu(3u, 0u, 3), kVuUpperNop);
++            writeVuInstructionPair(fx.code, 32u, makeVuIaddiu(4u, 0u, 4), kVuUpperNop);
++            writeVuInstructionPair(fx.code, 40u, makeVuIaddiu(5u, 0u, 5), kVuUpperNop);
++            VU1Interpreter vu1;
++            vu1.state().vi[1] = 5;
++            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
++                        fx.gs, &fx.mem, 0u, 0u, 0u, 4u);
++            t.Equals(vu1.state().vi[1], 4, "IADDIU should commit normally");
++            t.Equals(vu1.state().vi[2], 2, "JR should execute its delay slot");
++            t.Equals(vu1.state().vi[3], 0, "JR should skip the sequential pair");
++            t.Equals(vu1.state().vi[4], 4, "JR should use the current target");
++            t.Equals(vu1.state().vi[5], 0, "JR should not use the previous target");
++        });
++
++        tc.Run("JALR reads the current VI target before writing its link", [](TestCase &t)
++        {
++            for (const uint8_t link : {uint8_t{15}, uint8_t{1}})
++            {
++                Vu1Fixture fx;
++                t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++                writeVuInstructionPair(fx.code, 0u, makeVuIaddiu(1u, 0u, 4), kVuUpperNop);
++                const uint32_t jalr = (0x25u << 25) | (uint32_t{link} << 16) | (1u << 11);
++                writeVuInstructionPair(fx.code, 8u, jalr, kVuUpperNop);
++                writeVuInstructionPair(fx.code, 16u, makeVuIaddiu(2u, 0u, 2), kVuUpperNop);
++                writeVuInstructionPair(fx.code, 24u, makeVuIaddiu(3u, 0u, 3), kVuUpperNop);
++                writeVuInstructionPair(fx.code, 32u, makeVuIaddiu(4u, 0u, 4), kVuUpperNop);
++                writeVuInstructionPair(fx.code, 40u, makeVuIaddiu(5u, 0u, 5), kVuUpperNop);
++                VU1Interpreter vu1;
++                vu1.state().vi[1] = 5;
++                vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
++                            fx.gs, &fx.mem, 0u, 0u, 0u, 4u);
++                t.Equals(vu1.state().vi[link], 3, "JALR should link after the delay slot");
++                t.Equals(vu1.state().vi[2], 2, "JALR should execute its delay slot");
++                t.Equals(vu1.state().vi[3], 0, "JALR should skip the sequential pair");
++                t.Equals(vu1.state().vi[4], 4, "JALR should use the current target");
++                t.Equals(vu1.state().vi[5], 0, "JALR should not use the previous target");
++            }
+         });
+
+         tc.Run("MPG upload invalidates cached VU1 decode before MSCAL", [](TestCase &t)

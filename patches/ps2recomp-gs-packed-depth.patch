@@ -1,0 +1,72 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1014,7 +1014,8 @@
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(x) / 16.0f;
+         vtx.y = static_cast<float>(y) / 16.0f;
+-        vtx.z = static_cast<float>(z);
++        // GOW-Port: XYZ2 trae Z32; float pierde bits y redondea UINT32_MAX a 2^32.
++        vtx.z = static_cast<double>(z);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -1079,7 +1080,8 @@
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
+         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
+-        vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
++        // GOW-Port: XYZ3 conserva la misma profundidad Z32 aunque no lance el dibujo.
++        vtx.z = static_cast<double>(hi & 0xFFFFFFFF);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -566,6 +566,45 @@
+     MiniTest::Case("GOW GS backends", [](TestCase &t) {
+         t.Run("CPU drawing is independent of caller SSE rounding",[](TestCase &t) {cpuRoundingIndependent(t,false);});
+         t.Run("Threaded CPU drawing is independent of producer SSE rounding",[](TestCase &t) {cpuRoundingIndependent(t,true);});
++
++        // GOW-Port: PACKED XYZ conserva Z32 incluso por encima de la precision float.
++        t.Run("PACKED XYZ2 writes every depth bit through native and fragmented paths",[](TestCase &t){
++            for(bool native:{false,true}) for(uint32_t z:{0x01000001u,0x80000001u,0xffffff01u,0xffffffffu})
++            for(uint32_t cut=0;cut<=(native?0u:32u);++cut) {
++                std::vector<uint8_t> bytes(GSSwizzle::kMemorySize);GS gs;gs.init(bytes.data(),uint32_t(bytes.size()));
++                gs.setRasterBackend(std::make_unique<GSCpuBackend>());
++                gs.writeRegister(GS_REG_FRAME_1,1ull<<16);gs.writeRegister(GS_REG_SCISSOR_1,63ull<<16|63ull<<48);
++                gs.writeRegister(GS_REG_ZBUF_1,32);gs.writeRegister(GS_REG_TEST_1,1ull<<17);gs.writeRegister(GS_REG_RGBAQ,0x80332211u);
++                const uint64_t packet[]={1ull|(1ull<<15)|(1ull<<46)|(1ull<<60),5ull,0x0000001000000010ull,z};
++                const auto *data=reinterpret_cast<const uint8_t*>(packet);
++                if(native) t.IsTrue(gs.processNativePackedGIFPacket(data,sizeof(packet)),"Ruta nativa consume PACKED");
++                else {gs.processGIFPacket(data,cut);gs.processGIFPacket(data+cut,uint32_t(sizeof(packet))-cut);}
++                t.Equals(gs.ReadVram(GS_PSM_Z32,32u*32u,1,1,1),z,"El pixel conserva Z32 sin redondeo intermedio a float");
++                t.Equals(gs.ReadVram(GS_PSM_CT32,0,1,1,1),0x80332211u,"El punto sigue dibujandose");
++            }
++        });
++        t.Run("PACKED XYZ3 and XYZ2 ADC retain queued depth without a premature draw",[](TestCase &t){
++            for(bool native:{false,true}) for(bool xyz3:{false,true}) {
++                std::vector<uint8_t> bytes(GSSwizzle::kMemorySize);GS gs;gs.init(bytes.data(),uint32_t(bytes.size()));
++                Recording records;gs.setRasterBackend(std::make_unique<Recorder>(records));
++                gs.writeRegister(GS_REG_PRIM,GS_PRIM_TRIANGLE);
++                const uint64_t depths[]={0xffffffffull,0x80000001ull,0x01000001ull};
++                for(uint32_t i=0;i<3u;++i) {
++                    const bool suppressed=i<2u;
++                    const uint64_t reg=suppressed&&xyz3 ? 0xDull:5ull;
++                    const uint64_t adc=suppressed&&!xyz3 ? 1ull<<47:0ull;
++                    const uint64_t packet[]={1ull|(1ull<<15)|(1ull<<60),reg,
++                                             uint64_t(i*16u)|(uint64_t(i*32u)<<32),depths[i]|adc};
++                    const auto *data=reinterpret_cast<const uint8_t*>(packet);
++                    if(native)t.IsTrue(gs.processNativePackedGIFPacket(data,sizeof(packet)),"Ruta nativa consume XYZ3/ADC");
++                    else gs.processGIFPacket(data,sizeof(packet));
++                    t.Equals(records.draws.size(),size_t(i==2u?1u:0u),"Solo el ultimo vertice lanza el triangulo");
++                }
++                if(records.draws.size()!=1u){t.Fail("Falta el triangulo control");continue;}
++                for(uint32_t i=0;i<3u;++i)
++                    t.IsTrue(records.draws[0].vertices[i].z==double(depths[i]),"La cola conserva Z32 en XYZ3 y XYZ2 ADC");
++            }
++        });
+         // GOW-Port: exportación CPU adaptada de SotC ac9efa0 para repetir comandos GS.
+         t.Run("CPU and threaded CPU restore an incomplete CT24 transfer",[](TestCase &t) {
+             for(bool threaded:{false,true}) {

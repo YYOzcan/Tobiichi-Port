@@ -7,16 +7,31 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <immintrin.h>
 
 namespace
 {
+    inline void fastStoreDest(float *dst, const float *src, uint8_t dest)
+    {
+        if (__builtin_expect(dest == 0xFu, 1))
+        {
+            _mm_storeu_ps(dst, _mm_loadu_ps(src));
+            return;
+        }
+        if (dest & 0x8u) dst[0] = src[0];
+        if (dest & 0x4u) dst[1] = src[1];
+        if (dest & 0x2u) dst[2] = src[2];
+        if (dest & 0x1u) dst[3] = src[3];
+    }
+
     float vuEatan(float value)
     {
         constexpr float coefficients[] = {
             0.999999344348907f,
             -0.333298563957214f,
             0.199465364217758f,
-            -0.13085337519646f,
+            // GOW-Port: el coeficiente de t^7 es -0.139085..., como en PCSX2 (antes -0.130853..., una errata).
+            -0.139085337519646f,
             0.096420042216778f,
             -0.055909886956215f,
             0.021861229091883f,
@@ -91,9 +106,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         addr &= (dataSize - 1);
         if (addr + 16 <= dataSize)
         {
-            float tmp[4];
-            std::memcpy(tmp, vuData + addr, 16);
-            applyDest(m_state.vf[it], tmp, dest);
+            fastStoreDest(m_state.vf[it], reinterpret_cast<const float *>(vuData + addr), dest);
         }
         return;
     }
@@ -107,9 +120,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         addr &= (dataSize - 1);
         if (addr + 16 <= dataSize)
         {
-            uint32_t words[4]{};
-            std::memcpy(words, m_state.vf[is], sizeof(words));
-            queueStore(addr, words, dest);
+            queueStore(addr, reinterpret_cast<const uint32_t *>(m_state.vf[is]), dest);
         }
         return;
     }
@@ -175,6 +186,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x10: // FCEQ
     {
+        commitReadyFlags(); // GOW-Port: flags listos en este ciclo
         uint32_t imm24 = instr & 0xFFFFFF;
         if (1 != 0)
             m_state.vi[1] = ((m_state.clip & 0xFFFFFF) == imm24) ? 1 : 0;
@@ -187,6 +199,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x12: // FCAND
     {
+        commitReadyFlags(); // GOW-Port: flags listos en este ciclo
         uint32_t imm24 = instr & 0xFFFFFF;
         if (1 != 0)
             m_state.vi[1] = ((m_state.clip & imm24) != 0) ? 1 : 0;
@@ -194,6 +207,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x13: // FCOR
     {
+        commitReadyFlags(); // GOW-Port: flags listos en este ciclo
         uint32_t imm24 = instr & 0xFFFFFF;
         if (1 != 0)
             m_state.vi[1] = ((m_state.clip | imm24) == 0xFFFFFF) ? 1 : 0;
@@ -201,6 +215,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x14: // FSEQ
     {
+        commitReadyFlags(); // GOW-Port: flags listos en este ciclo
         const uint8_t it = VIT(instr);
         const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
         if (it != 0)
@@ -215,6 +230,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x16: // FSAND
     {
+        commitReadyFlags(); // GOW-Port: flags listos en este ciclo
         const uint8_t it = VIT(instr);
         const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
         if (it != 0)
@@ -223,6 +239,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x17: // FSOR
     {
+        commitReadyFlags(); // GOW-Port: flags listos en este ciclo
         const uint8_t it = VIT(instr);
         const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
         if (it != 0)
@@ -231,6 +248,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x18: // FMEQ
     {
+        commitReadyFlags(); // GOW-Port: flags listos en este ciclo
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
@@ -239,6 +257,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x1A: // FMAND
     {
+        commitReadyFlags(); // GOW-Port: flags listos en este ciclo
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
@@ -247,6 +266,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x1B: // FMOR
     {
+        commitReadyFlags(); // GOW-Port: flags listos en este ciclo
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
@@ -255,6 +275,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x1C: // FCGET
     {
+        commitReadyFlags(); // GOW-Port: flags listos en este ciclo
         const uint8_t it = VIT(instr);
         if (it != 0)
             m_state.vi[it] = static_cast<int32_t>(m_state.clip & 0x0FFFu);
@@ -284,7 +305,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     case 0x24: // JR
     {
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+        // GOW-Port: JR/JALR leen el VI actual; el valor retrasado se usa
+        // solo en las comparaciones de ramas condicionales.
+        uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask;
         m_state.branchPending = true;
         m_state.branchTarget = target;
         m_state.branchDelay = 1;
@@ -294,7 +317,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     {
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+        // GOW-Port: JR/JALR leen el VI actual; el valor retrasado se usa
+        // solo en las comparaciones de ramas condicionales.
+        uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask;
         if (it != 0)
             m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
         m_state.branchPending = true;
@@ -428,16 +453,15 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             switch (funct2)
             {
             case 0x30: // MOVE
-            {
-                float tmp[4];
-                std::memcpy(tmp, m_state.vf[vfS], 16);
-                applyDest(m_state.vf[vfT], tmp, dest);
+                fastStoreDest(m_state.vf[vfT], m_state.vf[vfS], dest);
                 return;
-            }
             case 0x31: // MR32 (rotate right by 32 bits = shift xyzw -> yzwx)
             {
-                float tmp[4] = {m_state.vf[vfS][1], m_state.vf[vfS][2], m_state.vf[vfS][3], m_state.vf[vfS][0]};
-                applyDest(m_state.vf[vfT], tmp, dest);
+                __m128 v = _mm_loadu_ps(m_state.vf[vfS]);
+                __m128 rot = _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 3, 2, 1));
+                alignas(16) float tmp[4];
+                _mm_store_ps(tmp, rot);
+                fastStoreDest(m_state.vf[vfT], tmp, dest);
                 return;
             }
             case 0x34: // LQI (Load Quadword, post-increment)
@@ -445,11 +469,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
                 addr &= (dataSize - 1);
                 if (addr + 16 <= dataSize)
-                {
-                    float tmp[4];
-                    std::memcpy(tmp, vuData + addr, 16);
-                    applyDest(m_state.vf[vfT], tmp, dest);
-                }
+                    fastStoreDest(m_state.vf[vfT], reinterpret_cast<const float *>(vuData + addr), dest);
                 if (viS != 0)
                     m_state.vi[viS] = (int16_t)(m_state.vi[viS] + 1);
                 return;
@@ -459,11 +479,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viT]) * 16u;
                 addr &= (dataSize - 1);
                 if (addr + 16 <= dataSize)
-                {
-                    uint32_t words[4]{};
-                    std::memcpy(words, m_state.vf[vfS], sizeof(words));
-                    queueStore(addr, words, dest);
-                }
+                    queueStore(addr, reinterpret_cast<const uint32_t *>(m_state.vf[vfS]), dest);
                 if (viT != 0)
                     m_state.vi[viT] = (int16_t)(m_state.vi[viT] + 1);
                 return;
@@ -475,11 +491,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
                 addr &= (dataSize - 1);
                 if (addr + 16 <= dataSize)
-                {
-                    float tmp[4];
-                    std::memcpy(tmp, vuData + addr, 16);
-                    applyDest(m_state.vf[vfT], tmp, dest);
-                }
+                    fastStoreDest(m_state.vf[vfT], reinterpret_cast<const float *>(vuData + addr), dest);
                 return;
             }
             case 0x37: // SQD (Store Quadword, pre-decrement)
@@ -489,11 +501,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viT]) * 16u;
                 addr &= (dataSize - 1);
                 if (addr + 16 <= dataSize)
-                {
-                    uint32_t words[4]{};
-                    std::memcpy(words, m_state.vf[vfS], sizeof(words));
-                    queueStore(addr, words, dest);
-                }
+                    queueStore(addr, reinterpret_cast<const uint32_t *>(m_state.vf[vfS]), dest);
                 return;
             }
             case 0x38: // DIV
@@ -572,7 +580,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 result[1] = result[0];
                 result[2] = result[0];
                 result[3] = result[0];
-                applyDest(m_state.vf[vfT], result, dest);
+                fastStoreDest(m_state.vf[vfT], result, dest);
                 return;
             }
             case 0x3E: // ILWR - integer load word from address in VI[is]
@@ -619,15 +627,16 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 float value = 0.0f;
                 std::memcpy(&value, &m_state.r, sizeof(value));
                 const float result[4] = {value, value, value, value};
-                applyDest(m_state.vf[vfT], result, dest);
+                fastStoreDest(m_state.vf[vfT], result, dest);
                 return;
             }
             case 0x41: // RGET
             {
                 float value = 0.0f;
                 std::memcpy(&value, &m_state.r, sizeof(value));
-                const float result[4] = {value, value, value, value};
-                applyDest(m_state.vf[vfT], result, dest);
+                alignas(16) float result[4];
+                _mm_store_ps(result, _mm_set1_ps(value));
+                fastStoreDest(m_state.vf[vfT], result, dest);
                 return;
             }
             case 0x42: // RINIT
@@ -648,8 +657,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             }
             case 0x64: // MFP (Move From P register)
             {
-                float result[4] = {m_state.p, m_state.p, m_state.p, m_state.p};
-                applyDest(m_state.vf[vfT], result, dest);
+                alignas(16) float result[4];
+                _mm_store_ps(result, _mm_set1_ps(m_state.p));
+                fastStoreDest(m_state.vf[vfT], result, dest);
                 return;
             }
             case 0x68: // XTOP - move current VIF1 TOP into VI register
@@ -723,7 +733,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 queueP(sum, 12u);
                 return;
             }
-            case 0x77: // ERSQRT
+            // GOW-Port: códigos EFU del LowerOP de PCSX2
+            // 32ac6e23e4aaf8c8c5e74a6c1ed750ee7672120e; 0x77 es reservado.
+            case 0x79: // ERSQRT
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 const float value = normalizeOperand(m_state.vf[vfS][component]);
@@ -744,7 +756,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
                 return;
             }
-            case 0x79: // ESIN
+            case 0x7C: // ESIN
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 const float value = normalizeOperand(m_state.vf[vfS][component]);
@@ -760,13 +772,13 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             }
             case 0x7B: // WAITP
                 return;
-            case 0x7C: // EATAN
+            case 0x7D: // EATAN
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
                 return;
             }
-            case 0x7D: // EEXP
+            case 0x7E: // EEXP
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);

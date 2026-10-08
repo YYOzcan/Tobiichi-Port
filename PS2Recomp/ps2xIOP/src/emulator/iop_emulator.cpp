@@ -18,12 +18,16 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <cstdlib>
 #include <cctype>
 #include <map>
 #include <optional>
 #include <span>
 #include <sstream>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace ps2x::iop::detail
 {
@@ -86,6 +90,7 @@ namespace ps2x::iop::detail
             uint32_t gp = 0;
         };
 
+        static constexpr uint64_t kSifDmaCompletionCycles = 2000u; // GOW-Port
         struct ScheduledGuestCallback
         {
             uint32_t function = 0u;
@@ -111,6 +116,19 @@ namespace ps2x::iop::detail
               loadcore(memory, imports)
         {
             reset();
+            kernel.setOutsideThreadWait([this](const std::function<bool()> &ready) { return waitOutsideThread(ready); });
+            // GOW-Port: memory card del SIO2. Puerto 1: GOW_MC0 o Mcd001.ps2 junto al ELF (formato de PCSX2);
+            // puerto 2: solo con GOW_MC1. GOW_MC0=0 deja el puerto 1 vacio.
+            memory.sio2().setCardPathProvider([this](uint32_t port) -> std::string
+            {
+                const char *setting = std::getenv(port == 0u ? "GOW_MC0" : "GOW_MC1");
+                if (setting != nullptr)
+                    return setting[0] == '0' && setting[1] == '\0' ? std::string() : std::string(setting);
+                if (port != 0u)
+                    return {};
+                const std::string directory = host.hostPath(HostPathKind::ElfDirectory);
+                return directory.empty() ? std::string("Mcd001.ps2") : (std::filesystem::path(directory) / "Mcd001.ps2").string();
+            });
         }
 
         void reset()
@@ -176,6 +194,8 @@ namespace ps2x::iop::detail
 
         void schedulePendingDma()
         {
+            if (!memory.hasDmaStart()) // GOW-Port: comprobacion barata en cada instruccion
+                return;
             if (const auto dma = memory.takeDmaStart())
                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
         }
@@ -245,6 +265,40 @@ namespace ps2x::iop::detail
                 cpu.gpr[2] = value;
             };
 
+            // GOW-Port: traza opcional de llamadas a importaciones (PS2X_IOP_TRACE=<numero de llamadas>).
+            static const long traceLimit = []
+            {
+                const char *v = std::getenv("PS2X_IOP_TRACE");
+                return v ? std::strtol(v, nullptr, 10) : 0L;
+            }();
+            // PS2X_IOP_TRACE_EVERY=<n>: muestreo, una de cada n llamadas (para ver progreso sin frenar).
+            static const long traceEvery = []
+            {
+                const char *v = std::getenv("PS2X_IOP_TRACE_EVERY");
+                return v ? std::strtol(v, nullptr, 10) : 0L;
+            }();
+            // PS2X_IOP_TRACE_NOCLIB=1: no trazar sysclib (memcpy/strncmp...), que es la mayor parte del volumen.
+            static const bool traceNoClib = std::getenv("PS2X_IOP_TRACE_NOCLIB") != nullptr;
+            static long traceCount = 0;
+            static long callCount = 0;
+            ++callCount;
+            const bool traceSkip = traceNoClib && iequals(call.library, "sysclib");
+            // PS2X_IOP_TRACE_FROM=<n>: la traza de PS2X_IOP_TRACE empieza en la llamada n.
+            static const long traceFrom = []
+            {
+                const char *v = std::getenv("PS2X_IOP_TRACE_FROM");
+                return v ? std::strtol(v, nullptr, 10) : 0L;
+            }();
+            if (!traceSkip && ((callCount >= traceFrom && traceCount < traceLimit) || (traceEvery > 0 && callCount % traceEvery == 0)))
+            {
+                ++traceCount;
+                std::ostringstream trace;
+                trace << "[IOP:trace] #" << std::dec << callCount << " " << call.library << ':' << std::dec << call.ordinal << std::hex
+                      << " a0=0x" << cpu.gpr[4] << " a1=0x" << cpu.gpr[5] << " a2=0x" << cpu.gpr[6]
+                      << " a3=0x" << cpu.gpr[7] << " ra=0x" << cpu.gpr[31];
+                log(LogLevel::Info, trace.str());
+            }
+
             if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
 
@@ -304,6 +358,12 @@ namespace ps2x::iop::detail
                     secrMcDevIdHandler = {a0, cpu.gpr[28]};
                     setV0(0);
                     return ImportDisposition::Handled;
+                case 6: // SecrAuthCard: GOW-Port: la memory card emulada no lleva MagicGate, se da por autenticada
+                    setV0(memory.sio2Enabled() ? 1u : 0u);
+                    return ImportDisposition::Handled;
+                case 7: // SecrResetAuthCard
+                    setV0(0);
+                    return ImportDisposition::Handled;
                 default:
                     break;
                 }
@@ -318,9 +378,13 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "sifman"))
             {
-                return rpc.dispatchSifManImport(call.ordinal, cpu)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
+                const bool handled = rpc.dispatchSifManImport(call.ordinal, cpu);
+                // GOW-Port: dbcman envía al EE con sceSifSetDmaIntr y espera su callback de fin de DMA.
+                IopRpcBridge::DmaCompletionCallback callback{};
+                if (rpc.takeDmaCompletionCallback(callback))
+                    pendingGuestCallbacks.emplace(totalCycles + kSifDmaCompletionCycles,
+                                                  ScheduledGuestCallback{callback.function, callback.gp, callback.argument});
+                return handled ? ImportDisposition::Handled : ImportDisposition::Missing;
             }
             if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
                 return ImportDisposition::Handled;
@@ -328,6 +392,25 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "dmacman"))
             {
+                // GOW-Port: sio2man programa los DMA 11 y 12 del SIO2 con sceSetSliceDMA/sceStartDMA.
+                const uint32_t channel = a0;
+                const bool sio2Channel = memory.sio2Enabled() && (channel == 11u || channel == 12u);
+                const uint32_t channelBase = 0x1F801500u + (channel - 7u) * 0x10u;
+                if (sio2Channel && call.ordinal == 28u) // sceSetSliceDMA(canal, direccion, palabras, bloques, sentido)
+                {
+                    const uint32_t direction = memory.read32(cpu.gpr[29] + 16u);
+                    write32(channelBase, cpu.gpr[5] & 0xFFFFFFu);
+                    write32(channelBase + 4u, (cpu.gpr[6] & 0xFFFFu) | (cpu.gpr[7] << 16u));
+                    write32(channelBase + 8u, (direction & 1u) | 0x200u | (direction == 0u ? 0x40000000u : 0u));
+                    setV0(1);
+                    return ImportDisposition::Handled;
+                }
+                if (sio2Channel && call.ordinal == 32u) // sceStartDMA(canal)
+                {
+                    write32(channelBase + 8u, memory.read32(channelBase + 8u) | 0x01000000u);
+                    setV0(0);
+                    return ImportDisposition::Handled;
+                }
                 setV0(0);
                 return ImportDisposition::Handled;
             }
@@ -378,7 +461,9 @@ namespace ps2x::iop::detail
             if (checkInterrupt(cpu))
                 return true;
 
-            if (const auto import = imports.decode(cpu.pc))
+            // GOW-Port: los stubs de importacion empiezan por "jr ra"; solo esas direcciones se buscan en las tablas.
+            const auto import = memory.fetch32(cpu.pc) == 0x03E00008u ? imports.decode(cpu.pc) : std::nullopt;
+            if (import)
             {
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
@@ -388,6 +473,16 @@ namespace ps2x::iop::detail
                 cpu.pc = cpu.gpr[31];
                 cpu.branchPending = false;
                 return !cpu.stopped;
+            }
+
+            // GOW-Port: muestreo del PC del IOP (PS2X_IOP_PC_EVERY=<instrucciones>), leido una vez al crear el IOP.
+            if (pcEvery != 0ULL && totalInstructions % pcEvery == 0ULL)
+            {
+                std::ostringstream out;
+                out << "[IOP:pc] instr=" << std::dec << totalInstructions << std::hex << " pc=0x" << cpu.pc
+                    << " ra=0x" << cpu.gpr[31] << " sp=0x" << cpu.gpr[29] << " v0=0x" << cpu.gpr[2]
+                    << " a0=0x" << cpu.gpr[4];
+                log(LogLevel::Info, out.str());
             }
 
             const bool running = cpuCore.executeInstruction(cpu);
@@ -456,8 +551,55 @@ namespace ps2x::iop::detail
             }
             cpu.gpr[31] = kCallReturnSentinel;
             runCpu(cpu, budget);
+            if (!cpu.stopped && !cpu.yielded)
+            {
+                // GOW-Port: avisar en vez de abandonar la llamada en silencio.
+                std::ostringstream out;
+                out << "[IOP] guest call 0x" << std::hex << address << " exceeded its budget of " << std::dec << budget
+                    << " instructions (pc=0x" << std::hex << cpu.pc << ")";
+                log(LogLevel::Warning, out.str());
+            }
             return cpu.gpr[2];
         }
+
+        void runReadyThreads(uint64_t maxCycles) override
+        {
+            // Solo desde fuera de la ejecucion del IOP (una RPC del EE), y sin reentrar.
+            if (activeCpu != nullptr || settlingThreads)
+                return;
+            settlingThreads = true;
+            const uint64_t start = totalCycles;
+            while (kernel.hasReadyThread() && totalCycles - start < maxCycles)
+                runCycles(kDefaultSlice * 16u);
+            settlingThreads = false;
+        }
+        bool settlingThreads = false;
+
+        // GOW-Port: una espera sin hilo actual (p. ej. WaitSema en un servidor RPC) deja correr a los hilos del IOP,
+        // como haria el IOP real al bloquear al hilo RPC, hasta que la condicion se cumple o pasa kMaxOutsideWaitCycles.
+        bool waitOutsideThread(const std::function<bool()> &ready)
+        {
+            if (ready())
+                return true;
+            if (waitingOutsideThread)
+                return false;
+            waitingOutsideThread = true;
+            const uint64_t start = totalCycles;
+            while (!ready() && totalCycles - start < kMaxOutsideWaitCycles)
+                runCycles(kDefaultSlice);
+            waitingOutsideThread = false;
+            const bool satisfied = ready();
+            if (!satisfied)
+                log(LogLevel::Warning, "[IOP] wait outside a thread timed out");
+            return satisfied;
+        }
+        bool waitingOutsideThread = false;
+        static constexpr uint64_t kMaxOutsideWaitCycles = 36864000u; // ~1 s de reloj del IOP
+        const unsigned long long pcEvery = []
+        {
+            const char *v = std::getenv("PS2X_IOP_PC_EVERY");
+            return v ? std::strtoull(v, nullptr, 10) : 0ULL;
+        }();
 
         uint32_t executeGuestFunction(uint32_t address,
                                       uint32_t a0,
@@ -512,6 +654,32 @@ namespace ps2x::iop::detail
             servicingDmaInterrupts = false;
         }
 
+        // GOW-Port: el SPU2 genera una muestra cada 768 ciclos del IOP; su IRQ (IRQA alcanzada) es la interrupcion 9.
+        void serviceSpu2()
+        {
+            // GOW_SPU2_IRQ=0 desactiva la entrega de la IRQ (para comparar si el juego cambia de comportamiento).
+            static const bool irqEnabled = []
+            {
+                const char *value = std::getenv("GOW_SPU2_IRQ");
+                return value == nullptr || value[0] != '0';
+            }();
+            Spu2 &spu = memory.spu2();
+            spu.advanceTo(totalCycles);
+            if (!spu.takeInterrupt() || !irqEnabled || servicingSpu2Interrupt)
+                return;
+            servicingSpu2Interrupt = true;
+            try
+            {
+                (void)intrman.dispatchInterrupt(Spu2::IopInterrupt, *this);
+            }
+            catch (...)
+            {
+                servicingSpu2Interrupt = false;
+                throw;
+            }
+            servicingSpu2Interrupt = false;
+        }
+
         void servicePendingGuestCallbacks()
         {
             if (servicingGuestCallbacks || pendingGuestCallbacks.empty())
@@ -560,12 +728,22 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    serviceSpu2();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
+                        // GOW-Port: con PS2X_IOP_PC_EVERY, avisar de vez en cuando si el IOP esta ocioso.
+                        static unsigned long long idleCount = 0ULL;
+                        static const bool idleTrace = std::getenv("PS2X_IOP_PC_EVERY") != nullptr;
+                        if (idleTrace && (++idleCount % 200000ULL) == 1ULL)
+                        {
+                            std::ostringstream out;
+                            out << "[IOP:idle] sin hilos listos (veces=" << idleCount << ") instr=" << totalInstructions;
+                            log(LogLevel::Info, out.str());
+                        }
                         uint64_t nextWake = kernel.nextWakeCycle(target);
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                             nextWake = std::min(nextWake, completionCycle);
@@ -581,6 +759,7 @@ namespace ps2x::iop::detail
                     if (totalCycles == before)
                         ++totalCycles;
                 }
+                serviceSpu2(); // GOW-Port: al dia tambien tras saltar ciclos ociosos hasta el final
             }
             catch (...)
             {
@@ -614,17 +793,44 @@ namespace ps2x::iop::detail
             module.entry = loaded.entry;
             module.gp = loaded.gp;
 
-            uint32_t args = 0u;
+            // GOW-Port: como el loadcore real, el modulo arranca con start(argc, argv): argv[0] es la ruta del
+            // modulo y los argumentos vienen separados por '\0' ("rpc_priority=64\0..."). Antes se pasaba
+            // (tamano en bytes, puntero al texto) y 989snd leia el texto como punteros ("989snd Error: cause 7").
+            std::vector<std::string> argStrings;
+            argStrings.push_back(module.path);
             if (arguments && argumentSize)
             {
-                args = allocate(argumentSize + 1u, 16u);
-                if (args)
+                const char *text = static_cast<const char *>(arguments);
+                size_t begin = 0u;
+                for (size_t i = 0u; i <= argumentSize; ++i)
                 {
-                    writeRam(args, arguments, argumentSize);
-                    write8(args + argumentSize, 0u);
+                    if (i == argumentSize || text[i] == '\0')
+                    {
+                        if (i > begin)
+                            argStrings.emplace_back(text + begin, i - begin);
+                        begin = i + 1u;
+                    }
                 }
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+            uint32_t stringBytes = 0u;
+            for (const std::string &value : argStrings)
+                stringBytes += static_cast<uint32_t>(value.size()) + 1u;
+            const uint32_t pointerBytes = static_cast<uint32_t>(argStrings.size() + 1u) * 4u;
+            const uint32_t args = allocate(pointerBytes + stringBytes, 16u);
+            const uint32_t argc = static_cast<uint32_t>(argStrings.size());
+            if (args)
+            {
+                uint32_t cursor = args + pointerBytes;
+                for (size_t i = 0u; i < argStrings.size(); ++i)
+                {
+                    memory.write32(args + static_cast<uint32_t>(i) * 4u, cursor);
+                    writeRam(cursor, argStrings[i].data(), static_cast<uint32_t>(argStrings[i].size()));
+                    write8(cursor + static_cast<uint32_t>(argStrings[i].size()), 0u);
+                    cursor += static_cast<uint32_t>(argStrings[i].size()) + 1u;
+                }
+                memory.write32(args + pointerBytes - 4u, 0u);
+            }
+            const uint32_t startResult = callFunction(module.entry, args ? argc : 0u, args, 0u, 0u, module.gp);
             if (args)
                 freeAllocation(args);
             module.resident = startResult == 0u || startResult == 2u;
@@ -696,6 +902,7 @@ namespace ps2x::iop::detail
         IopLoadcore loadcore;
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
+        bool servicingSpu2Interrupt = false;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
@@ -800,6 +1007,11 @@ namespace ps2x::iop::detail
             return false;
         const uint32_t physical = IopMemory::physicalAddress(address);
         return physical <= IopMemory::RamSize && size <= IopMemory::RamSize - physical;
+    }
+
+    size_t IopEmulator::drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames)
+    {
+        return m_impl->memory.spu2().drainOutput(stereo, maxFrames, maxLatencyFrames);
     }
 
     uint64_t IopEmulator::cycles() const noexcept

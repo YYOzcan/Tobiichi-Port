@@ -1,0 +1,86 @@
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2_vu1_detail.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cfenv>
+ #include <cmath>
+ #include <cstdio>
+@@ -17,6 +18,22 @@
+ 
+ namespace
+ {
++    // GOW-Port: GOW_XGKICK_IMMEDIATE se lee una vez (-1 = sin leer). getenv recorre el entorno
++    // completo; leerlo en cada XGKICK ocupaba un tercio del hilo del juego (ucrtbase!strchr).
++    std::atomic<int> g_xgkickImmediate{-1};
++
++    bool xgkickImmediate()
++    {
++        int value = g_xgkickImmediate.load(std::memory_order_relaxed);
++        if (value < 0)
++        {
++            const char *setting = std::getenv("GOW_XGKICK_IMMEDIATE");
++            value = (setting && std::strcmp(setting, "1") == 0) ? 1 : 0;
++            g_xgkickImmediate.store(value, std::memory_order_relaxed);
++        }
++        return value != 0;
++    }
++
+     constexpr uint8_t laneForComponent(uint32_t component)
+     {
+         return static_cast<uint8_t>(1u << (3u - component));
+@@ -971,8 +988,7 @@
+     // Opt-in packet snapshot, following Scotho/socom-unzipped's XGKICK workaround.
+     // Capture before later VU instructions re-template the source buffer. Keep
+     // the existing bounded parser and circular-memory handling in both modes.
+-    const char *immediate = std::getenv("GOW_XGKICK_IMMEDIATE");
+-    if (immediate && std::strcmp(immediate, "1") == 0)
++    if (xgkickImmediate())
+     {
+         m_xgkick.cycleCredit = 0x40000000u;
+         progressXgkick();
+@@ -1879,3 +1895,9 @@
+     if (useVuRounding && previousRoundingMode != -1)
+         std::fesetround(previousRoundingMode);
+ }
++
++// GOW-Port: volver a leer las variables de entorno de VU1 (las pruebas cambian GOW_XGKICK_IMMEDIATE).
++void ps2Vu1ReloadEnvironmentOptions()
++{
++    g_xgkickImmediate.store(-1, std::memory_order_relaxed);
++}
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -13,6 +13,8 @@
+ #include <string>
+ #include <vector>
+ 
++void ps2Vu1ReloadEnvironmentOptions(); // GOW-Port: ps2_vu1_core.cpp
++
+ namespace
+ {
+     constexpr uint32_t kVuUpperNop = 0x000002FFu;
+@@ -29,6 +31,7 @@
+             if (value) setenv("GOW_XGKICK_IMMEDIATE", value, 1);
+             else unsetenv("GOW_XGKICK_IMMEDIATE");
+ #endif
++            ps2Vu1ReloadEnvironmentOptions();
+         }
+         ScopedImmediateXgkick()
+         {
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -710,7 +710,10 @@
+                     {
+                         // GOW-Port: con PS2X_IOP_PC_EVERY, avisar de vez en cuando si el IOP esta ocioso.
+                         static unsigned long long idleCount = 0ULL;
+-                        if (std::getenv("PS2X_IOP_PC_EVERY") && (++idleCount % 200000ULL) == 1ULL)
++                        // GOW-Port: getenv recorre todo el entorno; en este bucle ocioso llegaba a ocupar
++                        // casi el 40 % del hilo del juego (ucrtbase!strchr). Se lee una sola vez.
++                        static const bool idleTrace = std::getenv("PS2X_IOP_PC_EVERY") != nullptr;
++                        if (idleTrace && (++idleCount % 200000ULL) == 1ULL)
+                         {
+                             std::ostringstream out;
+                             out << "[IOP:idle] sin hilos listos (veces=" << idleCount << ") instr=" << totalInstructions;

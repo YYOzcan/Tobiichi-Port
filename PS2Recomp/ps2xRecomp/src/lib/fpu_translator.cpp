@@ -53,12 +53,11 @@ namespace ps2recomp
             case COP1_S_MUL:
                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_DIV:
-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
-                                   ft, fd, fs, fd, fs, ft);
+                // GOW-Port: sin infinitos; dividir por cero da +/-FLT_MAX y pone D o I en FCR31 (fork de SotC, 8b51cb9).
+                return fmt::format("ctx->f[{}] = ps2FpuDivide(ctx->fcr31, ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_SQRT:
-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
+                // GOW-Port: R5900 codifica el radicando en FT; FS no es la fuente de SQRT.S.
+                return fmt::format("ctx->f[{}] = ps2FpuSqrt(ctx->fcr31, ctx->f[{}]);", fd, ft);
             case COP1_S_ABS:
                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
             case COP1_S_MOV:
@@ -76,7 +75,8 @@ namespace ps2recomp
             case COP1_S_CVT_W:
                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_RSQRT:
-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
+                // GOW-Port: RSQRT.S calcula FS/sqrt(FT), no la inversa de sqrt(FS).
+                return fmt::format("ctx->f[{}] = ps2FpuRsqrt(ctx->fcr31, ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_ADDA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
             case COP1_S_SUBA:

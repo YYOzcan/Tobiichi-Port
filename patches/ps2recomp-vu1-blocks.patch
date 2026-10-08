@@ -1,0 +1,457 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index cefe321..0b2dfaa 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -2,7 +2,9 @@
+ #define PS2_VU1_H
+ 
+ #include <array>
++#include <cmath>
+ #include <cstring>
++#include <limits>
+ #include <cstdint>
+ 
+ // GOW-Port: las funciones en línea de VU1 usan el mismo modo de coma flotante que ps2_vu1_*.cpp (sin
+@@ -12,6 +14,14 @@
+ #pragma fp_contract(off)
+ #endif
+ 
++// GOW-Port: funciones pequeñas que el código de VU1 generado debe expandir siempre (en funciones de bloque
++// grandes MSVC agota su presupuesto de expansión y las llama).
++#if defined(_MSC_VER)
++#define VU1_HOT_INLINE __forceinline
++#else
++#define VU1_HOT_INLINE inline __attribute__((always_inline))
++#endif
++
+ class GS;
+ class PS2Memory;
+ 
+@@ -230,6 +240,15 @@ private:
+         uint64_t issueCycle = 0;
+         bool active = false;
+         bool currentTagEop = false;
++
++        // GOW-Port: como *this = {} pero sin poner a cero los 64 KB de packet (solo se leen los bytes ya
++        // copiados: los GIFtags en copiedBytes y el envío hasta totalBytes <= copiedBytes).
++        void reset()
++        {
++            sourceAddress = totalBytes = copiedBytes = currentTagEnd = cycleCredit = 0u;
++            issueCycle = 0u;
++            active = currentTagEop = false;
++        }
+     };
+ 
+     static constexpr uint32_t kFmacLatency = 4u;
+@@ -352,14 +371,14 @@ private:
+     bool stepPair(const DecodedInstructionPair &decoded, StepContext &context);
+     // GOW-Port: versiones especializadas para el microcódigo compilado (ps2_vu1_compiled.inl).
+     template <uint32_t Upper, uint32_t C>
+-    void fmacLaneT(float &result, uint8_t &laneFlags);
++    void fmacLaneT(float &result, uint8_t &laneFlags, uint8_t &productFlags);
+     template <uint32_t Upper, bool DeadFlags>
+     void upperT();
+     template <uint32_t Lower>
+     void lowerT(StepContext &context, uint32_t upperInstr);
+     template <class T>
+     uint64_t readyCycleT() const;
+-    template <class T, bool DeadFlags>
++    template <class T, bool DeadFlags, bool Plain = false>
+     bool stepPairT(StepContext &context);
+     bool blockPreconditions(StepContext &context, uint32_t pc, const uint32_t *words, size_t bytes) const;
+     bool stepInterpreted(StepContext &context);
+@@ -368,7 +387,7 @@ private:
+     bool pipelinesPending() const;
+ 
+     // GOW-Port: en línea; se llama varias veces por instrucción (~9 % del tiempo de VU1 como llamada).
+-    float normalizeOperand(float value) const
++    VU1_HOT_INLINE float normalizeOperand(float value) const
+     {
+         uint32_t bits = 0;
+         std::memcpy(&bits, &value, sizeof(bits));
+@@ -384,7 +403,7 @@ private:
+     // por separado, |exacto - resultado| < 2^-23 (|producto| + |resultado|). Si el resultado es normal,
+     // no está cerca de los extremos (exponente 2..0xFD) y no es mucho menor que el producto (2^-20), el
+     // exacto tiene su mismo signo, no es cero y no desborda: el valor no cambia y los flags son el signo.
+-    static bool productSumFlagsFast(float result, float product, uint8_t &laneFlags)
++    static VU1_HOT_INLINE bool productSumFlagsFast(float result, float product, uint8_t &laneFlags)
+     {
+         uint32_t r = 0u, p = 0u;
+         std::memcpy(&r, &result, sizeof(r));
+@@ -396,6 +415,32 @@ private:
+         laneFlags = (r & 0x80000000u) != 0u ? 0x2u : 0u;
+         return true;
+     }
++    // GOW-Port: flags Z/S/U/O del producto exacto a*b (lo mismo que normalizeFmacExactResult sobre
++    // a*b en long double). El producto de dos float cabe exacto en un double. Si el producto ya
++    // redondeado es normal y lejos de los extremos (exponente 2..0xFD), el exacto no es cero, no desborda
++    // ni subdesborda y tiene su signo: los flags son solo el signo.
++    static VU1_HOT_INLINE uint8_t productStickyFlags(float a, float b, float rounded)
++    {
++        uint32_t bits = 0u;
++        std::memcpy(&bits, &rounded, sizeof(bits));
++        const uint32_t exponent = (bits >> 23) & 0xFFu;
++        if (exponent >= 2u && exponent <= 0xFDu)
++            return (bits & 0x80000000u) != 0u ? 0x2u : 0u;
++        return productStickyFlagsExact(a, b);
++    }
++    static uint8_t productStickyFlagsExact(float a, float b)
++    {
++        const double exact = static_cast<double>(a) * static_cast<double>(b);
++        const double magnitude = std::fabs(exact);
++        uint8_t flags = std::signbit(exact) ? 0x2u : 0u;
++        if (magnitude == 0.0)
++            flags |= 0x1u;
++        else if (magnitude > static_cast<double>(std::numeric_limits<float>::max()))
++            flags |= 0x8u;
++        else if (magnitude < static_cast<double>(std::numeric_limits<float>::min()))
++            flags |= 0x5u;
++        return flags;
++    }
+     float normalizeResult(float value, uint32_t &laneFlags) const;
+     uint32_t microAddressMask() const { return m_unit == Unit::VU1 ? 0x3FFFu : 0x0FFFu; }
+     int32_t readBranchVi(uint8_t reg) const;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl b/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl
+index b1ed790..2b7d4d9 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl
+@@ -125,6 +125,34 @@ namespace vu1c
+         }
+     }
+ 
++    // applyDest con la máscara constante.
++    template <uint32_t Dest>
++    VU1_STEP_INLINE void applyDestT(float *dst, const float *src)
++    {
++        if constexpr ((Dest & 8u) != 0u) dst[0] = src[0];
++        if constexpr ((Dest & 4u) != 0u) dst[1] = src[1];
++        if constexpr ((Dest & 2u) != 0u) dst[2] = src[2];
++        if constexpr ((Dest & 1u) != 0u) dst[3] = src[3];
++    }
++    // Especiales de la unidad superior sin flags MAC: ITOF0..15 (0x10-0x13), FTOI0..15 (0x14-0x17), ABS
++    // (0x1D) y CLIP (0x1F). Devuelve la especial o 0 si es otra instrucción.
++    constexpr uint32_t simpleSpecial(uint32_t upper)
++    {
++        if ((upper & 0x3Fu) < 0x3Cu)
++            return 0u;
++        const uint32_t special = (upper & 3u) | ((upper >> 4) & 0x7Cu);
++        return (special >= 0x10u && special <= 0x17u) || special == 0x1Du || special == 0x1Fu ? special : 0u;
++    }
++    // Igual que vuFloatToInt de ps2_vu1_upper.cpp.
++    inline int32_t floatToInt(float value, float scale)
++    {
++        const double scaled = static_cast<double>(value) * static_cast<double>(scale);
++        if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
++            return std::numeric_limits<int32_t>::max();
++        if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
++            return std::numeric_limits<int32_t>::min();
++        return static_cast<int32_t>(scaled);
++    }
+     constexpr uint32_t crossLeft(uint32_t c) { return c == 0 ? 1u : c == 1 ? 2u : c == 2 ? 0u : 3u; }
+     constexpr uint32_t crossRight(uint32_t c) { return c == 0 ? 2u : c == 1 ? 0u : c == 2 ? 1u : 3u; }
+ }
+@@ -132,7 +160,7 @@ namespace vu1c
+ // Una componente de una operación FMAC: calcula como execUpper (operandos normalizados, mismas expresiones
+ // en float) y aplica normalizeFmacResult a esa componente.
+ template <uint32_t Upper, uint32_t C>
+-VU1_STEP_INLINE void VU1Interpreter::fmacLaneT(float &result, uint8_t &laneFlags)
++VU1_STEP_INLINE void VU1Interpreter::fmacLaneT(float &result, uint8_t &laneFlags, uint8_t &productFlags)
+ {
+     constexpr vu1c::UpperInfo info = vu1c::classify(Upper);
+     constexpr uint32_t fs = (Upper >> 11) & 0x1Fu;
+@@ -165,6 +193,9 @@ VU1_STEP_INLINE void VU1Interpreter::fmacLaneT(float &result, uint8_t &laneFlags
+         float acc = 0.0f;
+         if constexpr (info.kind == vu1c::Kind::Madd || info.kind == vu1c::Kind::Msub || info.kind == vu1c::Kind::Opmsub)
+             acc = normalizeOperand(m_state.acc[C]);
++        // Bits pegajosos del producto (calculateFmacProductSticky), también en la componente 3 de OPMSUB.
++        if constexpr (info.kind == vu1c::Kind::Madd || info.kind == vu1c::Kind::Msub || info.kind == vu1c::Kind::Opmsub)
++            productFlags = productStickyFlags(vs, right, vs * right);
+ 
+         if constexpr (cross && C == 3u)
+             result = 0.0f;
+@@ -222,6 +253,68 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
+     {
+         m_currentUpperInstruction = Upper;
+     }
++    else if constexpr (constexpr uint32_t special = vu1c::simpleSpecial(Upper); special != 0u)
++    {
++        // Copia de los casos de execUpper (ps2_vu1_upper.cpp) con los campos resueltos.
++        m_currentUpperInstruction = Upper;
++        constexpr uint32_t dest = (Upper >> 21) & 0xFu;
++        constexpr uint32_t ft = (Upper >> 16) & 0x1Fu;
++        constexpr uint32_t fs = (Upper >> 11) & 0x1Fu;
++        if constexpr (special == 0x1Fu) // CLIP
++        {
++            uint32_t wBits = 0u;
++            std::memcpy(&wBits, &m_state.vf[ft][3], sizeof(wBits));
++            const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
++            const auto exceeds = [limit](float value, uint32_t signMask)
++            {
++                uint32_t bits = 0u;
++                std::memcpy(&bits, &value, sizeof(bits));
++                bits ^= signMask;
++                int32_t orderedBits = 0;
++                std::memcpy(&orderedBits, &bits, sizeof(orderedBits));
++                return orderedBits > limit;
++            };
++            uint32_t flags = 0u;
++            if (exceeds(m_state.vf[fs][0], 0x00000000u)) flags |= 0x01u;
++            if (exceeds(m_state.vf[fs][0], 0x80000000u)) flags |= 0x02u;
++            if (exceeds(m_state.vf[fs][1], 0x00000000u)) flags |= 0x04u;
++            if (exceeds(m_state.vf[fs][1], 0x80000000u)) flags |= 0x08u;
++            if (exceeds(m_state.vf[fs][2], 0x00000000u)) flags |= 0x10u;
++            if (exceeds(m_state.vf[fs][2], 0x80000000u)) flags |= 0x20u;
++            queueClip(flags);
++        }
++        else
++        {
++            float result[4];
++            for (uint32_t c = 0; c < 4u; ++c)
++            {
++                if constexpr (special <= 0x13u) // ITOF
++                {
++                    int32_t iv;
++                    std::memcpy(&iv, &m_state.vf[fs][c], 4);
++                    if constexpr (special == 0x10u)
++                        result[c] = static_cast<float>(iv);
++                    else if constexpr (special == 0x11u)
++                        result[c] = static_cast<float>(iv) / 16.0f;
++                    else if constexpr (special == 0x12u)
++                        result[c] = static_cast<float>(iv) / 4096.0f;
++                    else
++                        result[c] = static_cast<float>(iv) / 32768.0f;
++                }
++                else if constexpr (special <= 0x17u) // FTOI
++                {
++                    constexpr float scale = special == 0x14u ? 1.0f : special == 0x15u ? 16.0f : special == 0x16u ? 4096.0f : 32768.0f;
++                    const int32_t iv = vu1c::floatToInt(normalizeOperand(m_state.vf[fs][c]), scale);
++                    std::memcpy(&result[c], &iv, 4);
++                }
++                else // ABS
++                {
++                    result[c] = std::fabs(normalizeOperand(m_state.vf[fs][c]));
++                }
++            }
++            vu1c::applyDestT<dest>(m_state.vf[ft], result);
++        }
++    }
+     else if constexpr (info.kind == vu1c::Kind::Other)
+     {
+         execUpper(Upper);
+@@ -233,10 +326,11 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
+         constexpr uint32_t fd = (Upper >> 6) & 0x1Fu;
+         float result[4]{};
+         uint8_t laneFlags[4]{};
+-        if constexpr ((dest & 8u) != 0u) fmacLaneT<Upper, 0>(result[0], laneFlags[0]);
+-        if constexpr ((dest & 4u) != 0u) fmacLaneT<Upper, 1>(result[1], laneFlags[1]);
+-        if constexpr ((dest & 2u) != 0u) fmacLaneT<Upper, 2>(result[2], laneFlags[2]);
+-        if constexpr ((dest & 1u) != 0u) fmacLaneT<Upper, 3>(result[3], laneFlags[3]);
++        uint8_t productFlags[4]{};
++        if constexpr ((dest & 8u) != 0u) fmacLaneT<Upper, 0>(result[0], laneFlags[0], productFlags[0]);
++        if constexpr ((dest & 4u) != 0u) fmacLaneT<Upper, 1>(result[1], laneFlags[1], productFlags[1]);
++        if constexpr ((dest & 2u) != 0u) fmacLaneT<Upper, 2>(result[2], laneFlags[2], productFlags[2]);
++        if constexpr ((dest & 1u) != 0u) fmacLaneT<Upper, 3>(result[3], laneFlags[3], productFlags[3]);
+         if constexpr (info.kind != vu1c::Kind::Max && info.kind != vu1c::Kind::Mini)
+         {
+             if constexpr (dest != 0u)
+@@ -245,7 +339,7 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
+                 // antes de que nadie pueda leer estos. Con m_statusQuiet solo cuentan sus bits pegajosos,
+                 // que el estado acumula en cualquier orden (y quedan igual al final del bloque).
+                 // GOW-Port: no leer status ahora no hace muertos sus bits persistentes.
+-                const uint32_t productSticky = calculateFmacProductSticky(static_cast<uint8_t>(dest));
++                const uint32_t productSticky = (productFlags[0] | productFlags[1] | productFlags[2] | productFlags[3]) & 0xFu;
+                 if (DeadFlags && m_statusQuiet)
+                     m_state.status |= static_cast<uint32_t>((laneFlags[0] | laneFlags[1] | laneFlags[2] | laneFlags[3] | productSticky) & 0xFu) << 6;
+                 else
+@@ -292,7 +386,7 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
+         {
+             float tmp[4];
+             std::memcpy(tmp, vuData + addr, 16);
+-            applyDest(m_state.vf[ft], tmp, dest);
++            vu1c::applyDestT<dest>(m_state.vf[ft], tmp);
+         }
+     }
+     else if constexpr (opHi == 0x01u) // SQ
+@@ -401,12 +495,12 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
+     {
+         float tmp[4];
+         std::memcpy(tmp, m_state.vf[fs], 16);
+-        applyDest(m_state.vf[ft], tmp, dest);
++        vu1c::applyDestT<dest>(m_state.vf[ft], tmp);
+     }
+     else if constexpr (opHi == 0x40u && funct >= 0x3Cu && funct2 == 0x31u) // MR32
+     {
+         float tmp[4] = {m_state.vf[fs][1], m_state.vf[fs][2], m_state.vf[fs][3], m_state.vf[fs][0]};
+-        applyDest(m_state.vf[ft], tmp, dest);
++        vu1c::applyDestT<dest>(m_state.vf[ft], tmp);
+     }
+     else if constexpr (opHi == 0x40u && funct >= 0x3Cu && funct2 == 0x34u) // LQI
+     {
+@@ -416,7 +510,7 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
+         {
+             float tmp[4];
+             std::memcpy(tmp, vuData + addr, 16);
+-            applyDest(m_state.vf[ft], tmp, dest);
++            vu1c::applyDestT<dest>(m_state.vf[ft], tmp);
+         }
+         if constexpr (viS != 0)
+             m_state.vi[viS] = static_cast<int16_t>(m_state.vi[viS] + 1);
+@@ -453,7 +547,7 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
+         result[1] = result[0];
+         result[2] = result[0];
+         result[3] = result[0];
+-        applyDest(m_state.vf[ft], result, dest);
++        vu1c::applyDestT<dest>(m_state.vf[ft], result);
+     }
+     else
+     {
+@@ -530,7 +624,7 @@ VU1_STEP_INLINE uint64_t VU1Interpreter::readyCycleT() const
+     return ready;
+ }
+ 
+-template <class T, bool DeadFlags>
++template <class T, bool DeadFlags, bool Plain>
+ VU1_STEP_INLINE bool VU1Interpreter::stepPairT(StepContext &context)
+ {
+     constexpr const DecodedInstructionPair &k = T::value;
+@@ -638,6 +732,21 @@ VU1_STEP_INLINE bool VU1Interpreter::stepPairT(StepContext &context)
+     m_state.vf[0][3] = 1.0f;
+     m_state.vi[0] = 0;
+ 
++    // Plain: par intermedio de un bloque que no salta ni termina. blockPreconditions garantiza que al
++    // entrar no había salto, bit E ni final pendientes, y solo el último par del bloque puede crearlos, así
++    // que basta con avanzar el PC (el par siguiente está en el bloque, sin pasar del final de la memoria).
++    if constexpr (Plain)
++    {
++        m_state.pc += 8u;
++        ++m_cycle;
++        m_state.cycles = m_cycle;
++        if (m_cycle >= m_nextCommitCycle)
++            commitReadyPipelines();
++        if (m_xgkick.active)
++            progressXgkick();
++        return true;
++    }
++
+     uint32_t nextPc = m_state.pc + 8u;
+     if (nextPc >= context.codeSize)
+         nextPc = 0u;
+@@ -700,8 +809,8 @@ struct VU1CompiledAccess
+     using P = VU1Interpreter::DecodedInstructionPair;
+     using C = VU1Interpreter::StepContext;
+     using Pipeline = VU1Interpreter::Pipeline;
+-    template <class T, bool DeadFlags>
+-    static VU1_STEP_INLINE bool step(VU1Interpreter &vu, C &c) { return vu.stepPairT<T, DeadFlags>(c); }
++    template <class T, bool DeadFlags, bool Plain = false>
++    static VU1_STEP_INLINE bool step(VU1Interpreter &vu, C &c) { return vu.stepPairT<T, DeadFlags, Plain>(c); }
+     static bool interpret(VU1Interpreter &vu, C &c) { return vu.stepInterpreted(c); }
+     static uint32_t pc(const VU1Interpreter &vu) { return vu.m_state.pc; }
+     static bool block(const VU1Interpreter &vu, C &c, uint32_t pc, const uint32_t *words, size_t bytes)
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 31d5df7..76e9a72 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -115,7 +115,7 @@ void VU1Interpreter::resetScheduler()
+     m_accWritePipeline = {};
+     m_storePending = m_vfPending = m_viPending = m_accPending = 0u;
+     m_flagHead = m_flagCount = 0u;
+-    m_xgkick = {};
++    m_xgkick.reset();
+     m_vfReady = {};
+     m_viReady = {};
+     m_accReady = {};
+@@ -603,9 +603,7 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+             right = normalizeOperand(m_state.vf[ft][component]);
+         }
+ 
+-        float product = left * right;
+-        const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
+-        const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
++        const uint8_t productFlags = productStickyFlags(left, right, left * right);
+         // Product-sum instructions report Z/S/U/O from the add/subtract result
+         // as current flags, while every product condition accumulates into the
+         // corresponding sticky flag.
+@@ -675,7 +673,8 @@ VU1Interpreter::FlagPipelineEntry *VU1Interpreter::pushFlagEntry()
+         return nullptr;
+     FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + m_flagCount) % kMaxFlagEntries];
+     ++m_flagCount;
+-    entry = {};
++    entry.mac = entry.status = entry.extraSticky = entry.clip = 0u;
++    entry.writesMac = entry.writesStatus = entry.writesSticky = entry.writesClip = false;
+     entry.valid = true;
+     entry.issueCycle = m_cycle;
+     entry.readyCycle = m_cycle + kFmacLatency;
+@@ -862,6 +861,34 @@ void VU1Interpreter::commitReadyPipelines()
+ {
+     if (m_cycle < m_nextCommitCycle)
+         return;
++    // GOW-Port: caso frecuente (código FMAC denso con escrituras directas): solo hay flags pendientes.
++    // Se confirman en orden y el siguiente ciclo es el de la cabeza de la cola, como en el caso general.
++    if ((m_storePending | m_vfPending | m_viPending | m_accPending) == 0u && !m_fdiv.valid &&
++        !m_efu[0].valid && !m_efu[1].valid)
++    {
++        while (m_flagCount != 0u)
++        {
++            FlagPipelineEntry &entry = m_flagPipeline[m_flagHead];
++            if (entry.readyCycle > m_cycle)
++                break;
++            m_flagHead = (m_flagHead + 1u) % kMaxFlagEntries;
++            --m_flagCount;
++            if (entry.writesMac)
++                m_state.mac = entry.mac;
++            if (entry.writesStatus)
++            {
++                const uint32_t current = entry.status & 0xFu;
++                m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
++            }
++            if (entry.writesSticky)
++                m_state.status = (m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
++            if (entry.writesClip)
++                m_state.clip = entry.clip;
++            entry.valid = false;
++        }
++        m_nextCommitCycle = m_flagCount != 0u ? m_flagPipeline[m_flagHead].readyCycle : ~0ull;
++        return;
++    }
+     while (m_flagCount != 0u)
+     {
+         FlagPipelineEntry &entry = m_flagPipeline[m_flagHead];
+@@ -883,7 +910,7 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         if (entry.writesClip)
+             m_state.clip = entry.clip;
+-        entry = {};
++        entry.valid = false; // GOW-Port: pushFlagEntry inicializa todos los campos
+     }
+ 
+     if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
+@@ -1022,11 +1049,15 @@ void VU1Interpreter::progressXgkick()
+         }
+ 
+         const uint32_t qwordOffset = m_xgkick.copiedBytes;
+-        for (uint32_t i = 0; i < 16u; ++i)
+-        {
+-            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
+-            m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
+-        }
++        const uint32_t first = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
++        if (first + 16u <= m_activeVuDataSize) // GOW-Port: un qword sin dar la vuelta, de una vez
++            std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + first, 16u);
++        else
++            for (uint32_t i = 0; i < 16u; ++i)
++            {
++                const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
++                m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
++            }
+         m_xgkick.copiedBytes += 16u;
+ 
+         if (m_xgkick.currentTagEnd == 0u)
+@@ -1113,7 +1144,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+         return;
+ 
+     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
+-    m_xgkick = {};
++    m_xgkick.reset();
+     m_xgkick.active = true;
+     m_xgkick.sourceAddress = sourceAddress;
+     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.

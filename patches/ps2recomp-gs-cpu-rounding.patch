@@ -1,0 +1,106 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -21,11 +21,30 @@
+ #include <fstream>
+ #include <iostream>
+ #include <stdexcept>
++#include <xmmintrin.h>
+ 
+ using namespace GSInternal;
+ 
+ namespace
+ {
++    // GOW-Port: el GS es independiente del modo SSE que usa EE/VU al enviar.
++    // Mantener el redondeo habitual del rasterizador aproximado, también con hilo;
++    // no modificar FTZ/DAZ, máscaras ni el redondeo del código que nos llamó.
++    class GSCpuRoundingScope
++    {
++        const unsigned rounding = _mm_getcsr() & _MM_ROUND_MASK;
++    public:
++        GSCpuRoundingScope()
++        {
++            if (rounding != _MM_ROUND_NEAREST)
++                _mm_setcsr(_mm_getcsr() & ~_MM_ROUND_MASK);
++        }
++        ~GSCpuRoundingScope()
++        {
++            if (rounding != _MM_ROUND_NEAREST)
++                _mm_setcsr((_mm_getcsr() & ~_MM_ROUND_MASK) | rounding);
++        }
++    };
+     float fabsQ(float q)
+     {
+         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
+@@ -596,6 +615,7 @@
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || batch.vertexCount == 0u)
+         return;
++    const GSCpuRoundingScope rounding;
+     DrawPrimitive(batch);
+ }
+ 
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -13,9 +13,51 @@
+ #include <memory>
+ #include <thread>
+ #include <vector>
++#include <xmmintrin.h>
+ 
+ namespace
+ {
++    // GOW-Port: el GS recibe datos, no debe heredar el redondeo SSE del EE/VU.
++    void cpuRoundingIndependent(TestCase &t, bool threaded)
++    {
++        struct Restore { unsigned csr=_mm_getcsr(); ~Restore(){_mm_setcsr(csr);} } restore;
++        auto render=[&](unsigned mode,unsigned fixture) {
++            _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
++            std::unique_ptr<GSRasterBackend> backend=std::make_unique<GSCpuBackend>();
++            if(threaded) backend=std::make_unique<GSThreadedBackend>(std::move(backend));
++            backend->Initialize(vram.data(),uint32_t(vram.size()));
++            GSPrimitiveBatch b{}; b.vertexCount=3; b.state.prim.type=GS_PRIM_TRIANGLE;
++            b.state.context.frame.fbw=1; b.state.context.scissor={0,63,0,63};
++            b.state.context.zbuf.zmask=true; b.state.context.test=1ull<<17; b.state.colclamp=1;
++            b.vertices[0].x=20;b.vertices[0].y=20;b.vertices[1].x=37;b.vertices[1].y=20;b.vertices[2].x=20;b.vertices[2].y=39;
++            for(auto &v:b.vertices) {v.a=128;v.r=128;v.g=128;v.b=128;v.z=7;}
++            if(fixture==0) {
++                b.state.prim.iip=true;b.vertices[0].r=0;b.vertices[1].r=17;b.vertices[2].r=19;
++            } else {
++                b.state.prim.tme=true;b.state.prim.fst=fixture==1;
++                auto &tex=b.state.context.tex0;tex.tbp0=256;tex.tbw=1;tex.tw=6;tex.th=6;tex.tfx=1;tex.tcc=1;
++                for(unsigned y=0;y<64;++y) for(unsigned x=0;x<64;++x)
++                    backend->WriteVram(0,256,1,x,y,0x80000000u|(x*3u)|((y*3u)<<8)|(((x+y)*2u)<<16));
++                b.vertices[1].u=272;b.vertices[2].v=304;
++                const float q[]={1.5f,2.0f,1.0f};
++                for(unsigned i=0;i<3;++i) {
++                    b.vertices[i].q=q[i];b.vertices[i].s=q[i]*(i==1?.75f:.25f);b.vertices[i].t=q[i]*(i==2?.75f:.25f);
++                }
++            }
++            const unsigned before=(_mm_getcsr() & ~_MM_ROUND_MASK) | mode;
++            _mm_setcsr(before);backend->Submit(b);backend->Sync(GSSyncReason::Finish);
++            const unsigned control=_MM_ROUND_MASK|_MM_MASK_MASK|_MM_FLUSH_ZERO_MASK|0x40u;
++            t.IsTrue((_mm_getcsr()&control)==(before&control),"Submit conserva redondeo, mascaras y FTZ/DAZ del llamador");
++            _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++            std::vector<uint8_t> out;backend->SnapshotVram(out);return out;
++        };
++        for(unsigned fixture=0;fixture<3;++fixture) {
++            const auto expected=render(_MM_ROUND_NEAREST,fixture);
++            for(unsigned mode:{_MM_ROUND_NEAREST,_MM_ROUND_TOWARD_ZERO,_MM_ROUND_UP,_MM_ROUND_DOWN})
++                t.IsTrue(render(mode,fixture)==expected,"Gradiente/UV/STQ conserva VRAM con cualquier redondeo SSE del productor");
++        }
++    }
+     struct Recording
+     {
+         std::vector<int> events;
+@@ -482,6 +524,8 @@
+ void register_ps2_gs_backend_tests()
+ {
+     MiniTest::Case("GOW GS backends", [](TestCase &t) {
++        t.Run("CPU drawing is independent of caller SSE rounding",[](TestCase &t) {cpuRoundingIndependent(t,false);});
++        t.Run("Threaded CPU drawing is independent of producer SSE rounding",[](TestCase &t) {cpuRoundingIndependent(t,true);});
+         // GOW-Port: exportación CPU adaptada de SotC ac9efa0 para repetir comandos GS.
+         t.Run("CPU and threaded CPU restore an incomplete CT24 transfer",[](TestCase &t) {
+             for(bool threaded:{false,true}) {

@@ -1,0 +1,146 @@
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_backend.cpp
+@@ -28,12 +28,29 @@
+ #include <thread>
+ #include <filesystem>
+ #include <fstream>
++#include <xmmintrin.h>
+ 
+ using namespace GSGL;
+ using namespace GSCpuInternal;
+ 
+ namespace
+ {
++    // GOW-Port: la preparación GS conserva el redondeo del productor EE/VU.
++    class GSGpuRoundingScope
++    {
++        const unsigned rounding = _mm_getcsr() & _MM_ROUND_MASK;
++    public:
++        GSGpuRoundingScope()
++        {
++            if (rounding != _MM_ROUND_NEAREST)
++                _mm_setcsr(_mm_getcsr() & ~_MM_ROUND_MASK);
++        }
++        ~GSGpuRoundingScope()
++        {
++            if (rounding != _MM_ROUND_NEAREST)
++                _mm_setcsr((_mm_getcsr() & ~_MM_ROUND_MASK) | rounding);
++        }
++    };
+     // GOW-Port: el frontend existente consume filas de 640 píxeles, incluso con CRTC menor.
+     PresentationFrame gowPresentationRows(PresentationFrame frame)
+     {
+@@ -1935,6 +1952,8 @@
+         }
+         p[9] = static_cast<uint32_t>(tri.winding);
+         p[10] = fbits(static_cast<float>(tri.invArea));
++        // GOW-Port: conservar el recíproco double; p[33..34] estaban libres.
++        std::memcpy(p + 33, &tri.invArea, sizeof(tri.invArea));
+         std::memcpy(p + 11, &v0.z, 8u);
+         std::memcpy(p + 13, &v1.z, 8u);
+         std::memcpy(p + 15, &v2.z, 8u);
+@@ -2514,6 +2533,7 @@
+     Impl &d = *m_impl;
+     if (batch.vertexCount == 0u || !d.ensure())
+         return;
++    const GSGpuRoundingScope rounding;
+     ++d.contentRevision;
+     switch (batch.state.prim.type)
+     {
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+@@ -712,10 +712,10 @@
+         vy[i] = int(pw(p, 4u + i * 2u));
+     }
+     int sgn = int(pw(p, 9u));
+-    float invArea = pf(p, 10u);
++    double invArea = pd(p, 33u);
+     int sx = x * 16;
+     int sy = y * 16;
+-    float e[3];
++    double e[3];
+     for (uint i = 0u; i < 3u; ++i)
+     {
+         uint a = (i + 1u) % 3u;
+@@ -733,11 +733,14 @@
+         bool zero = hi == 0 && lo == 0u;
+         if (!(positive || (zero && bias)))
+             return;
+-        e[i] = float(hi) * 4294967296.0 + float(lo);
+-    }
+-    float w0 = e[0] * invArea;
+-    float w1 = e[1] * invArea;
+-    float w2 = e[2] * invArea;
++        // GOW-Port: el edge del dominio GS conserva sus bits antes de ponderar.
++        e[i] = double(hi) * 4294967296.0 + double(lo);
++    }
++    // GOW-Port: mismo redondeo final a float que CPU, sin recíproco float intermedio.
++    precise double weighted1 = e[1] * invArea;
++    precise double weighted2 = e[2] * invArea;
++    float w1 = float(weighted1);
++    float w2 = float(weighted2);
+ 
+     double z0 = pd(p, 11u);
+     double z1 = pd(p, 13u);
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -58,6 +58,46 @@
+                 t.IsTrue(render(mode,fixture)==expected,"Gradiente/UV/STQ conserva VRAM con cualquier redondeo SSE del productor");
+         }
+     }
++
++    // GOW-Port: conservar los bits de profundidad al convertir areas grandes en pesos.
++    void gpuTrianglePrecision(TestCase &t, bool hardware)
++    {
++        struct Restore {unsigned csr=_mm_getcsr();~Restore(){_mm_setcsr(csr);}} restore;
++        _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++        std::vector<uint8_t> cpuVram(GSSwizzle::kMemorySize), gpuVram(cpuVram.size());
++        GSCpuBackend cpu; cpu.Initialize(cpuVram.data(),uint32_t(cpuVram.size()));
++        auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();raw->SetHardwareRasterAllowed(hardware);
++        GSThreadedBackend gl(std::move(gpu));gl.Initialize(gpuVram.data(),uint32_t(gpuVram.size()));
++        if(dynamic_cast<GSGpuBackend*>(&gl.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
++        const std::vector<uint8_t> zeros(64u*64u*4u);
++        for(unsigned extent:{3071u,4095u}) for(unsigned offset:{0u,256u})
++        for(uint8_t psm:{uint8_t(GS_PSM_Z32),uint8_t(GS_PSM_Z24)}) {
++            GSPrimitiveBatch b{}; b.vertexCount=3;b.state.prim.type=GS_PRIM_TRIANGLE;
++            auto &c=b.state.context;c.frame.fbw=1;c.scissor={0,63,0,63};
++            c.xyoffset={uint16_t(offset*16u),uint16_t(offset*16u)};
++            c.zbuf.zbp=32;c.zbuf.psm=psm;c.test=1ull<<17;b.state.colclamp=1;
++            b.vertices[1].x=float(extent);b.vertices[2].y=float(extent);
++            for(auto &v:b.vertices){v.r=128;v.g=128;v.b=128;v.a=128;v.z=7;}
++            b.vertices[1].z=4294967295.0;b.vertices[2].z=2147483647.0;
++            GSTransferCommand clear{};clear.direction=0;clear.bitbltbuf.dbp=32u*32u;
++            clear.bitbltbuf.dbw=1;clear.bitbltbuf.dpsm=GS_PSM_Z32;clear.trxreg={64,64};
++            auto render=[&](GSRasterBackend &backend){
++                backend.ClearFramebuffer(c,0);backend.BeginTransfer(clear);backend.UploadImage(zeros.data(),uint32_t(zeros.size()));
++                backend.Submit(b);backend.Sync(GSSyncReason::DebugReadback);
++                std::vector<uint8_t> out;backend.SnapshotVram(out);return out;
++            };
++            const auto expected=render(cpu);
++            for(unsigned mode:{_MM_ROUND_NEAREST,_MM_ROUND_TOWARD_ZERO,_MM_ROUND_UP,_MM_ROUND_DOWN}) {
++                const unsigned before=(restore.csr & ~_MM_ROUND_MASK)|mode;_mm_setcsr(before);
++                const auto actual=render(gl);
++                const unsigned control=_MM_ROUND_MASK|_MM_MASK_MASK|_MM_FLUSH_ZERO_MASK|0x40u;
++                t.IsTrue((_mm_getcsr()&control)==(before&control),"OpenGL conserva los controles SSE del productor");
++                _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++                t.IsTrue(actual==expected,"Z32/Z24 coincide con CPU para areas grandes, XYOFFSET y los cuatro modos SSE");
++            }
++        }
++    }
++
+     struct Recording
+     {
+         std::vector<int> events;
+@@ -1042,6 +1082,9 @@
+         const char *gpu=std::getenv("GOW_GS_GPU_TEST");
+         if(gpu && *gpu && *gpu!='0')
+         {
++            t.Run("OpenGL triangle depth keeps large-area precision independently of SSE",[](TestCase &t){
++                gpuTrianglePrecision(t,false);gpuTrianglePrecision(t,true);
++            });
+             t.Run("OpenGL compute agrees with synthetic CPU fixture",[](TestCase &t){gpuComparison(t,false);});
+             t.Run("OpenGL hardware or compute fallback agrees with CPU fixture",[](TestCase &t){gpuComparison(t,true);});
+             t.Run("OpenGL CT24 and Z24 retain pixels across every upload byte cut",[](TestCase &t){

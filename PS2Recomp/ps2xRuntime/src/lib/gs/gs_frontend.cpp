@@ -1,11 +1,16 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+// GOW-Port: CPU de referencia por defecto; OpenGL/cola seleccionables.
+#include "runtime/gs/gs_threaded_backend.h"
 #include "ps2_log.h"
+#include "runtime/ps2_perf.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -106,7 +111,7 @@ namespace
 
 
 GS::GS()
-    : m_backend(std::make_unique<GSCpuBackend>())
+    : m_backend(GSThreadedBackend::MakeDefault())
 {
     reset();
 }
@@ -117,7 +122,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
     if (!m_backend)
-        m_backend = std::make_unique<GSCpuBackend>();
+        m_backend = GSThreadedBackend::MakeDefault();
     m_backend->Initialize(vram, vramSize);
     reset();
 }
@@ -126,6 +131,7 @@ void GS::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::memset(m_ctx, 0, sizeof(m_ctx));
+    m_gifInput = {}; // GOW-Port: reset tambien descarta etiquetas/registros incompletos.
     m_prim = {};
     m_primRegister = {};
     m_prmodeRegister = {};
@@ -638,18 +644,29 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
-void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+// GOW-Port: los atajos nativos solo son validos al comienzo de una etiqueta de este PATH.
+bool GS::hasPendingGIFPacket(GifPathId path) const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    if (!data || sizeBytes < 16 || !m_backend)
+    const size_t index = static_cast<size_t>(path);
+    return index == 0u || index >= m_gifInput.size() || m_gifInput[index].pending();
+}
+
+void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, GifPathId path)
+{
+    ps2_perf::Scope perf(ps2_perf::Bucket::Gs); // GOW-Port: incluye rasterizado y transferencias GIF.
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    const size_t pathIndex = static_cast<size_t>(path);
+    if (!data || !sizeBytes || !m_backend || pathIndex == 0u || pathIndex >= m_gifInput.size())
         return;
 
-    if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+    auto &input = m_gifInput[pathIndex];
+    if (!input.pending() && tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
-        if (packetIndex < 48u)
+        if (packetIndex < 48u && sizeBytes >= 16u)
         {
             const uint64_t tagLo = loadLE64(data);
             const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
@@ -668,78 +685,92 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
     });
 
-    uint32_t offset = 0;
-    while (offset + 16 <= sizeBytes)
+    // GOW-Port: como maximo se retienen 15 bytes por PATH, mas el cursor de la etiqueta.
+    // No reiniciar Q/PRE ni perder el indice de registro al llegar otro fragmento.
+    uint32_t offset = 0u;
+    while (offset < sizeBytes)
     {
-        uint64_t tagLo = loadLE64(data + offset);
-        uint64_t tagHi = loadLE64(data + offset + 8);
-        offset += 16;
-
-        m_curQ = 1.0f;
-
-        uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFF);
-        uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3);
-        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
-        if (nreg == 0)
-            nreg = 16;
-
-        recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
-
-        bool pre = ((tagLo >> 46) & 1) != 0;
-        if (pre)
+        if (input.imageBytes && !input.partialBytes && sizeBytes - offset >= 16u)
         {
-            writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
+            // Mantener las subidas contiguas grandes; no llamar al backend por cada quadword.
+            const uint32_t bytes = std::min(input.imageBytes, sizeBytes - offset) & ~15u;
+            processImageData(data + offset, bytes);
+            input.imageBytes -= bytes;
+            offset += bytes;
+            continue;
+        }
+        if (!input.registersLeft && input.paddingBytes)
+        {
+            const uint32_t bytes = std::min(input.paddingBytes, sizeBytes - offset);
+            input.paddingBytes -= bytes;
+            offset += bytes;
+            continue;
         }
 
-        uint8_t regs[16];
-        for (uint32_t i = 0; i < nreg; ++i)
-            regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
-
-        if (flg == GIF_FMT_PACKED)
+        const bool header = !input.registersLeft && !input.imageBytes;
+        const uint32_t unitBytes = !header && input.format == GIF_FMT_REGLIST ? 8u : 16u;
+        const uint8_t *unit = nullptr;
+        if (!input.partialBytes && sizeBytes - offset >= unitBytes)
         {
-            for (uint32_t loop = 0; loop < nloop; ++loop)
+            unit = data + offset;
+            offset += unitBytes;
+        }
+        else
+        {
+            const uint32_t bytes = std::min(unitBytes - input.partialBytes, sizeBytes - offset);
+            std::memcpy(input.partial.data() + input.partialBytes, data + offset, bytes);
+            input.partialBytes += bytes;
+            offset += bytes;
+            if (input.partialBytes < unitBytes) break;
+            unit = input.partial.data();
+            input.partialBytes = 0u;
+        }
+
+        if (header)
+        {
+            const uint64_t tagLo = loadLE64(unit), tagHi = loadLE64(unit + 8u);
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            input.format = static_cast<uint8_t>((tagLo >> 58u) & 0x3u);
+            input.nreg = static_cast<uint32_t>((tagLo >> 60u) & 0xFu);
+            if (!input.nreg) input.nreg = 16u;
+            input.regIndex = 0u;
+            recordGifTagDebugEventUnlocked(sizeBytes, nloop, input.format, input.nreg);
+            if (!nloop) continue; // NLOOP=0 conserva PRIM, vertices y Q.
+            m_curQ = 1.0f;
+            if (input.format == GIF_FMT_PACKED && ((tagLo >> 46u) & 1u))
+                writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47u) & 0x7FFu);
+            for (uint32_t i = 0u; i < input.nreg; ++i)
+                input.regs[i] = static_cast<uint8_t>((tagHi >> (i * 4u)) & 0xFu);
+            if (input.format == GIF_FMT_PACKED || input.format == GIF_FMT_REGLIST)
             {
-                for (uint32_t r = 0; r < nreg; ++r)
-                {
-                    if (offset + 16 > sizeBytes)
-                        return;
-                    uint64_t lo = loadLE64(data + offset);
-                    uint64_t hi = loadLE64(data + offset + 8);
-                    offset += 16;
-                    writeRegisterPacked(regs[r], lo, hi);
-                }
+                input.registersLeft = nloop * input.nreg;
+                input.paddingBytes = input.format == GIF_FMT_REGLIST && (input.registersLeft & 1u) ? 8u : 0u;
             }
+            // GOW-Port: IMAGE2 consume tambien su payload, sin aplicar PRE.
+            else if (input.format == GIF_FMT_IMAGE || input.format == GIF_FMT_IMAGE2)
+                input.imageBytes = nloop * 16u;
         }
-        else if (flg == GIF_FMT_REGLIST)
+        else if (input.imageBytes)
         {
-            for (uint32_t loop = 0; loop < nloop; ++loop)
-            {
-                for (uint32_t r = 0; r < nreg; ++r)
-                {
-                    if (offset + 8 > sizeBytes)
-                        return;
-                    writeRegisterUnlocked(regs[r], loadLE64(data + offset));
-                    offset += 8;
-                }
-            }
-            if ((nloop * nreg) & 1)
-                offset += 8;
+            processImageData(unit, 16u);
+            input.imageBytes -= 16u;
         }
-        else if (flg == GIF_FMT_IMAGE)
+        else
         {
-            uint32_t imageBytes = nloop * 16;
-            if (offset + imageBytes > sizeBytes)
-                imageBytes = sizeBytes - offset;
-            processImageData(data + offset, imageBytes);
-            offset += imageBytes;
+            if (input.format == GIF_FMT_PACKED)
+                writeRegisterPacked(input.regs[input.regIndex], loadLE64(unit), loadLE64(unit + 8u));
+            else
+                writeRegisterUnlocked(input.regs[input.regIndex], loadLE64(unit));
+            if (++input.regIndex == input.nreg) input.regIndex = 0u;
+            --input.registersLeft;
         }
     }
 }
 
-bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes, GifPathId path)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    if (!data || sizeBytes < 16u || !m_backend)
+    if (!data || sizeBytes < 16u || !m_backend || hasPendingGIFPacket(path))
         return false;
 
     if (!validatePackedGifPacket(data, sizeBytes))
@@ -747,9 +778,12 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
                                                 {
-        m_curQ = 1.0f;
-
         recordGifTagDebugEventUnlocked(sizeBytes, tag.nloop, GIF_FMT_PACKED, tag.nreg);
+
+        // GOW-Port: aplicar la misma regla NLOOP=0 en la ruta nativa validada.
+        if (tag.nloop == 0u)
+            return true;
+        m_curQ = 1.0f;
 
         const bool pre = ((tag.lo >> 46u) & 1u) != 0u;
         if (pre)
@@ -781,9 +815,18 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxreg,
                            uint64_t trxdir,
                            const uint8_t *data,
-                           uint32_t sizeBytes)
+                           uint32_t sizeBytes,
+                           uint64_t setupGifTag)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    // GOW-Port: DMA valida toda la cadena antes de aplicar PRE/Q, bajo el mismo lock que la subida.
+    if (data && sizeBytes && m_backend && (setupGifTag & 0x7FFFu) &&
+        ((setupGifTag >> 58u) & 3u) == GIF_FMT_PACKED)
+    {
+        m_curQ = 1.0f;
+        if ((setupGifTag >> 46u) & 1u)
+            writeRegisterUnlocked(GS_REG_PRIM, (setupGifTag >> 47u) & 0x7FFu);
+    }
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
 
@@ -860,7 +903,7 @@ bool GS::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeByt
     const uint64_t imageTagLo = loadLE64(data + offset);
     const uint8_t imageFlg = static_cast<uint8_t>((imageTagLo >> 58u) & 0x3u);
     const uint32_t imageNloop = static_cast<uint32_t>(imageTagLo & 0x7FFFu);
-    if (imageFlg != GIF_FMT_IMAGE || imageNloop == 0u)
+    if ((imageFlg != GIF_FMT_IMAGE && imageFlg != GIF_FMT_IMAGE2) || imageNloop == 0u)
         return false;
 
     offset += 16u;
@@ -871,6 +914,11 @@ bool GS::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeByt
     if (offset + imageBytes != sizeBytes)
         return false;
 
+    // GOW-Port: el atajo conserva los efectos de las etiquetas no vacias del parser general.
+    // Solo PRE del setup PACKED cambia PRIM; PRE de IMAGE no tiene efecto.
+    m_curQ = 1.0f;
+    if ((setupTagLo & (1ull << 46u)) != 0u)
+        writeRegisterUnlocked(GS_REG_PRIM, (setupTagLo >> 47u) & 0x7FFu);
     uploadImageNativeUnlocked(regs[0], regs[1], regs[2], regs[3], data + offset, imageBytes);
     return true;
 }
@@ -966,7 +1014,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
-        vtx.z = static_cast<float>(z);
+        // GOW-Port: XYZ2 trae Z32; float pierde bits y redondea UINT32_MAX a 2^32.
+        vtx.z = static_cast<double>(z);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1031,7 +1080,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
-        vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
+        // GOW-Port: XYZ3 conserva la misma profundidad Z32 aunque no lance el dibujo.
+        vtx.z = static_cast<double>(hi & 0xFFFFFFFF);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1478,7 +1528,9 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         if (m_backend)
         {
-            m_backend->Flush();
+            static const bool finishAsync = [] { const char *v = std::getenv("GOW_GS_FINISH_ASINCRONO"); return v && v[0] == '1'; }();
+            if (!finishAsync)
+                m_backend->Flush();
             m_backend->Sync(GSSyncReason::Finish);
         }
         if (m_privRegs)
@@ -1526,6 +1578,32 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 
 void GS::vertexKick(bool drawing)
 {
+    // GOW-Port: PS2X_GS_TRACE_TBP=<tbp0> registra los vertices que llegan con esa textura activa.
+    {
+        static const long traceTbp = []
+        {
+            const char *v = std::getenv("PS2X_GS_TRACE_TBP");
+            return v ? std::strtol(v, nullptr, 10) : -1L;
+        }();
+        static int traced = 0;
+        // PS2X_GS_TRACE_AFTER=<segundos>: empezar la traza pasados esos segundos desde el primer vertice.
+        static const long traceAfter = []
+        {
+            const char *v = std::getenv("PS2X_GS_TRACE_AFTER");
+            return v ? std::strtol(v, nullptr, 10) : 0L;
+        }();
+        static const auto traceStart = std::chrono::steady_clock::now();
+        const GSContext &tc = m_ctx[m_prim.ctxt ? 1 : 0];
+        if (traceTbp >= 0 && m_prim.tme && static_cast<long>(tc.tex0.tbp0) == traceTbp && traced < 400 &&
+            std::chrono::steady_clock::now() - traceStart >= std::chrono::seconds(traceAfter))
+        {
+            ++traced;
+            const GSVertex &v = m_vtxQueue[m_vtxCount % kMaxVerts];
+            std::cerr << "[gs:trace] prim=" << static_cast<unsigned>(m_prim.type) << " draw=" << drawing
+                      << " cnt=" << m_vtxCount << " xy=(" << v.x << "," << v.y << ") stq=(" << v.s << "," << v.t
+                      << "," << v.q << ") uv=(" << (v.u >> 4) << "," << (v.v >> 4) << ")" << std::endl;
+        }
+    }
     ++m_vtxCount;
     ++m_vtxIndex;
 

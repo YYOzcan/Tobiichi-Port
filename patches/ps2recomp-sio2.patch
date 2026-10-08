@@ -1,0 +1,1143 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index 1ef3cca..5e83b73 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -13,6 +13,7 @@ add_library(ps2_iop STATIC
+     src/emulator/core/iop_kernel.cpp
+     src/emulator/core/iop_memory.cpp
+     src/emulator/core/spu2.cpp
++    src/emulator/core/sio2.cpp
+     src/emulator/services/iop_module_loader.cpp
+     src/emulator/services/iop_rpc.cpp
+     src/emulator/imports/iop_cdvd.cpp
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 2c900c0..f5d7657 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -1,6 +1,7 @@
+ #include "iop_memory.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ 
+ namespace ps2x::iop::detail
+@@ -12,6 +13,9 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kDmaStart = 1u << 24u;
+         constexpr int kDmaSpu0Irq = 0x24;
+         constexpr int kDmaSpu1Irq = 0x28;
++        constexpr uint32_t kDmaSio2InChcr = 0x1F801548u;  // GOW-Port: DMA 11
++        constexpr uint32_t kDmaSio2OutChcr = 0x1F801558u; // GOW-Port: DMA 12
++        constexpr uint64_t kSio2TransferCycles = 256u;
+ 
+         uint32_t alignUp(uint32_t value, uint32_t alignment)
+         {
+@@ -22,6 +26,8 @@ namespace ps2x::iop::detail
+     IopMemory::IopMemory()
+         : m_ram(RamSize), m_owned(RamSize), m_scratch(ScratchSize)
+     {
++        const char *sio2 = std::getenv("GOW_SIO2");
++        m_sio2Enabled = sio2 == nullptr || sio2[0] != '0';
+         reset();
+     }
+ 
+@@ -38,6 +44,7 @@ namespace ps2x::iop::detail
+         m_interruptControl = 1;
+         m_dmaStart.reset();
+         m_spu2.reset();
++        m_sio2.reset();
+     }
+ 
+     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
+@@ -52,6 +59,8 @@ namespace ps2x::iop::detail
+             return m_ram[phys];
+         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
+             return m_scratch[phys - ScratchBase];
++        if (m_sio2Enabled && phys == Sio2::RegFifoOut) // GOW-Port: lectura de un byte de la respuesta
++            return m_sio2.readFifo();
+         const uint32_t value = readHardware32(phys & ~3u);
+         return static_cast<uint8_t>(value >> ((phys & 3u) * 8u));
+     }
+@@ -114,6 +123,11 @@ namespace ps2x::iop::detail
+             m_spu2.write16(half, static_cast<uint16_t>((current & ~(0xFFu << shift)) | (static_cast<uint32_t>(value) << shift)));
+             return;
+         }
++        if (m_sio2Enabled && phys == Sio2::RegFifoIn) // GOW-Port: un byte del comando
++        {
++            m_sio2.writeFifo(value);
++            return;
++        }
+         const uint32_t aligned = phys & ~3u;
+         uint32_t current = readHardware32(aligned);
+         const uint32_t shift = (phys & 3u) * 8u;
+@@ -235,6 +249,8 @@ namespace ps2x::iop::detail
+     {
+         if (Spu2::contains(address))
+             return m_spu2.read16(address) | (static_cast<uint32_t>(m_spu2.read16(address + 2u)) << 16u);
++        if (m_sio2Enabled && Sio2::contains(address))
++            return m_sio2.read32(address);
+         const auto value = m_hardware.find(address);
+         if (value != m_hardware.end())
+             return value->second;
+@@ -267,6 +283,18 @@ namespace ps2x::iop::detail
+         default:
+             break;
+         }
++        if (m_sio2Enabled && Sio2::contains(address))
++        {
++            m_sio2.write32(address, value);
++            if (m_sio2.takeTransferStarted())
++                m_dmaStart = DmaStart{Sio2::IopInterrupt, kSio2TransferCycles};
++            return;
++        }
++        if (m_sio2Enabled && (address == kDmaSio2InChcr || address == kDmaSio2OutChcr) && (value & kDmaStart) != 0u)
++        {
++            startSio2Dma(address, value);
++            return;
++        }
+ 
+         m_hardware[address] = value;
+         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
+@@ -301,6 +329,29 @@ namespace ps2x::iop::detail
+         };
+     }
+ 
++    // GOW-Port: DMA 11 (memoria -> SIO2) y 12 (SIO2 -> memoria). Bloques de BCR&0xFFFF palabras, BCR>>16 bloques.
++    // Terminan en el acto: sio2man solo espera la interrupcion del SIO2.
++    void IopMemory::startSio2Dma(uint32_t chcrAddress, uint32_t value)
++    {
++        m_hardware[chcrAddress] = value & ~kDmaStart;
++        uint32_t madr = 0u, blockControl = 0u;
++        if (const auto current = m_hardware.find(chcrAddress - 8u); current != m_hardware.end())
++            madr = physicalAddress(current->second) & (RamSize - 1u);
++        if (const auto current = m_hardware.find(chcrAddress - 4u); current != m_hardware.end())
++            blockControl = current->second;
++        const size_t blockBytes = static_cast<size_t>(blockControl & 0xFFFFu) * 4u;
++        const size_t blocks = std::max<uint32_t>(blockControl >> 16u, 1u);
++        const size_t bytes = std::min<size_t>(blockBytes * blocks, RamSize - madr);
++        if (chcrAddress == kDmaSio2InChcr)
++            m_sio2.dmaIn(m_ram.data() + madr, blockBytes, blockBytes != 0u ? bytes / blockBytes : 0u);
++        else
++        {
++            m_sio2.dmaOut(m_ram.data() + madr, bytes);
++            markOwned(madr, bytes);
++        }
++        m_hardware[chcrAddress - 8u] = madr + static_cast<uint32_t>(bytes);
++    }
++
+     std::optional<IopMemory::DmaStart> IopMemory::takeDmaStart() noexcept
+     {
+         std::optional<DmaStart> result = m_dmaStart;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 6027905..3bb7330 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -8,6 +8,7 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++#include "sio2.h"
+ #include "spu2.h"
+ 
+ namespace ps2x::iop::detail
+@@ -75,6 +76,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+         [[nodiscard]] Spu2 &spu2() noexcept { return m_spu2; }
++        [[nodiscard]] Sio2 &sio2() noexcept { return m_sio2; }
++        [[nodiscard]] bool sio2Enabled() const noexcept { return m_sio2Enabled; }
+ 
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+ 
+@@ -94,5 +97,8 @@ namespace ps2x::iop::detail
+         uint32_t m_interruptControl = 1;
+         std::optional<DmaStart> m_dmaStart;
+         Spu2 m_spu2; // GOW-Port
++        mutable Sio2 m_sio2; // GOW-Port: leer la FIFO de salida consume bytes
++        bool m_sio2Enabled = true; // GOW_SIO2=0: registros del SIO2 como simples latches (comportamiento anterior)
++        void startSio2Dma(uint32_t chcrAddress, uint32_t value);
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/sio2.cpp b/ps2xIOP/src/emulator/core/sio2.cpp
+new file mode 100644
+index 0000000..1241d64
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/sio2.cpp
+@@ -0,0 +1,531 @@
++#include "sio2.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <iostream>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        constexpr uint8_t kModePad = 0x01u;
++        constexpr uint8_t kModeMultitap = 0x21u;
++        constexpr uint8_t kModeMemcard = 0x81u;
++        constexpr uint32_t kCtrlStart = 0x1u;
++    }
++
++    // ---------------------------------------------------------------------------------------------------------------
++    // MemoryCard
++
++    void MemoryCard::insert(std::string path)
++    {
++        m_path = std::move(path);
++        m_present = true;
++        m_loaded = false;
++        m_fileExists = false;
++        m_image.clear();
++        m_address = 0;
++        terminator = 0x55u;
++    }
++
++    void MemoryCard::eject()
++    {
++        m_present = false;
++        m_loaded = false;
++        m_image.clear();
++    }
++
++    void MemoryCard::load()
++    {
++        if (m_loaded)
++            return;
++        m_loaded = true;
++        m_image.assign(ImageSize, 0xFFu); // sin formatear
++        if (m_path.empty())
++            return;
++        std::ifstream file(m_path, std::ios::binary);
++        if (!file)
++            return;
++        m_fileExists = true;
++        file.read(reinterpret_cast<char *>(m_image.data()), static_cast<std::streamsize>(m_image.size()));
++    }
++
++    const std::vector<uint8_t> &MemoryCard::image()
++    {
++        load();
++        return m_image;
++    }
++
++    void MemoryCard::persist(uint32_t offset, size_t size)
++    {
++        if (m_path.empty() || size == 0u)
++            return;
++        if (!m_fileExists)
++        {
++            // Primera escritura: se crea el archivo con la imagen entera
++            std::ofstream file(m_path, std::ios::binary | std::ios::trunc);
++            if (!file)
++            {
++                std::cerr << "[SIO2] no se puede crear la memory card " << m_path << std::endl;
++                return;
++            }
++            file.write(reinterpret_cast<const char *>(m_image.data()), static_cast<std::streamsize>(m_image.size()));
++            m_fileExists = static_cast<bool>(file);
++            std::cerr << "[SIO2] memory card creada en " << m_path << std::endl;
++            return;
++        }
++        std::fstream file(m_path, std::ios::binary | std::ios::in | std::ios::out);
++        if (!file)
++            return;
++        file.seekp(offset);
++        file.write(reinterpret_cast<const char *>(m_image.data() + offset), static_cast<std::streamsize>(size));
++    }
++
++    void MemoryCard::read(uint8_t *destination, size_t size)
++    {
++        load();
++        for (size_t i = 0; i < size; ++i)
++        {
++            const uint32_t offset = m_address + static_cast<uint32_t>(i);
++            destination[i] = offset < ImageSize ? m_image[offset] : 0xFFu;
++        }
++        m_address += static_cast<uint32_t>(size);
++    }
++
++    void MemoryCard::write(const uint8_t *source, size_t size)
++    {
++        load();
++        const uint32_t start = m_address;
++        if (start >= ImageSize)
++        {
++            m_address += static_cast<uint32_t>(size);
++            return;
++        }
++        const size_t count = std::min<size_t>(size, ImageSize - start);
++        for (size_t i = 0; i < count; ++i)
++            m_image[start + i] &= source[i];
++        persist(start, count);
++        m_address += static_cast<uint32_t>(size);
++    }
++
++    void MemoryCard::eraseBlock()
++    {
++        load();
++        const uint32_t start = m_address;
++        if (start >= ImageSize)
++            return;
++        const size_t count = std::min<size_t>(RawPageSize * PagesPerBlock, ImageSize - start);
++        std::fill_n(m_image.begin() + start, count, uint8_t{0xFFu});
++        persist(start, count);
++    }
++
++    // ---------------------------------------------------------------------------------------------------------------
++    // Sio2
++
++    Sio2::Sio2()
++    {
++        const char *diag = std::getenv("GOW_SIO2_DIAG");
++        m_diag = diag != nullptr && diag[0] != '0';
++        reset();
++    }
++
++    void Sio2::reset()
++    {
++        m_cmdQueue.fill(0u);
++        m_portCtrl.fill(0u);
++        m_ctrl = 0x3BCu;
++        m_cmdStat = StatDisconnected;
++        m_portStat = 0xFu;
++        m_fifoStat = 0u;
++        m_unknown78 = m_unknown7C = 0u;
++        m_istat = 0u;
++        m_out.clear();
++        softReset();
++        m_port = 0u;
++        m_transferStarted = false;
++        for (MemoryCard &card : m_cards)
++            card.terminator = 0x55u;
++    }
++
++    void Sio2::softReset()
++    {
++        m_queueRead = false;
++        m_queuePosition = 0u;
++        m_commandLength = 0u;
++        m_dmaBlockSize = 0u;
++        m_queueComplete = false;
++        m_in.clear();
++        m_cmdStat = 0u;
++    }
++
++    void Sio2::setCardPathProvider(std::function<std::string(uint32_t port)> provider)
++    {
++        m_pathProvider = std::move(provider);
++        m_cardPrepared.fill(false);
++    }
++
++    void Sio2::prepareCard(uint32_t port)
++    {
++        if (m_cardPrepared[port] || !m_pathProvider)
++            return;
++        m_cardPrepared[port] = true;
++        const std::string path = m_pathProvider(port);
++        if (path.empty())
++            return;
++        m_cards[port].insert(path);
++        std::cerr << "[SIO2] memory card del puerto " << (port + 1u) << ": " << path << std::endl;
++    }
++
++    uint32_t Sio2::read32(uint32_t physical)
++    {
++        const uint32_t offset = physical - RegBase;
++        if (offset < 0x40u)
++            return m_cmdQueue[offset >> 2u];
++        if (offset < 0x60u)
++            return m_portCtrl[(offset - 0x40u) >> 2u];
++        switch (physical)
++        {
++        case RegFifoOut:
++            return readFifo();
++        case RegCtrl:
++            return m_ctrl;
++        case RegRecv1:
++            return m_cmdStat;
++        case RegRecv2:
++            return m_portStat;
++        case RegRecv3:
++            return m_fifoStat;
++        case 0x1F808278u:
++            return m_unknown78;
++        case 0x1F80827Cu:
++            return m_unknown7C;
++        case RegIstat:
++            return m_istat;
++        default:
++            return 0u;
++        }
++    }
++
++    void Sio2::write32(uint32_t physical, uint32_t value)
++    {
++        const uint32_t offset = physical - RegBase;
++        if (offset < 0x40u)
++        {
++            m_cmdQueue[offset >> 2u] = value;
++            if (offset == 0u)
++            {
++                softReset(); // una cola nueva: lo que quedara sin leer de la anterior se descarta
++                m_out.clear();
++            }
++            return;
++        }
++        if (offset < 0x60u)
++        {
++            m_portCtrl[(offset - 0x40u) >> 2u] = value;
++            return;
++        }
++        switch (physical)
++        {
++        case RegFifoIn:
++            writeFifo(static_cast<uint8_t>(value));
++            return;
++        case RegCtrl:
++            if ((value & kCtrlStart) != 0u)
++            {
++                // Los comandos ya se procesaron al recibir sus bytes: la transferencia termina en el acto.
++                m_istat |= 1u;
++                m_transferStarted = true;
++            }
++            m_ctrl = value & ~kCtrlStart;
++            return;
++        case RegRecv1:
++            m_cmdStat = value;
++            return;
++        case RegRecv2:
++            m_portStat = value;
++            return;
++        case RegRecv3:
++            m_fifoStat = value;
++            return;
++        case 0x1F808278u:
++            m_unknown78 = value;
++            return;
++        case 0x1F80827Cu:
++            m_unknown7C = value;
++            return;
++        case RegIstat:
++            m_istat &= ~value;
++            return;
++        default:
++            return;
++        }
++    }
++
++    bool Sio2::takeTransferStarted() noexcept
++    {
++        const bool started = m_transferStarted;
++        m_transferStarted = false;
++        return started;
++    }
++
++    uint8_t Sio2::readFifo()
++    {
++        if (m_out.empty())
++            return 0xFFu;
++        const uint8_t value = m_out.front();
++        m_out.pop_front();
++        return value;
++    }
++
++    uint8_t Sio2::popIn()
++    {
++        if (m_in.empty())
++            return 0u;
++        const uint8_t value = m_in.front();
++        m_in.pop_front();
++        return value;
++    }
++
++    void Sio2::writeFifo(uint8_t value)
++    {
++        if (!m_queueRead)
++        {
++            if (m_queuePosition >= m_cmdQueue.size())
++                return;
++            const uint32_t command = m_cmdQueue[m_queuePosition];
++            m_port = command & 1u;
++            m_commandLength = (command >> 8u) & 0x3FFu;
++            m_queueRead = true;
++            m_queueComplete = m_commandLength == 0u;
++            m_in.clear();
++        }
++        if (m_queueComplete)
++            return;
++        m_in.push_back(value);
++        if ((m_dmaBlockSize == 0u && m_in.size() == m_commandLength) ||
++            (m_dmaBlockSize != 0u && m_in.size() == m_dmaBlockSize))
++        {
++            m_queueRead = false;
++            ++m_queuePosition;
++            process();
++        }
++    }
++
++    void Sio2::process()
++    {
++        const size_t outStart = m_out.size();
++        const uint8_t mode = popIn();
++        switch (mode)
++        {
++        case kModeMemcard:
++            memcard();
++            break;
++        case kModePad:
++        case kModeMultitap:
++        default:
++            absentDevice(false);
++            break;
++        }
++        // La respuesta ocupa lo mismo que el comando (y con DMA, bloques enteros)
++        const size_t produced = m_out.size() - outStart;
++        const size_t expected = m_dmaBlockSize != 0u ? ((produced + m_dmaBlockSize - 1u) / m_dmaBlockSize) * m_dmaBlockSize
++                                                     : m_commandLength;
++        for (size_t i = produced; i < expected; ++i)
++            m_out.push_back(m_dmaBlockSize != 0u ? 0x00u : 0xFFu);
++    }
++
++    void Sio2::absentDevice(bool memcard)
++    {
++        // Nadie responde: todo 0xFF y el bit de "falta el dispositivo" del puerto
++        if (memcard)
++            m_cmdStat = StatDisconnected;
++        else
++        {
++            m_cmdStat |= (m_cmdStat & 0x100u) ? 0x200u : 0x100u;
++            m_cmdStat |= m_port == 0u ? 0x1D000u : 0x2D000u;
++        }
++        m_out.push_back(0xFFu);
++        while (!m_in.empty())
++        {
++            m_in.pop_front();
++            m_out.push_back(0xFFu);
++        }
++    }
++
++    void Sio2::memcard()
++    {
++        prepareCard(m_port);
++        MemoryCard &card = m_cards[m_port];
++        if (!card.present())
++        {
++            absentDevice(true);
++            return;
++        }
++        m_cmdStat = StatConnected;
++        const uint8_t command = popIn();
++        m_lastCardCommand = command;
++        if (m_diag)
++            std::cerr << "[SIO2] mc" << m_port << " cmd=0x" << std::hex << static_cast<int>(command) << std::dec
++                      << " len=" << m_commandLength << std::endl;
++
++        // Las dos primeras posiciones corresponden a 0x81 y al comando. El relleno se mide desde aqui.
++        const size_t base = m_out.size();
++        m_out.push_back(0x00u);
++        m_out.push_back(0x00u);
++        auto terminator = [&](size_t length)
++        {
++            while (m_out.size() - base + 2u < length)
++                m_out.push_back(0x00u);
++            m_out.push_back(0x2Bu);
++            m_out.push_back(card.terminator);
++        };
++
++        switch (command)
++        {
++        case 0x11u: // sondeo
++        case 0x12u: // fin de escritura/borrado
++        case 0x81u: // fin de lectura/escritura
++            terminator(4u);
++            break;
++        case 0x21u: // fijar pagina de borrado, escritura o lectura
++        case 0x22u:
++        case 0x23u:
++        {
++            uint32_t page = 0u;
++            for (uint32_t i = 0; i < 4u; ++i)
++                page |= static_cast<uint32_t>(popIn()) << (i * 8u);
++            (void)popIn(); // XOR de los 4 bytes
++            card.setAddress(page);
++            terminator(9u);
++            break;
++        }
++        case 0x26u: // especificaciones: 512 bytes por pagina, 16 paginas por bloque, 0x4000 paginas
++        {
++            const uint8_t specs[8] = {0x00u, 0x02u, 0x10u, 0x00u, 0x00u, 0x40u, 0x00u, 0x00u};
++            uint8_t checksum = 0u;
++            m_out.push_back(0x2Bu);
++            for (uint8_t value : specs)
++            {
++                checksum ^= value;
++                m_out.push_back(value);
++            }
++            m_out.push_back(checksum);
++            m_out.push_back(card.terminator);
++            break;
++        }
++        case 0x27u: // fijar terminador
++            card.terminator = popIn();
++            m_out.push_back(0x00u);
++            m_out.push_back(0x2Bu);
++            m_out.push_back(card.terminator);
++            break;
++        case 0x28u: // leer terminador
++            m_out.push_back(0x2Bu);
++            m_out.push_back(card.terminator);
++            m_out.push_back(card.terminator);
++            break;
++        case 0x42u: // escribir datos en la pagina actual
++        {
++            const uint8_t length = popIn();
++            m_out.push_back(0x00u);
++            m_out.push_back(0x2Bu);
++            std::vector<uint8_t> data(length);
++            uint8_t checksum = 0u;
++            for (uint8_t &value : data)
++            {
++                value = popIn();
++                checksum ^= value;
++                m_out.push_back(0x00u);
++            }
++            card.write(data.data(), data.size());
++            m_out.push_back(checksum);
++            m_out.push_back(card.terminator);
++            break;
++        }
++        case 0x43u: // leer datos de la pagina actual
++        {
++            const uint8_t length = popIn();
++            m_out.push_back(0x00u);
++            m_out.push_back(0x2Bu);
++            std::vector<uint8_t> data(length);
++            card.read(data.data(), data.size());
++            uint8_t checksum = 0u;
++            for (uint8_t value : data)
++            {
++                checksum ^= value;
++                m_out.push_back(value);
++            }
++            m_out.push_back(checksum);
++            m_out.push_back(card.terminator);
++            break;
++        }
++        case 0x82u: // borrar el bloque (16 paginas) de la pagina fijada
++            card.eraseBlock();
++            terminator(4u);
++            break;
++        case 0xBFu:
++        case 0xF7u:
++            terminator(5u);
++            break;
++        case 0xF3u: // reinicio de la autenticacion
++            card.terminator = 0x55u;
++            terminator(5u);
++            break;
++        case 0xF0u: // autenticacion MagicGate: se acepta sin cifrado (secrman va por HLE)
++        {
++            const uint8_t step = popIn();
++            switch (step)
++            {
++            case 0x01u:
++            case 0x02u:
++            case 0x04u:
++            case 0x0Fu:
++            case 0x11u:
++            case 0x13u:
++            {
++                m_out.push_back(0x00u);
++                m_out.push_back(0x2Bu);
++                uint8_t checksum = 0u;
++                for (int i = 0; i < 8; ++i)
++                {
++                    checksum ^= popIn();
++                    m_out.push_back(0x00u);
++                }
++                m_out.push_back(checksum);
++                m_out.push_back(card.terminator);
++                break;
++            }
++            case 0x06u:
++            case 0x07u:
++            case 0x0Bu:
++                terminator(14u);
++                break;
++            default:
++                terminator(5u);
++                break;
++            }
++            break;
++        }
++        default:
++            std::cerr << "[SIO2] comando de memory card no emulado 0x" << std::hex << static_cast<int>(command)
++                      << std::dec << std::endl;
++            break;
++        }
++        m_in.clear();
++    }
++
++    void Sio2::dmaIn(const uint8_t *source, size_t blockBytes, size_t blocks)
++    {
++        m_dmaBlockSize = blockBytes;
++        for (size_t i = 0; i < blockBytes * blocks; ++i)
++            writeFifo(source[i]);
++    }
++
++    void Sio2::dmaOut(uint8_t *destination, size_t bytes)
++    {
++        for (size_t i = 0; i < bytes; ++i)
++            destination[i] = readFifo();
++    }
++}
+diff --git a/ps2xIOP/src/emulator/core/sio2.h b/ps2xIOP/src/emulator/core/sio2.h
+new file mode 100644
+index 0000000..b2b13bc
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/sio2.h
+@@ -0,0 +1,135 @@
++#pragma once
++
++// GOW-Port: emulacion del SIO2 del IOP (0x1F808200-0x1F8082FF) y de la memory card de PS2.
++// sio2man escribe la cola de comandos (SEND3), los bytes de cada comando (FIFO o DMA 11), pone CTRL bit 0 y espera la
++// interrupcion 17; despues lee RECV1-3 y la respuesta (FIFO o DMA 12). Cada comando empieza por el modo (0x01 mando,
++// 0x21 multitap, 0x61 infrarrojos, 0x81 memory card). Los mandos y el multitap se ven desconectados (libpad2 va por HLE
++// en el EE). La memory card guarda las paginas en bruto (512 + 16 de ECC) en un archivo del formato de PCSX2 (8 MB).
++// Referencias: PCSX2 (pcsx2/SIO/Sio2.cpp, Memcard/MemoryCardProtocol.cpp) y ps2sdk (sio2man, mcman).
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace ps2x::iop::detail
++{
++    class MemoryCard
++    {
++    public:
++        static constexpr uint32_t PageSize = 512u;
++        static constexpr uint32_t SpareSize = 16u;
++        static constexpr uint32_t RawPageSize = PageSize + SpareSize; // 528
++        static constexpr uint32_t PagesPerBlock = 16u;
++        static constexpr uint32_t PageCount = 0x4000u; // 8 MB
++        static constexpr uint32_t ImageSize = RawPageSize * PageCount;
++
++        // Ruta vacia: tarjeta solo en memoria (pruebas). Si el archivo no existe, la tarjeta empieza sin formatear (0xFF)
++        // y el archivo se crea en la primera escritura.
++        void insert(std::string path);
++        void eject();
++        [[nodiscard]] bool present() const noexcept { return m_present; }
++        [[nodiscard]] const std::string &path() const noexcept { return m_path; }
++
++        void setAddress(uint32_t page) noexcept { m_address = page * RawPageSize; }
++        void read(uint8_t *destination, size_t size);
++        void write(const uint8_t *source, size_t size); // la flash solo pasa bits de 1 a 0 (AND)
++        void eraseBlock();                              // 16 paginas desde la direccion actual
++        [[nodiscard]] uint32_t address() const noexcept { return m_address; }
++        [[nodiscard]] const std::vector<uint8_t> &image();
++
++        uint8_t terminator = 0x55u;
++
++    private:
++        void load();
++        void persist(uint32_t offset, size_t size);
++
++        std::string m_path;
++        bool m_present = false;
++        bool m_loaded = false;
++        bool m_fileExists = false;
++        std::vector<uint8_t> m_image;
++        uint32_t m_address = 0;
++    };
++
++    class Sio2
++    {
++    public:
++        static constexpr uint32_t RegBase = 0x1F808200u;
++        static constexpr uint32_t RegEnd = 0x1F808300u;
++        static constexpr uint32_t RegFifoIn = 0x1F808260u;
++        static constexpr uint32_t RegFifoOut = 0x1F808264u;
++        static constexpr uint32_t RegCtrl = 0x1F808268u;
++        static constexpr uint32_t RegRecv1 = 0x1F80826Cu;
++        static constexpr uint32_t RegRecv2 = 0x1F808270u;
++        static constexpr uint32_t RegRecv3 = 0x1F808274u;
++        static constexpr uint32_t RegIstat = 0x1F808280u;
++        static constexpr int IopInterrupt = 17;
++
++        // RECV1: 0x1000 = respondio un dispositivo; 0xD000 con el bit del puerto = falta el dispositivo.
++        static constexpr uint32_t StatConnected = 0x1100u;
++        static constexpr uint32_t StatDisconnected = 0x1D100u;
++
++        Sio2();
++        void reset();
++
++        [[nodiscard]] static bool contains(uint32_t physical) noexcept
++        {
++            return physical >= RegBase && physical < RegEnd;
++        }
++        [[nodiscard]] uint32_t read32(uint32_t physical);
++        void write32(uint32_t physical, uint32_t value);
++        [[nodiscard]] uint8_t readFifo();
++        void writeFifo(uint8_t value);
++
++        // DMA 11 (SIO2 in, bloques de blockBytes) y DMA 12 (SIO2 out)
++        void dmaIn(const uint8_t *source, size_t blockBytes, size_t blocks);
++        void dmaOut(uint8_t *destination, size_t bytes);
++
++        // true una vez por cada CTRL con el bit 0 (inicio de transferencia): hay que lanzar la interrupcion 17.
++        [[nodiscard]] bool takeTransferStarted() noexcept;
++
++        [[nodiscard]] MemoryCard &card(uint32_t port) { return m_cards[port & 1u]; }
++        // Se consulta la primera vez que se accede a cada puerto, para no tocar el disco si el juego no usa la tarjeta.
++        void setCardPathProvider(std::function<std::string(uint32_t port)> provider);
++
++        // Diagnostico (GOW_SIO2_DIAG): ultimo comando de memory card procesado
++        [[nodiscard]] uint8_t lastCardCommand() const noexcept { return m_lastCardCommand; }
++
++    private:
++        void softReset();
++        [[nodiscard]] uint8_t popIn();
++        void process();
++        void absentDevice(bool memcard);
++        void memcard();
++        void prepareCard(uint32_t port);
++
++        std::array<uint32_t, 16> m_cmdQueue{};
++        std::array<uint32_t, 8> m_portCtrl{};
++        uint32_t m_ctrl = 0x3BCu;
++        uint32_t m_cmdStat = 0;
++        uint32_t m_portStat = 0xFu;
++        uint32_t m_fifoStat = 0;
++        uint32_t m_unknown78 = 0, m_unknown7C = 0;
++        uint32_t m_istat = 0;
++
++        std::deque<uint8_t> m_in;
++        std::deque<uint8_t> m_out;
++        bool m_queueRead = false;
++        size_t m_queuePosition = 0;
++        size_t m_commandLength = 0;
++        size_t m_dmaBlockSize = 0;
++        bool m_queueComplete = false;
++        uint32_t m_port = 0;
++        bool m_transferStarted = false;
++
++        std::array<MemoryCard, 2> m_cards{};
++        std::array<bool, 2> m_cardPrepared{};
++        std::function<std::string(uint32_t)> m_pathProvider;
++        uint8_t m_lastCardCommand = 0;
++        bool m_diag = false;
++    };
++}
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index ae77127..d31d6fe 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -18,6 +18,7 @@
+ #include "iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <filesystem>
+ #include <cstdlib>
+ #include <cctype>
+ #include <map>
+@@ -114,6 +115,18 @@ namespace ps2x::iop::detail
+               loadcore(memory, imports)
+         {
+             reset();
++            // GOW-Port: memory card del SIO2. Puerto 1: GOW_MC0 o Mcd001.ps2 junto al ELF (formato de PCSX2);
++            // puerto 2: solo con GOW_MC1. GOW_MC0=0 deja el puerto 1 vacio.
++            memory.sio2().setCardPathProvider([this](uint32_t port) -> std::string
++            {
++                const char *setting = std::getenv(port == 0u ? "GOW_MC0" : "GOW_MC1");
++                if (setting != nullptr)
++                    return setting[0] == '0' && setting[1] == '\0' ? std::string() : std::string(setting);
++                if (port != 0u)
++                    return {};
++                const std::string directory = host.hostPath(HostPathKind::ElfDirectory);
++                return directory.empty() ? std::string("Mcd001.ps2") : (std::filesystem::path(directory) / "Mcd001.ps2").string();
++            });
+         }
+ 
+         void reset()
+@@ -341,6 +354,12 @@ namespace ps2x::iop::detail
+                     secrMcDevIdHandler = {a0, cpu.gpr[28]};
+                     setV0(0);
+                     return ImportDisposition::Handled;
++                case 6: // SecrAuthCard: GOW-Port: la memory card emulada no lleva MagicGate, se da por autenticada
++                    setV0(memory.sio2Enabled() ? 1u : 0u);
++                    return ImportDisposition::Handled;
++                case 7: // SecrResetAuthCard
++                    setV0(0);
++                    return ImportDisposition::Handled;
+                 default:
+                     break;
+                 }
+@@ -365,6 +384,25 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "dmacman"))
+             {
++                // GOW-Port: sio2man programa los DMA 11 y 12 del SIO2 con sceSetSliceDMA/sceStartDMA.
++                const uint32_t channel = a0;
++                const bool sio2Channel = memory.sio2Enabled() && (channel == 11u || channel == 12u);
++                const uint32_t channelBase = 0x1F801500u + (channel - 7u) * 0x10u;
++                if (sio2Channel && call.ordinal == 28u) // sceSetSliceDMA(canal, direccion, palabras, bloques, sentido)
++                {
++                    const uint32_t direction = memory.read32(cpu.gpr[29] + 16u);
++                    write32(channelBase, cpu.gpr[5] & 0xFFFFFFu);
++                    write32(channelBase + 4u, (cpu.gpr[6] & 0xFFFFu) | (cpu.gpr[7] << 16u));
++                    write32(channelBase + 8u, (direction & 1u) | 0x200u | (direction == 0u ? 0x40000000u : 0u));
++                    setV0(1);
++                    return ImportDisposition::Handled;
++                }
++                if (sio2Channel && call.ordinal == 32u) // sceStartDMA(canal)
++                {
++                    write32(channelBase + 8u, memory.read32(channelBase + 8u) | 0x01000000u);
++                    setV0(0);
++                    return ImportDisposition::Handled;
++                }
+                 setV0(0);
+                 return ImportDisposition::Handled;
+             }
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 72f1522..4ac1d4a 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -38,6 +38,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_recompiler_tests.cpp
+     src/ps2_runtime_expansion_tests.cpp
+     src/ps2_spu2_tests.cpp
++    src/ps2_sio2_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 040e13e..c8e696d 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -19,6 +19,7 @@ void register_ps2_sif_dma_tests();
+ void register_ps2_recompiler_tests();
+ void register_ps2_runtime_expansion_tests();
+ void register_ps2_spu2_tests();
++void register_ps2_sio2_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -42,6 +43,7 @@ int main()
+     register_ps2_recompiler_tests();
+     register_ps2_runtime_expansion_tests();
+     register_ps2_spu2_tests();
++    register_ps2_sio2_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_sio2_tests.cpp b/ps2xTest/src/ps2_sio2_tests.cpp
+new file mode 100644
+index 0000000..b1b1f2b
+--- /dev/null
++++ b/ps2xTest/src/ps2_sio2_tests.cpp
+@@ -0,0 +1,197 @@
++// GOW-Port: pruebas de la emulacion del SIO2 y de la memory card (ps2xIOP/src/emulator/core/sio2.*).
++#include "MiniTest.h"
++#include "../../ps2xIOP/src/emulator/core/iop_memory.h"
++#include "../../ps2xIOP/src/emulator/core/sio2.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <filesystem>
++#include <fstream>
++#include <vector>
++
++using ps2x::iop::detail::IopMemory;
++using ps2x::iop::detail::MemoryCard;
++using ps2x::iop::detail::Sio2;
++
++namespace
++{
++    // Un comando por la FIFO, como sio2man sin DMA: SEND3[0], bytes, CTRL |= 1. Devuelve los bytes de respuesta.
++    std::vector<uint8_t> transfer(Sio2 &sio2, uint32_t port, const std::vector<uint8_t> &command, size_t responseLength)
++    {
++        sio2.write32(Sio2::RegCtrl, sio2.read32(Sio2::RegCtrl) | 0xCu);
++        sio2.write32(Sio2::RegBase, port | (static_cast<uint32_t>(command.size()) << 8u));
++        sio2.write32(Sio2::RegBase + 4u, 0u);
++        for (uint8_t value : command)
++            sio2.writeFifo(value);
++        sio2.write32(Sio2::RegCtrl, sio2.read32(Sio2::RegCtrl) | 1u);
++        std::vector<uint8_t> response(responseLength);
++        for (uint8_t &value : response)
++            value = sio2.readFifo();
++        return response;
++    }
++
++    std::vector<uint8_t> setPage(Sio2 &sio2, uint8_t command, uint32_t page)
++    {
++        const uint8_t b0 = static_cast<uint8_t>(page), b1 = static_cast<uint8_t>(page >> 8u);
++        const uint8_t b2 = static_cast<uint8_t>(page >> 16u), b3 = static_cast<uint8_t>(page >> 24u);
++        return transfer(sio2, 0u, {0x81u, command, b0, b1, b2, b3, static_cast<uint8_t>(b0 ^ b1 ^ b2 ^ b3), 0u, 0u}, 9u);
++    }
++
++    std::vector<uint8_t> writeData(Sio2 &sio2, const std::vector<uint8_t> &data)
++    {
++        std::vector<uint8_t> command = {0x81u, 0x42u, static_cast<uint8_t>(data.size())};
++        command.insert(command.end(), data.begin(), data.end());
++        command.push_back(0u);
++        command.push_back(0u);
++        return transfer(sio2, 0u, command, command.size());
++    }
++
++    std::vector<uint8_t> readData(Sio2 &sio2, uint8_t length)
++    {
++        std::vector<uint8_t> command(static_cast<size_t>(length) + 5u, 0u);
++        command[0] = 0x81u;
++        command[1] = 0x43u;
++        command[2] = length;
++        return transfer(sio2, 0u, command, command.size());
++    }
++}
++
++void register_ps2_sio2_tests()
++{
++    MiniTest::Case("PS2Sio2", [](TestCase &tc)
++    {
++        tc.Run("a present memory card answers the probe with 0x2B and the terminator", [](TestCase &t)
++        {
++            Sio2 sio2;
++            sio2.card(0).insert("");
++            const auto response = transfer(sio2, 0u, {0x81u, 0x11u, 0u, 0u}, 4u);
++            t.Equals(sio2.read32(Sio2::RegRecv1) & 0xF000u, 0x1000u, "RECV1 should report a connected device");
++            t.Equals(response[2], static_cast<uint8_t>(0x2Bu), "third byte should be 0x2B");
++            t.Equals(response[3], static_cast<uint8_t>(0x55u), "fourth byte should be the default terminator");
++            t.IsTrue(sio2.takeTransferStarted(), "CTRL bit 0 should request the SIO2 interrupt");
++            t.Equals(sio2.read32(Sio2::RegIstat), 1u, "ISTAT should flag the finished transfer");
++            sio2.write32(Sio2::RegIstat, 1u);
++            t.Equals(sio2.read32(Sio2::RegIstat), 0u, "writing ISTAT should acknowledge it");
++            t.Equals(sio2.read32(Sio2::RegCtrl) & 1u, 0u, "the start bit should clear once the transfer is done");
++        });
++
++        tc.Run("an empty slot and the controller ports read as disconnected", [](TestCase &t)
++        {
++            Sio2 sio2;
++            auto response = transfer(sio2, 0u, {0x81u, 0x11u, 0u, 0u}, 4u);
++            t.IsTrue((sio2.read32(Sio2::RegRecv1) & 0xF000u) != 0x1000u, "no card: RECV1 must not report a device");
++            t.Equals(response[3], static_cast<uint8_t>(0xFFu), "no card: dead air");
++            response = transfer(sio2, 1u, {0x01u, 0x42u, 0u, 0u, 0u}, 5u);
++            t.Equals(sio2.read32(Sio2::RegRecv1) & 0x2D000u, 0x2D000u, "missing pad on port 2 should set its bits");
++            t.Equals(response[1], static_cast<uint8_t>(0xFFu), "missing pad: dead air");
++        });
++
++        tc.Run("get specs reports 512-byte pages, 16-page blocks and 8 MB", [](TestCase &t)
++        {
++            Sio2 sio2;
++            sio2.card(0).insert("");
++            std::vector<uint8_t> command(13u, 0u); // 0x81, 0x26 y 11 de relleno
++            command[0] = 0x81u;
++            command[1] = 0x26u;
++            const auto r = transfer(sio2, 0u, command, 13u);
++            t.Equals(r[2], static_cast<uint8_t>(0x2Bu), "0x2B header");
++            t.Equals(static_cast<uint32_t>(r[3] | (r[4] << 8u)), 512u, "page size");
++            t.Equals(static_cast<uint32_t>(r[5] | (r[6] << 8u)), 16u, "pages per block");
++            t.Equals(static_cast<uint32_t>(r[7] | (r[8] << 8u) | (r[9] << 16u)), 0x4000u, "page count");
++            t.Equals(r[11], static_cast<uint8_t>(0x52u), "XOR of the eight spec bytes");
++            t.Equals(r[12], static_cast<uint8_t>(0x55u), "terminator");
++        });
++
++        tc.Run("set terminator changes the byte that ends every reply", [](TestCase &t)
++        {
++            Sio2 sio2;
++            sio2.card(0).insert("");
++            (void)transfer(sio2, 0u, {0x81u, 0x27u, 0x5Au, 0u, 0u}, 5u);
++            const auto r = transfer(sio2, 0u, {0x81u, 0x28u, 0u, 0u, 0u}, 5u);
++            t.Equals(r[3], static_cast<uint8_t>(0x5Au), "get terminator should return the new value");
++            t.Equals(r[4], static_cast<uint8_t>(0x5Au), "and repeat it as the terminator");
++        });
++
++        tc.Run("erase, write and read back a page, and persist it to the card file", [](TestCase &t)
++        {
++            const std::filesystem::path file = std::filesystem::temp_directory_path() / "ps2x_sio2_test_card.ps2";
++            std::filesystem::remove(file);
++            std::vector<uint8_t> pattern(128u);
++            for (size_t i = 0; i < pattern.size(); ++i)
++                pattern[i] = static_cast<uint8_t>(i * 7u + 3u);
++            {
++                Sio2 sio2;
++                sio2.card(0).insert(file.string());
++                (void)setPage(sio2, 0x21u, 0x20u);
++                (void)transfer(sio2, 0u, {0x81u, 0x82u, 0u, 0u}, 4u);
++                (void)setPage(sio2, 0x22u, 0x21u);
++                const auto w = writeData(sio2, pattern);
++                uint8_t checksum = 0u;
++                for (uint8_t value : pattern)
++                    checksum ^= value;
++                t.Equals(w[w.size() - 2u], checksum, "write reply should echo the XOR of the data");
++                (void)setPage(sio2, 0x23u, 0x21u);
++                const auto r = readData(sio2, 128u);
++                t.IsTrue(std::equal(pattern.begin(), pattern.end(), r.begin() + 4), "read should return the written bytes");
++                t.Equals(r[132], checksum, "read reply should carry the XOR of the data");
++            }
++            t.Equals(static_cast<uint64_t>(std::filesystem::file_size(file)), static_cast<uint64_t>(MemoryCard::ImageSize),
++                     "the card file should be a full 8 MB PCSX2 image");
++            MemoryCard reloaded;
++            reloaded.insert(file.string());
++            reloaded.setAddress(0x21u);
++            std::vector<uint8_t> data(128u);
++            reloaded.read(data.data(), data.size());
++            t.IsTrue(data == pattern, "the page should survive in the file");
++            std::filesystem::remove(file);
++        });
++
++        tc.Run("flash writes only clear bits until the block is erased", [](TestCase &t)
++        {
++            MemoryCard card;
++            card.insert("");
++            card.setAddress(0u);
++            const uint8_t first = 0xF0u, second = 0x3Cu;
++            card.write(&first, 1u);
++            card.setAddress(0u);
++            card.write(&second, 1u);
++            uint8_t value = 0u;
++            card.setAddress(0u);
++            card.read(&value, 1u);
++            t.Equals(value, static_cast<uint8_t>(0x30u), "two writes without erase should AND together");
++            card.setAddress(0u);
++            card.eraseBlock();
++            card.setAddress(0u);
++            card.read(&value, 1u);
++            t.Equals(value, static_cast<uint8_t>(0xFFu), "erase should restore 0xFF");
++        });
++
++        tc.Run("DMA 11 and 12 move a command and its reply through IOP RAM", [](TestCase &t)
++        {
++            IopMemory memory;
++            memory.sio2().card(0).insert("");
++            constexpr uint32_t inAddress = 0x1000u, outAddress = 0x2000u;
++            const uint8_t probe[8] = {0x81u, 0x11u, 0u, 0u, 0u, 0u, 0u, 0u};
++            t.IsTrue(memory.writeRam(inAddress, probe, sizeof(probe)), "command in RAM");
++            memory.write32(Sio2::RegCtrl, 0x3BCu | 0xCu);
++            memory.write32(Sio2::RegBase, 0u | (4u << 8u)); // puerto 1, 4 bytes
++            memory.write32(Sio2::RegBase + 4u, 0u);
++            memory.write32(0x1F801540u, inAddress);      // DMA 11 MADR
++            memory.write32(0x1F801544u, (1u << 16u) | 2u); // 1 bloque de 2 palabras
++            memory.write32(0x1F801548u, 0x01000201u);
++            memory.write32(0x1F801550u, outAddress);     // DMA 12 MADR
++            memory.write32(0x1F801554u, (1u << 16u) | 2u);
++            memory.write32(0x1F801558u, 0x41000200u);
++            t.IsFalse(memory.takeDmaStart().has_value(), "the DMA channels themselves raise no interrupt");
++            memory.write32(Sio2::RegCtrl, memory.read32(Sio2::RegCtrl) | 1u);
++            const auto start = memory.takeDmaStart();
++            t.IsTrue(start.has_value() && start->irq == Sio2::IopInterrupt, "CTRL start should schedule IRQ 17");
++            uint8_t reply[8]{};
++            t.IsTrue(memory.readRam(outAddress, reply, sizeof(reply)), "reply in RAM");
++            t.Equals(reply[2], static_cast<uint8_t>(0x2Bu), "DMA 12 should deliver 0x2B");
++            t.Equals(reply[3], static_cast<uint8_t>(0x55u), "and the terminator");
++            t.Equals(memory.read32(0x1F801548u) & 0x01000000u, 0u, "DMA 11 should be idle again");
++            t.Equals(memory.read32(Sio2::RegRecv1) & 0xF000u, 0x1000u, "RECV1 should report the card");
++        });
++    });
++}

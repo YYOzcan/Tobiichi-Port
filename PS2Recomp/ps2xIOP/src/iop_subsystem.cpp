@@ -23,6 +23,7 @@ namespace ps2x::iop
             coreServices.emplace_back(detail::createMcservService(host));
             coreServices.emplace_back(detail::createDbcmanService(host));
             coreServices.emplace_back(detail::createLibSdService(host));
+            coreServices.emplace_back(detail::createGow989SndService(host));
             refreshServiceModuleKeys();
             rebuildRoutes();
         }
@@ -247,6 +248,11 @@ namespace ps2x::iop
     bool IopSubsystem::isMemoryRange(uint32_t address, size_t size) const
     {
         return m_impl->emulator.isMemoryRange(address, size);
+    }
+
+    size_t IopSubsystem::drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames)
+    {
+        return m_impl->emulator.drainAudio(stereo, maxFrames, maxLatencyFrames);
     }
 
     DebugSnapshot IopSubsystem::debugSnapshot() const

@@ -1,0 +1,658 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+index 4bf8dc5..711b346 100644
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -404,12 +404,13 @@ namespace ps2recomp
+         case OPCODE_BNE:
+         case OPCODE_BNEL:
+             return fmt::format("GPR_U64(ctx, {}) != GPR_U64(ctx, {})", rsReg, rtReg);
++        // GOW-Port: en el R5900 BLEZ/BGTZ/BLTZ/BGEZ comparan el registro de 64 bits (fork de SotC, 3c46932).
+         case OPCODE_BLEZ:
+         case OPCODE_BLEZL:
+-            return fmt::format("GPR_S32(ctx, {}) <= 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) <= 0", rsReg);
+         case OPCODE_BGTZ:
+         case OPCODE_BGTZL:
+-            return fmt::format("GPR_S32(ctx, {}) > 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) > 0", rsReg);
+         case OPCODE_REGIMM:
+             switch (m_branchInst.rt)
+             {
+@@ -417,12 +418,12 @@ namespace ps2recomp
+             case REGIMM_BLTZL:
+             case REGIMM_BLTZAL:
+             case REGIMM_BLTZALL:
+-                return fmt::format("GPR_S32(ctx, {}) < 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) < 0", rsReg);
+             case REGIMM_BGEZ:
+             case REGIMM_BGEZL:
+             case REGIMM_BGEZAL:
+             case REGIMM_BGEZALL:
+-                return fmt::format("GPR_S32(ctx, {}) >= 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) >= 0", rsReg);
+             default:
+                 return "false";
+             }
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index a2f895e..6a956b4 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -53,13 +53,11 @@ namespace ps2recomp
+             case COP1_S_MUL:
+                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_DIV:
+-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
+-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
+-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
+-                                   ft, fd, fs, fd, fs, ft);
++                // GOW-Port: sin infinitos; dividir por cero da +/-FLT_MAX y pone D o I en FCR31 (fork de SotC, 8b51cb9).
++                return fmt::format("ctx->f[{}] = ps2FpuDivide(ctx->fcr31, ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_SQRT:
+                 // GOW-Port: R5900 codifica el radicando en FT; FS no es la fuente de SQRT.S.
+-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
++                return fmt::format("ctx->f[{}] = ps2FpuSqrt(ctx->fcr31, ctx->f[{}]);", fd, ft);
+             case COP1_S_ABS:
+                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
+             case COP1_S_MOV:
+@@ -78,7 +76,7 @@ namespace ps2recomp
+                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
+             case COP1_S_RSQRT:
+                 // GOW-Port: RSQRT.S calcula FS/sqrt(FT), no la inversa de sqrt(FS).
+-                return fmt::format("ctx->f[{}] = ctx->f[{}] / FPU_SQRT_S(ctx->f[{}]);", fd, fs, ft);
++                return fmt::format("ctx->f[{}] = ps2FpuRsqrt(ctx->fcr31, ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_ADDA:
+                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
+             case COP1_S_SUBA:
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 509fd07..f8386b3 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -75,21 +75,25 @@ namespace ps2recomp
+         uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+ 
+-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2VuDivide(ctx->vu0_status, fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
+     {
+         uint8_t ftf = inst.vectorInfo.ftf;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2VuSqrt(ctx->vu0_status, ft); }}", ft_reg, ft_reg, ftf);
+     }
+ 
++    // GOW-Port: VDIV/VSQRT/VRSQRT con la semantica del PS2 (sin infinitos; VRSQRT es FS/sqrt(|FT|), antes ignoraba FS).
++    // Fork de SotC, 8b51cb9.
+     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
+     {
++        uint8_t fsf = inst.vectorInfo.fsf;
+         uint8_t ftf = inst.vectorInfo.ftf;
++        uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2VuRsqrt(ctx->vu0_status, fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 0f19c9f..f157b72 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -140,12 +140,201 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
+ #define PS2_PXOR(a, b) _mm_xor_si128((__m128i)(a), (__m128i)(b))
+ #define PS2_PNOR(a, b) _mm_xor_si128(_mm_or_si128((__m128i)(a), (__m128i)(b)), _mm_set1_epi32(0xFFFFFFFF))
+ 
++// GOW-Port: semantica de la FPU (COP1) y de VU0 en modo macro del PS2: no hay NaN ni infinitos (se satura al maximo
++// finito), suma/resta sin bits de guarda, division y raices con flags de FCR31 y comparaciones sobre el patron de bits.
++// Tomado del port de Shadow of the Colossus (TaylorNAlbarnaz/PS2Recomp, rama sotc-port: 8b51cb9, 9bb389e, c419f26).
++inline __m128 ps2VuClampVector(__m128 value)
++{
++    const __m128i bits = _mm_castps_si128(value);
++    const __m128i exponentMask = _mm_set1_epi32(0x7F800000);
++    const __m128i special = _mm_cmpeq_epi32(_mm_and_si128(bits, exponentMask), exponentMask);
++    const __m128i saturated = _mm_or_si128(_mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u))), _mm_set1_epi32(0x7F7FFFFF));
++    return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(special, saturated), _mm_andnot_si128(special, bits)));
++}
++
++inline float ps2FpuClamp(float value)
++{
++    uint32_t bits;
++    std::memcpy(&bits, &value, sizeof(bits));
++    if ((bits & 0x7F800000u) == 0x7F800000u)
++    {
++        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++        std::memcpy(&value, &bits, sizeof(value));
++    }
++    return value;
++}
++
++inline void ps2FpuAlignOperands(float &a, float &b)
++{
++    uint32_t ua;
++    uint32_t ub;
++    std::memcpy(&ua, &a, sizeof(ua));
++    std::memcpy(&ub, &b, sizeof(ub));
++    const int32_t diff = static_cast<int32_t>((ua >> 23) & 0xFFu) - static_cast<int32_t>((ub >> 23) & 0xFFu);
++    if (diff >= 25)
++        ub &= 0x80000000u;
++    else if (diff > 0)
++        ub &= 0xFFFFFFFFu << (diff - 1);
++    else if (diff <= -25)
++        ua &= 0x80000000u;
++    else if (diff < 0)
++        ua &= 0xFFFFFFFFu << (-diff - 1);
++    std::memcpy(&a, &ua, sizeof(a));
++    std::memcpy(&b, &ub, sizeof(b));
++}
++
++inline float ps2FpuAdd(float a, float b)
++{
++    ps2FpuAlignOperands(a, b);
++    return ps2FpuClamp(a + b);
++}
++
++inline float ps2FpuSub(float a, float b)
++{
++    ps2FpuAlignOperands(a, b);
++    return ps2FpuClamp(a - b);
++}
++
++inline float ps2SignedFloatMax(uint32_t signSource)
++{
++    const uint32_t bits = (signSource & 0x80000000u) | 0x7F7FFFFFu;
++    float out;
++    std::memcpy(&out, &bits, sizeof(out));
++    return out;
++}
++
++inline uint32_t ps2FloatBits(float value)
++{
++    uint32_t bits;
++    std::memcpy(&bits, &value, sizeof(bits));
++    return bits;
++}
++
++inline uint32_t ps2FpuCompareKey(float value)
++{
++    uint32_t bits = ps2FloatBits(value);
++    if ((bits & 0x7F800000u) == 0u)
++        bits = 0u;
++    return (bits & 0x80000000u) != 0u ? ~bits : bits ^ 0x80000000u;
++}
++
++inline bool ps2FloatIsZero(float value)
++{
++    return (ps2FloatBits(value) & 0x7F800000u) == 0u;
++}
++
++constexpr uint32_t PS2_FCR31_I = 0x00020000u;
++constexpr uint32_t PS2_FCR31_D = 0x00010000u;
++constexpr uint32_t PS2_FCR31_SI = 0x00000040u;
++constexpr uint32_t PS2_FCR31_SD = 0x00000020u;
++
++inline float ps2FpuDivideNearest(float dividend, float divisor)
++{
++    const uint32_t csr = _mm_getcsr();
++    _mm_setcsr(csr & ~0x6000u);
++    const float result = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(dividend), _mm_set_ss(divisor)));
++    _mm_setcsr(csr);
++    return result;
++}
++
++inline float ps2FpuSqrtNearest(float value)
++{
++    const uint32_t csr = _mm_getcsr();
++    _mm_setcsr(csr & ~0x6000u);
++    const float result = _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(value)));
++    _mm_setcsr(csr);
++    return result;
++}
++
++inline float ps2FpuDivide(uint32_t &fcr31, float dividend, float divisor)
++{
++    if (ps2FloatIsZero(divisor))
++    {
++        if (ps2FloatIsZero(dividend))
++            fcr31 |= PS2_FCR31_I | PS2_FCR31_SI;
++        else
++            fcr31 |= PS2_FCR31_D | PS2_FCR31_SD;
++        return ps2SignedFloatMax(ps2FloatBits(dividend) ^ ps2FloatBits(divisor));
++    }
++    return ps2FpuClamp(ps2FpuDivideNearest(dividend, divisor));
++}
++
++inline float ps2FpuSqrt(uint32_t &fcr31, float value)
++{
++    if ((ps2FloatBits(value) & 0x80000000u) != 0u && !ps2FloatIsZero(value))
++        fcr31 |= PS2_FCR31_I | PS2_FCR31_SI;
++    return ps2FpuClamp(ps2FpuSqrtNearest(std::fabs(value)));
++}
++
++inline float ps2FpuRsqrt(uint32_t &fcr31, float numerator, float value)
++{
++    if (ps2FloatIsZero(value))
++    {
++        fcr31 |= PS2_FCR31_D | PS2_FCR31_SD;
++        return ps2SignedFloatMax(ps2FloatBits(numerator) ^ ps2FloatBits(value));
++    }
++    if ((ps2FloatBits(value) & 0x80000000u) != 0u)
++        fcr31 |= PS2_FCR31_I | PS2_FCR31_SI;
++    return ps2FpuClamp(ps2FpuDivideNearest(numerator, ps2FpuSqrtNearest(std::fabs(value))));
++}
++
++inline int32_t ps2FpuConvertToWord(float value)
++{
++    const uint32_t bits = ps2FloatBits(value);
++    if ((bits & 0x7F800000u) >= 0x4F000000u)
++        return (bits & 0x80000000u) ? INT32_MIN : INT32_MAX;
++    return static_cast<int32_t>(value);
++}
++
++constexpr uint16_t PS2_VU_STATUS_I = 0x0010u;
++constexpr uint16_t PS2_VU_STATUS_D = 0x0020u;
++constexpr uint16_t PS2_VU_STATUS_IS = 0x0400u;
++constexpr uint16_t PS2_VU_STATUS_DS = 0x0800u;
++
++inline float ps2VuDivide(uint16_t &status, float dividend, float divisor)
++{
++    status &= static_cast<uint16_t>(~(PS2_VU_STATUS_I | PS2_VU_STATUS_D));
++    if (ps2FloatIsZero(divisor))
++    {
++        if (ps2FloatIsZero(dividend))
++            status |= PS2_VU_STATUS_I | PS2_VU_STATUS_IS;
++        else
++            status |= PS2_VU_STATUS_D | PS2_VU_STATUS_DS;
++        return ps2SignedFloatMax(ps2FloatBits(dividend) ^ ps2FloatBits(divisor));
++    }
++    return ps2FpuClamp(dividend / divisor);
++}
++
++inline float ps2VuSqrt(uint16_t &status, float value)
++{
++    status &= static_cast<uint16_t>(~(PS2_VU_STATUS_I | PS2_VU_STATUS_D));
++    if ((ps2FloatBits(value) & 0x80000000u) != 0u && !ps2FloatIsZero(value))
++        status |= PS2_VU_STATUS_I | PS2_VU_STATUS_IS;
++    return ps2FpuClamp(std::sqrt(std::fabs(value)));
++}
++
++inline float ps2VuRsqrt(uint16_t &status, float numerator, float value)
++{
++    status &= static_cast<uint16_t>(~(PS2_VU_STATUS_I | PS2_VU_STATUS_D));
++    if (ps2FloatIsZero(value))
++    {
++        if (ps2FloatIsZero(numerator))
++            status |= PS2_VU_STATUS_I | PS2_VU_STATUS_IS;
++        else
++            status |= PS2_VU_STATUS_D | PS2_VU_STATUS_DS;
++        return ps2SignedFloatMax(ps2FloatBits(numerator) ^ ps2FloatBits(value));
++    }
++    if ((ps2FloatBits(value) & 0x80000000u) != 0u)
++        status |= PS2_VU_STATUS_I | PS2_VU_STATUS_IS;
++    return ps2FpuClamp(numerator / std::sqrt(std::fabs(value)));
++}
++
+ // PS2 VU (Vector Unit) operations
+-#define PS2_VADD(a, b) _mm_add_ps((__m128)(a), (__m128)(b))
+-#define PS2_VSUB(a, b) _mm_sub_ps((__m128)(a), (__m128)(b))
+-#define PS2_VMUL(a, b) _mm_mul_ps((__m128)(a), (__m128)(b))
++#define PS2_VADD(a, b) ps2VuClampVector(_mm_add_ps((__m128)(a), (__m128)(b)))
++#define PS2_VSUB(a, b) ps2VuClampVector(_mm_sub_ps((__m128)(a), (__m128)(b)))
++#define PS2_VMUL(a, b) ps2VuClampVector(_mm_mul_ps((__m128)(a), (__m128)(b)))
+ #define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
+-#define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
++#define PS2_VMULQ(a, q) ps2VuClampVector(_mm_mul_ps((__m128)(a), _mm_set1_ps(q)))
+ #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
+ 
+ // Memory access helpers - Hybrid Fast/Slow Path
+@@ -224,7 +413,8 @@ static inline uint64_t Ps2FastRead64(const uint8_t *rdram, uint32_t addr)
+ 
+ static inline __m128i Ps2FastRead128(const uint8_t *rdram, uint32_t addr)
+ {
+-    const uint32_t offset = addr & PS2_RAM_MASK;
++    // GOW-Port: LQ/SQ/LQC2/SQC2 ignoran los 4 bits bajos de la direccion (fork de SotC, 9bb389e).
++    const uint32_t offset = addr & PS2_RAM_MASK & ~0xFu;
+     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
+     {
+         alignas(16) uint8_t wrapped[sizeof(__m128i)];
+@@ -297,7 +487,7 @@ static inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
+ 
+ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+ {
+-    const uint32_t offset = addr & PS2_RAM_MASK;
++    const uint32_t offset = addr & PS2_RAM_MASK & ~0xFu; // GOW-Port
+     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
+     {
+         alignas(16) uint8_t wrapped[sizeof(__m128i)];
+@@ -348,7 +538,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+         : FAST_READ64(_addr); }())
+ 
+ #define READ128(addr) ([&]() -> __m128i {                     \
+-    uint32_t _addr = (uint32_t)(addr);                        \
++    uint32_t _addr = (uint32_t)(addr) & ~0xFu;                \
+     return PS2Runtime::isSpecialAddress(_addr)                \
+         ? runtime->Load128(rdram, ctx, _addr)                 \
+         : FAST_READ128(_addr); }())
+@@ -408,7 +598,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+ #define WRITE128(addr, val)                                                          \
+     do                                                                               \
+     {                                                                                \
+-        uint32_t _addr = (addr);                                                     \
++        uint32_t _addr = (uint32_t)(addr) & ~0xFu;                                   \
+         __m128i _value = (val);                                                      \
+         if (PS2Runtime::isSpecialAddress(_addr))                                     \
+             runtime->Store128(rdram, ctx, _addr, _value);                            \
+@@ -605,11 +795,11 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ 
+ // FPU (COP1) operations
+ #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
+-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
+-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
+-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
+-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
+-#define FPU_SQRT_S(a) sqrtf((float)(a))
++#define FPU_ADD_S(a, b) ps2FpuAdd((float)(a), (float)(b))
++#define FPU_SUB_S(a, b) ps2FpuSub((float)(a), (float)(b))
++#define FPU_MUL_S(a, b) ps2FpuClamp((float)(a) * (float)(b))
++#define FPU_DIV_S(a, b) ps2FpuClamp((float)(a) / (float)(b))
++#define FPU_SQRT_S(a) ps2FpuClamp(std::sqrt(std::fabs((float)(a))))
+ #define FPU_ABS_S(a) fabsf((float)(a))
+ #define FPU_MOV_S(a) ((float)(a))
+ #define FPU_NEG_S(a) (-(float)(a))
+@@ -623,24 +813,24 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
+ #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
+ #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
+-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
++#define FPU_CVT_W_S(a) ps2FpuConvertToWord((float)(a))
+ #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+ #define FPU_C_F_S(a, b) (0)
+-#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
+-#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
+-#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
+-#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_UN_S(a, b) (0)
++#define FPU_C_EQ_S(a, b) (ps2FpuCompareKey((float)(a)) == ps2FpuCompareKey((float)(b)))
++#define FPU_C_UEQ_S(a, b) FPU_C_EQ_S(a, b)
++#define FPU_C_OLT_S(a, b) (ps2FpuCompareKey((float)(a)) < ps2FpuCompareKey((float)(b)))
++#define FPU_C_ULT_S(a, b) FPU_C_OLT_S(a, b)
++#define FPU_C_OLE_S(a, b) (ps2FpuCompareKey((float)(a)) <= ps2FpuCompareKey((float)(b)))
++#define FPU_C_ULE_S(a, b) FPU_C_OLE_S(a, b)
+ #define FPU_C_SF_S(a, b) (0)
+-#define FPU_C_NGLE_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_SEQ_S(a, b) ((float)(a) == (float)(b))
+-#define FPU_C_NGL_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_LT_S(a, b) ((float)(a) < (float)(b))
+-#define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_LE_S(a, b) ((float)(a) <= (float)(b))
+-#define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_NGLE_S(a, b) (0)
++#define FPU_C_SEQ_S(a, b) FPU_C_EQ_S(a, b)
++#define FPU_C_NGL_S(a, b) FPU_C_EQ_S(a, b)
++#define FPU_C_LT_S(a, b) FPU_C_OLT_S(a, b)
++#define FPU_C_NGE_S(a, b) FPU_C_OLT_S(a, b)
++#define FPU_C_LE_S(a, b) FPU_C_OLE_S(a, b)
++#define FPU_C_NGT_S(a, b) FPU_C_OLE_S(a, b)
+ 
+ // QFSRV: Quadword Funnel Shift Right Variable
+ // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index e1e6615..d174891 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -158,6 +158,9 @@ namespace
+     };
+ 
+     thread_local DispatchHistory g_dispatchHistory;
++    // GOW-Port: cuenta los saltos (no llamadas) despachados, para distinguir un retorno implicito de un salto final
++    // que vuelve a la entrada de la funcion llamada (fork de SotC, c4c20e8).
++    thread_local uint64_t g_guestJumpSerial = 0u;
+ 
+     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
+     {
+@@ -1435,6 +1438,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ 
+     if (!isCall)
+     {
++        ++g_guestJumpSerial;
+         if (!hasFunction(targetPc))
+         {
+             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+@@ -1469,6 +1473,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
+     const uint64_t checkpointSerial = m_eeCheckpointSerial;
++    const uint64_t jumpSerial = g_guestJumpSerial;
+     ps2_perf::guestEntry(targetPc); // GOW-Port: también cuenta llamadas que no vuelven al dispatcher.
+     targetFn(rdram, ctx, this);
+ 
+@@ -1477,7 +1482,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
+-    if (ctx->pc == entryPc && m_eeCheckpointSerial == checkpointSerial)
++    if (ctx->pc == entryPc && m_eeCheckpointSerial == checkpointSerial && jumpSerial == g_guestJumpSerial)
+     {
+         ctx->pc = fallthroughPc;
+     }
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 09e8fdc..58fab65 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -179,7 +179,8 @@ void register_code_generator_tests()
+                                  (11u << 16) | (fd << 6) | COP1_S_SQRT;
+             const Instruction inst = decoder.decodeInstruction(0x1000, raw, false);
+             const std::string code = gen.translateInstruction(inst);
+-            t.Equals(code, "ctx->f[" + std::to_string(fd) + "] = FPU_SQRT_S(ctx->f[11]);",
++            // GOW-Port: desde ps2recomp-ee-fixes.patch la raiz pasa por ps2FpuSqrt (flags de FCR31, sin NaN).
++            t.Equals(code, "ctx->f[" + std::to_string(fd) + "] = ps2FpuSqrt(ctx->fcr31, ctx->f[11]);",
+                      "SQRT.S debe leer FT=11 incluso si FS=0 o FD coincide con FT");
+         }
+     });
+@@ -193,7 +194,7 @@ void register_code_generator_tests()
+                                  (11u << 16) | (7u << 11) | (fd << 6) | COP1_S_RSQRT;
+             const Instruction inst = decoder.decodeInstruction(0x1004, raw, false);
+             const std::string code = gen.translateInstruction(inst);
+-            t.Equals(code, "ctx->f[" + std::to_string(fd) + "] = ctx->f[7] / FPU_SQRT_S(ctx->f[11]);",
++            t.Equals(code, "ctx->f[" + std::to_string(fd) + "] = ps2FpuRsqrt(ctx->fcr31, ctx->f[7], ctx->f[11]);",
+                      "RSQRT.S debe calcular FS/sqrt(FT), incluidos los alias de destino");
+         }
+     });
+@@ -1713,6 +1714,50 @@ void register_code_generator_tests()
+                      "backward internal branch should still re-enter the in-function label when it keeps the current slice");
+         });
+ 
++        tc.Run("signed branches compare the full 64-bit EE register", [](TestCase &t) {
++            struct BranchCase
++            {
++                uint32_t opcode;
++                uint8_t rt;
++                const char *comparison;
++            };
++            const BranchCase cases[] = {
++                {OPCODE_BLEZ, 0, "<= 0"},
++                {OPCODE_BLEZL, 0, "<= 0"},
++                {OPCODE_BGTZ, 0, "> 0"},
++                {OPCODE_BGTZL, 0, "> 0"},
++                {OPCODE_REGIMM, REGIMM_BLTZ, "< 0"},
++                {OPCODE_REGIMM, REGIMM_BLTZL, "< 0"},
++                {OPCODE_REGIMM, REGIMM_BLTZAL, "< 0"},
++                {OPCODE_REGIMM, REGIMM_BLTZALL, "< 0"},
++                {OPCODE_REGIMM, REGIMM_BGEZ, ">= 0"},
++                {OPCODE_REGIMM, REGIMM_BGEZL, ">= 0"},
++                {OPCODE_REGIMM, REGIMM_BGEZAL, ">= 0"},
++                {OPCODE_REGIMM, REGIMM_BGEZALL, ">= 0"},
++            };
++            for (const BranchCase &branchCase : cases)
++            {
++                Function func{};
++                func.name = "signed_branch";
++                func.start = 0x1200;
++                func.end = 0x1210;
++                func.isRecompiled = true;
++
++                Instruction branch = makeIType(0x1200, branchCase.opcode, 3, branchCase.rt, 1);
++                branch.isBranch = true;
++                branch.hasDelaySlot = true;
++
++                CodeGenerator gen({}, {});
++                const std::string generated = gen.generateFunction(
++                    func, {branch, makeNop(0x1204), makeNop(0x1208)}, false);
++                const std::string expected = std::string("GPR_S64(ctx, 3) ") + branchCase.comparison;
++                t.IsTrue(generated.find(expected) != std::string::npos,
++                         "signed branch must use bit 63, including likely and link variants");
++                t.IsTrue(generated.find("GPR_S32(ctx, 3)") == std::string::npos,
++                         "the low-word sign can differ from the sign of a soft-double mantissa");
++            }
++        });
++
+         tc.Run("branch-likely places delay slot only in taken path", [](TestCase &t) {
+             Function func;
+             func.name = "branch_likely";
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index 72f3a64..53666c1 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -175,6 +175,12 @@ namespace
+ 
+     std::atomic<uint32_t> gGuestJumpTargetCount{0u};
+ 
++    void testGuestBranchSelfTailJumpHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setRegU32(*ctx, 29, 0x00001F00u);
++        runtime->dispatchGuestBranch(rdram, ctx, 0x3600u, 0x3610u, 0u, PS2Runtime::GuestBranchKind::DirectJump, "test-j");
++    }
++
+     void testGuestJumpTargetHandler(uint8_t *, R5900Context *, PS2Runtime *)
+     {
+         gGuestJumpTargetCount.fetch_add(1u, std::memory_order_relaxed);
+@@ -476,6 +482,33 @@ void register_ps2_runtime_expansion_tests()
+             t.Equals(ctx.pc, 0x3000u, "the scheduler must resume the unfinished loop");
+         });
+ 
++        // GOW-Port: prueba del fork de SotC (c4c20e8).
++        tc.Run("dispatchGuestBranch call does not treat a tail jump to the callee entry as a return", [](TestCase &t)
++        {
++            PS2Runtime runtime;
++            runtime.registerFunction(0x3600u, &testGuestBranchSelfTailJumpHandler);
++
++            R5900Context ctx{};
++            ctx.pc = 0x2000u;
++            setRegU32(ctx, 29, 0x00002000u);
++
++            const bool continuedInCaller = runtime.dispatchGuestBranch(
++                nullptr,
++                &ctx,
++                0x3600u,
++                0x2000u,
++                0x2008u,
++                PS2Runtime::GuestBranchKind::DirectCall,
++                "test-jal");
++
++            t.IsFalse(continuedInCaller,
++                      "a pending tail jump back to the callee entry must unwind to the dispatcher");
++            t.Equals(ctx.pc, 0x3600u,
++                     "the dispatcher should resume at the tail-jump target");
++            t.Equals(::getRegU32(&ctx, 29), 0x00001F00u,
++                     "the callee's stack pointer belongs to the pending tail call");
++        });
++
+         tc.Run("dispatchGuestBranch jump returns to central dispatcher without nesting", [](TestCase &t)
+         {
+             PS2Runtime runtime;
+diff --git a/ps2xTest/src/ps2_vu_tests.cpp b/ps2xTest/src/ps2_vu_tests.cpp
+index b96befe..832594a 100644
+--- a/ps2xTest/src/ps2_vu_tests.cpp
++++ b/ps2xTest/src/ps2_vu_tests.cpp
+@@ -1041,5 +1041,87 @@ void register_ps2_vu_tests()
+             readMat4(env, kDst, out);
+             t.IsTrue(nearlyEqual(out[0], 0.0f), "DropShadowMatrix point mode should subtract d before scaling by k");
+         });
++
++        // GOW-Port: VRSQRT de VU0 en modo macro es FS/sqrt(|FT|) (antes se ignoraba FS) y dividir por cero satura.
++        tc.Run("VU0 Q-unit VRSQRT uses FS and saturates on zero divisors", [](TestCase &t)
++        {
++            uint16_t status = 0u;
++            t.IsTrue(nearlyEqual(ps2VuRsqrt(status, 6.0f, 9.0f), 2.0f), "VRSQRT should compute FS/sqrt(FT)");
++            t.IsTrue(nearlyEqual(ps2VuRsqrt(status, 6.0f, -9.0f), 2.0f), "VRSQRT should use |FT|");
++            t.IsTrue((status & PS2_VU_STATUS_I) != 0u, "a negative radicand should set the invalid flag");
++            const float saturated = ps2VuDivide(status, -1.0f, 0.0f);
++            t.IsTrue(std::isfinite(saturated) && saturated < -3.0e38f, "division by zero should give -FLT_MAX, not infinity");
++            t.IsTrue((status & PS2_VU_STATUS_D) != 0u, "division by zero should set the D flag");
++            uint32_t fcr31 = 0u;
++            t.IsTrue(std::isfinite(ps2FpuDivide(fcr31, 1.0f, 0.0f)), "EE DIV.S by zero should stay finite");
++            t.IsTrue(std::isfinite(FPU_MUL_S(3.0e38f, 3.0e38f)), "EE MUL.S overflow should saturate");
++        });
++
++        // GOW-Port: pruebas del fork de SotC (c419f26, 9bb389e) para la FPU del EE y LQ/SQ.
++        tc.Run("EE FPU compares extended finite values", [](TestCase &t)
++        {
++            const auto fromBits = [](uint32_t bits) { float value; std::memcpy(&value, &bits, sizeof(value)); return value; };
++            const float sentinel = fromBits(0x7FFFFFFFu);
++            const float negativeSentinel = fromBits(0xFFFFFFFFu);
++            t.IsTrue(FPU_C_EQ_S(sentinel, sentinel), "the horse steering sentinel compares equal to itself");
++            t.IsTrue(FPU_C_OLT_S(3.0f, sentinel), "the extended positive value exceeds ordinary finite values");
++            t.IsTrue(FPU_C_OLT_S(negativeSentinel, -3.0f), "the extended negative value is below ordinary finite values");
++            t.IsTrue(FPU_C_EQ_S(-0.0f, 0.0f), "signed zeros compare equal");
++            t.IsTrue(!FPU_C_UN_S(sentinel, sentinel), "the EE does not classify extended values as unordered");
++        });
++
++        tc.Run("EE FPU add/sub drops operand bits shifted out of the aligned mantissa", [](TestCase &t)
++        {
++            const auto bits = [](float v) { uint32_t b; std::memcpy(&b, &v, sizeof(b)); return b; };
++            const auto fromBits = [](uint32_t b) { float v; std::memcpy(&v, &b, sizeof(v)); return v; };
++            const uint32_t savedCsr = _mm_getcsr();
++            _mm_setcsr((savedCsr & ~0x6000u) | 0x6000u);
++            const float oneMinusTiny = FPU_SUB_S(1.0f, 4.6e-9f);
++            const float oneMinusSmall = FPU_SUB_S(1.0f, fromBits(0x339DD4C2u));
++            const float tinyPlusOne = FPU_ADD_S(fromBits(0xB39DD4C2u), 1.0f);
++            const float sameExponent = FPU_ADD_S(1.5f, 1.25f);
++            const float withZero = FPU_ADD_S(0.0f, -2.0f);
++            _mm_setcsr(savedCsr);
++            t.Equals(bits(oneMinusTiny), 0x3F800000u, "exponent difference >= 25 leaves the larger operand unchanged");
++            t.Equals(bits(oneMinusSmall), 0x3F7FFFFFu, "difference 24 truncates the smaller operand to its leading bit before subtracting");
++            t.Equals(bits(tinyPlusOne), 0x3F7FFFFFu, "the smaller operand may be either source");
++            t.Equals(bits(sameExponent), bits(2.75f), "equal exponents add normally");
++            t.Equals(bits(withZero), bits(-2.0f), "zero operands are harmless");
++        });
++
++        tc.Run("EE FPU div/sqrt round to nearest under a round-toward-zero MXCSR", [](TestCase &t)
++        {
++            const auto bits = [](float v) { uint32_t b; std::memcpy(&b, &v, sizeof(b)); return b; };
++            const uint32_t savedCsr = _mm_getcsr();
++            _mm_setcsr((savedCsr & ~0x6000u) | 0x6000u);
++            uint32_t fcr31 = 0u;
++            const float third = ps2FpuDivide(fcr31, 1.0f, 3.0f);
++            const float root5 = ps2FpuSqrt(fcr31, 5.0f);
++            volatile float three = 3.0f;
++            const float chopped = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(1.0f), _mm_set_ss(three)));
++            const uint32_t csrAfter = _mm_getcsr();
++            _mm_setcsr(savedCsr);
++            t.Equals(bits(third), 0x3EAAAAABu, "DIV.S rounds to nearest");
++            t.Equals(bits(root5), 0x400F1BBDu, "SQRT.S rounds to nearest");
++            t.Equals(bits(chopped), 0x3EAAAAAAu, "other operations keep round toward zero");
++            t.Equals(csrAfter & 0x6000u, 0x6000u, "the rounding mode is restored");
++        });
++
++        tc.Run("LQ/SQ ignore the low four address bits", [](TestCase &t)
++        {
++            VuEnv env;
++            uint8_t *rdram = env.rdram.data();
++            R5900Context *ctx = &env.ctx;
++            PS2Runtime *runtime = &env.runtime;
++            const __m128i value = _mm_set_epi32(0x44444444, 0x33333333, 0x22222222, 0x11111111);
++            WRITE128(kA + 0xCu, value);
++            const __m128i back = READ128(kA + 0x7u);
++            t.Equals(static_cast<uint32_t>(_mm_cvtsi128_si32(back)), 0x11111111u, "read uses the aligned quadword");
++            uint32_t word = 0;
++            std::memcpy(&word, rdram + kA, sizeof(word));
++            t.Equals(word, 0x11111111u, "write lands on the aligned quadword");
++            std::memcpy(&word, rdram + kA + 0x10u, sizeof(word));
++            t.Equals(word, 0u, "the next quadword is untouched");
++        });
+     });
+ }

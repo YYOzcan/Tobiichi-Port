@@ -1,0 +1,135 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -115,7 +115,8 @@
+                            uint64_t trxreg,
+                            uint64_t trxdir,
+                            const uint8_t *data,
+-                           uint32_t sizeBytes);
++                           uint32_t sizeBytes,
++                           uint64_t setupGifTag = 0u); // GOW-Port: efectos del setup validado por DMA.
+     void writeRegister(uint8_t regAddr, uint64_t value);
+ 
+     const uint8_t *lockDisplaySnapshot(uint32_t &outSize);
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -815,9 +815,18 @@
+                            uint64_t trxreg,
+                            uint64_t trxdir,
+                            const uint8_t *data,
+-                           uint32_t sizeBytes)
++                           uint32_t sizeBytes,
++                           uint64_t setupGifTag)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    // GOW-Port: DMA valida toda la cadena antes de aplicar PRE/Q, bajo el mismo lock que la subida.
++    if (data && sizeBytes && m_backend && (setupGifTag & 0x7FFFu) &&
++        ((setupGifTag >> 58u) & 3u) == GIF_FMT_PACKED)
++    {
++        m_curQ = 1.0f;
++        if ((setupGifTag >> 46u) & 1u)
++            writeRegisterUnlocked(GS_REG_PRIM, (setupGifTag >> 47u) & 0x7FFu);
++    }
+     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2121,7 +2121,8 @@
+         return false;
+ 
+     const uint64_t imageTagLo = loadScalar<uint64_t>(imageGifTag, 0u, 16u, "native gif image tag", imageTagDmaAddr + 16u);
+-    if (gifTagFlg(imageTagLo) != GIF_FMT_IMAGE)
++    // GOW-Port: el atajo acepta los mismos formatos de imagen que el frontend.
++    if (gifTagFlg(imageTagLo) != GIF_FMT_IMAGE && gifTagFlg(imageTagLo) != GIF_FMT_IMAGE2)
+         return false;
+ 
+     const uint32_t imageQwc = gifTagNloop(imageTagLo);
+@@ -2177,7 +2178,9 @@
+     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+     m_seenGifCopy = true;
+     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+-    gs.uploadImageNative(setupRegs[0], setupRegs[1], setupRegs[2], setupRegs[3], imageData, imageBytes);
++    // GOW-Port: mantener los efectos de la GIFtag PACKED sin perder el atajo DMA de texturas.
++    const uint64_t setupGifTag = loadScalar<uint64_t>(setupPayload, 0u, 80u, "native gif setup tag", setupPayloadAddr);
++    gs.uploadImageNative(setupRegs[0], setupRegs[1], setupRegs[2], setupRegs[3], imageData, imageBytes, setupGifTag);
+ 
+     m_ioRegisters[GIF_CHANNEL + 0x30u] = finalTadr;
+     m_ioRegisters[GIF_CHANNEL + 0x40u] = 0u;
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -6,6 +6,7 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_swizzle.h"
+ #include "runtime/gs/ps2_gs_memory.h"
++#include "runtime/ps2_memory.h"
+ #include <algorithm>
+ #include <cstdlib>
+ #include <cstring>
+@@ -354,6 +355,63 @@
+                                  "El renderer CPU conserva cada pixel IMAGE2");
+             }
+         });
++        t.Run("native DMA IMAGE chain preserves GIF tag PRE Q and pixels", [](TestCase &t) {
++            for(const uint64_t format : {2ull,3ull}) for(const bool pre : {false,true})
++            {
++                PS2Memory mem; t.IsTrue(mem.initialize(),"Memoria para cadena DMA");
++                Recording r; GS gs; gs.init(mem.getGSVRAM(),uint32_t(PS2_GS_VRAM_SIZE));
++                gs.setRasterBackend(std::make_unique<Recorder>(r));
++                constexpr uint32_t address=0x28000u,pixels=0x29000u;
++                const uint64_t chain[]={5ull|(1ull<<28),0ull,
++                    4ull|(1ull<<60)|(pre ? (1ull<<46)|(uint64_t(GS_PRIM_SPRITE)<<47) : 0ull),0xeull,
++                    (96ull<<32)|(1ull<<48),GS_REG_BITBLTBUF,
++                    0ull,GS_REG_TRXPOS,4ull|(1ull<<32),GS_REG_TRXREG,0ull,GS_REG_TRXDIR,
++                    1ull|(1ull<<28),0ull,
++                    1ull|(format<<58)|(1ull<<46),0ull,
++                    1ull|(3ull<<28)|(uint64_t(pixels)<<32),0ull,
++                    7ull<<28,0ull};
++                std::memcpy(mem.getRDRAM()+address,chain,sizeof(chain));
++                for(uint32_t i=0;i<16u;++i) mem.getRDRAM()[pixels+i]=uint8_t(0x40u+i);
++                gs.writeRegister(GS_REG_PRIM,GS_PRIM_TRIANGLE);
++                gs.writeRegister(GS_REG_RGBAQ,0x4000000080112233ull); // Q=2 antes de la etiqueta.
++                t.IsTrue(mem.tryProcessNativeGifImageUploadChain(gs,address,0x105u),"Cadena IMAGE/IMAGE2 validada usa el atajo");
++                t.Equals(gs.nativeImageUploadCount(),1ull,"Una sola subida nativa");
++                t.Equals(gs.getDebugSnapshot().prim.type,uint8_t(pre ? GS_PRIM_SPRITE : GS_PRIM_TRIANGLE),
++                         "Solo PRE de la etiqueta PACKED del setup afecta a PRIM");
++                t.IsTrue(r.uploaded.size()==16u && std::memcmp(r.uploaded.data(),mem.getRDRAM()+pixels,16u)==0,
++                         "El atajo conserva los bytes de los pixels");
++                gs.writeRegister(GS_REG_PRIM,GS_PRIM_POINT);
++                gs.writeRegister(GS_REG_XYZ2,0x00100010ull);
++                t.Equals(r.draws.size(),size_t(1),"Punto posterior para observar Q sin otra GIFtag");
++                if(!r.draws.empty()) {
++                    t.Equals(r.draws[0].vertices[0].q,1.0f,"El atajo DMA reinicia Q por las etiquetas no vacias");
++                    t.Equals(r.draws[0].vertices[0].r,uint8_t(0x33u),"Reiniciar Q no cambia el color previo");
++                }
++            }
++        });
++        t.Run("rejected native DMA IMAGE chain does not apply its setup tag", [](TestCase &t) {
++            PS2Memory mem; t.IsTrue(mem.initialize(),"Memoria para cadena DMA rechazada");
++            Recording r; GS gs; gs.init(mem.getGSVRAM(),uint32_t(PS2_GS_VRAM_SIZE));
++            gs.setRasterBackend(std::make_unique<Recorder>(r));
++            constexpr uint32_t address=0x28000u,pixels=0x29000u;
++            const uint64_t chain[]={5ull|(1ull<<28),0ull,
++                4ull|(1ull<<60)|(1ull<<46)|(uint64_t(GS_PRIM_SPRITE)<<47),0xeull,
++                (96ull<<32)|(1ull<<48),GS_REG_BITBLTBUF,
++                0ull,GS_REG_TRXPOS,4ull|(1ull<<32),GS_REG_TRXREG,0ull,GS_REG_TRXDIR,
++                1ull|(1ull<<28),0ull,1ull|(2ull<<58),0ull,
++                1ull|(3ull<<28)|(uint64_t(pixels)<<32),0ull,
++                2ull<<28,0ull}; // terminal NEXT invalido para el atajo canonico
++            std::memcpy(mem.getRDRAM()+address,chain,sizeof(chain));
++            gs.writeRegister(GS_REG_PRIM,GS_PRIM_TRIANGLE);
++            gs.writeRegister(GS_REG_RGBAQ,0x4000000080112233ull);
++            t.IsTrue(!mem.tryProcessNativeGifImageUploadChain(gs,address,0x105u),"Validar toda la cadena antes de alterar GS");
++            t.Equals(gs.nativeImageUploadCount(),0ull,"Rechazo no cuenta una subida");
++            t.IsTrue(r.uploaded.empty(),"Rechazo no sube pixels");
++            t.Equals(gs.getDebugSnapshot().prim.type,uint8_t(GS_PRIM_TRIANGLE),"PRE queda intacto tras el rechazo");
++            gs.writeRegister(GS_REG_PRIM,GS_PRIM_POINT); gs.writeRegister(GS_REG_XYZ2,0x00100010ull);
++            t.Equals(r.draws.size(),size_t(1),"Punto posterior al rechazo");
++            if(!r.draws.empty()) t.Equals(r.draws[0].vertices[0].q,2.0f,"Q queda intacto tras el rechazo");
++        });
+         t.Run("GS reset discards partial GIF input before the next packet", [](TestCase &t) {
+             std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GS gs; gs.init(vram.data(),uint32_t(vram.size()));
+             const uint64_t partial[]={2ull|(1ull<<60),0xeull,5ull,GS_REG_COLCLAMP};

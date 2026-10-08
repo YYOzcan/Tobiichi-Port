@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 
 namespace ps2x::iop::detail
@@ -66,7 +67,20 @@ namespace ps2x::iop::detail
         void cleanupDeadThreads();
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
+        // GOW-Port: espera fuera de un hilo (servidor RPC o callback ejecutado sin hilo actual). El emulador
+        // deja correr a los hilos listos hasta que la condicion se cumple; devuelve si se cumplio.
+        using OutsideThreadWait = std::function<bool(const std::function<bool()> &)>;
+        void setOutsideThreadWait(OutsideThreadWait wait) { m_outsideThreadWait = std::move(wait); }
+
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        // GOW-Port: hay algun hilo listo para ejecutar (lo usa IopRpcBridge tras cada RPC).
+        [[nodiscard]] bool hasReadyThread() const noexcept
+        {
+            for (const auto &[id, thread] : m_threads)
+                if (thread.state == IopThreadState::Ready)
+                    return true;
+            return false;
+        }
 
     private:
         struct Semaphore
@@ -99,5 +113,13 @@ namespace ps2x::iop::detail
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
         IopThread *m_currentThread = nullptr;
+        OutsideThreadWait m_outsideThreadWait;
+        // GOW-Port: el EE avanza el IOP ~1,5 millones de veces por segundo de a pocos ciclos, casi siempre
+        // sin hilos listos. m_version cambia con cada operación que puede cambiar los hilos; si no cambió
+        // desde el último beginNextReady sin hilos listos, el resultado es el mismo hasta m_idleUntil (el
+        // primer despertar de un hilo en Delay) y no hace falta recorrer m_threads.
+        uint64_t m_version = 1;
+        uint64_t m_idleVersion = 0;
+        uint64_t m_idleUntil = 0;
     };
 }

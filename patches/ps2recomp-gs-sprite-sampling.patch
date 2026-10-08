@@ -1,0 +1,318 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -6,6 +6,7 @@
+ #include "runtime/gs/ps2_gs_psmt8.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "gs_triangle_rules.h"
++#include "gs_sprite_rules.h"
+ #include "ps2_log.h"
+ #include <atomic>
+ #include <chrono>
+@@ -1305,26 +1306,18 @@
+     const GSVertex &v1 = batch.vertices[1];
+     const auto &ctx = state.context;
+ 
+-    int ofx = ctx.xyoffset.ofx >> 4;
+-    int ofy = ctx.xyoffset.ofy >> 4;
+-
+-    int x0 = static_cast<int>(v0.x) - ofx;
+-    int y0 = static_cast<int>(v0.y) - ofy;
+-    int x1 = static_cast<int>(v1.x) - ofx;
+-    int y1 = static_cast<int>(v1.y) - ofy;
+-    u32 z1 = static_cast<u32>(v1.z);
+-
+-    if (x0 > x1)
+-        std::swap(x0, x1);
+-    if (y0 > y1)
+-        std::swap(y0, y1);
+-
+-    const int unclippedX0 = x0;
+-    const int unclippedY0 = y0;
+-    const int spanX = std::max(1, x1 - x0);
+-    const int spanY = std::max(1, y1 - y0);
+-    const int unclippedX1 = unclippedX0 + spanX - 1;
+-    const int unclippedY1 = unclippedY0 + spanY - 1;
++    // GOW-Port: ejes firmados de sotc-port, ac9efa070638ad3b3accd284de6f898d5ab271d1
++    // (Taylor N. Albarnaz / LightVelox), igual que OpenGL. El scissor solo recorta
++    // cobertura; no cambia el origen ni el sentido de interpolacion de UV/ST.
++    const GSSpriteAxis axisX = gsSpriteAxis(v0.x, v1.x, static_cast<float>(ctx.xyoffset.ofx) / 16.0f);
++    const GSSpriteAxis axisY = gsSpriteAxis(v0.y, v1.y, static_cast<float>(ctx.xyoffset.ofy) / 16.0f);
++    const int unclippedX0 = axisX.first;
++    const int unclippedY0 = axisY.first;
++    const int unclippedX1 = axisX.last;
++    const int unclippedY1 = axisY.last;
++    const u32 z1 = static_cast<u32>(v1.z);
++    if (unclippedX1 < unclippedX0 || unclippedY1 < unclippedY0)
++        return;
+ 
+     // If the sprite rectangle is fully outside scissor, nothing should render.
+     if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
+@@ -1351,10 +1344,10 @@
+         float u0f, v0f, u1f, v1f;
+         if (state.prim.fst)
+         {
+-            u0f = static_cast<float>(v0.u >> 4);
+-            v0f = static_cast<float>(v0.v >> 4);
+-            u1f = static_cast<float>(v1.u >> 4);
+-            v1f = static_cast<float>(v1.v >> 4);
++            u0f = static_cast<float>(v0.u) / 16.0f;
++            v0f = static_cast<float>(v0.v) / 16.0f;
++            u1f = static_cast<float>(v1.u) / 16.0f;
++            v1f = static_cast<float>(v1.v) / 16.0f;
+         }
+         else
+         {
+@@ -1366,21 +1359,14 @@
+             v1f = (v1.t / q1) * static_cast<float>(texH);
+         }
+ 
+-        float spriteW = static_cast<float>(spanX);
+-        float spriteH = static_cast<float>(spanY);
+-        if (spriteW < 1.0f)
+-            spriteW = 1.0f;
+-        if (spriteH < 1.0f)
+-            spriteH = 1.0f;
+-
+         for (int y = drawY0; y <= drawY1; ++y)
+         {
+-            float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
++            const float ty = gsSpriteParameter(axisY, y);
+             float texVf = v0f + (v1f - v0f) * ty;
+ 
+             for (int x = drawX0; x <= drawX1; ++x)
+             {
+-                float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
++                const float tx = gsSpriteParameter(axisX, x);
+                 float texUf = u0f + (u1f - u0f) * tx;
+                 uint32_t texel = 0xFFFF00FFu;
+                 if (state.prim.fst)
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -153,6 +153,80 @@
+             }
+         }
+     }
++    // GOW-Port: GS 3.2.9 y ejes firmados de sotc-port ac9efa070638ad3b3accd284de6f898d5ab271d1.
++    void spriteSampling(TestCase &t, GSRasterBackend &backend, unsigned fixture)
++    {
++        auto draw=sprite();
++        draw.vertices[0].x=20;draw.vertices[0].y=20;
++        draw.vertices[1].x=28;draw.vertices[1].y=28;
++        if(fixture==0u) {
++            for(const uint16_t extra : {uint16_t(0),uint16_t(16)}) {
++                draw.state.context.xyoffset.ofx=4+extra;draw.state.context.xyoffset.ofy=12+extra;
++                draw.vertices[0].x=20.5f;draw.vertices[0].y=20.5f;
++                draw.vertices[1].x=28.5f;draw.vertices[1].y=28.5f;
++                for(const bool reverse : {false,true}) {
++                    backend.ClearFramebuffer(draw.state.context,0x80332211u);
++                    auto submitted=draw;
++                    if(reverse) std::swap(submitted.vertices[0],submitted.vertices[1]);
++                    backend.Submit(submitted);
++                    const uint32_t firstX=extra ? 20u:21u,firstY=extra ? 19u:20u;
++                    for(uint32_t y=18;y<=30u;++y) for(uint32_t x=18;x<=30u;++x) {
++                        const uint32_t expected=x>=firstX&&x<firstX+8u&&y>=firstY&&y<firstY+8u ? 0x80633319u:0x80332211u;
++                        if(backend.ReadVram(0,0,1,x,y)!=expected) {
++                            t.Fail("Cobertura fraccional de sprite: x="+std::to_string(x)+" y="+std::to_string(y));return;
++                        }
++                    }
++                }
++            }
++        } else if(fixture==1u) {
++            for(unsigned axis=0;axis<2u;++axis) {
++                backend.ClearFramebuffer(draw.state.context,0x80332211u);
++                std::vector<uint8_t> before,after;backend.SnapshotVram(before);
++                auto empty=draw;
++                if(axis==0u) empty.vertices[1].x=empty.vertices[0].x;
++                else empty.vertices[1].y=empty.vertices[0].y;
++                backend.Submit(empty);backend.SnapshotVram(after);
++                t.IsTrue(before==after,"Ancho o alto cero no modifica VRAM");
++            }
++        } else {
++            draw.state.prim.tme=true;draw.state.prim.fst=true;
++            draw.state.context.tex0.tbp0=256;draw.state.context.tex0.tbw=1;
++            draw.state.context.tex0.tfx=1;draw.state.context.tex0.tcc=1;
++            draw.state.textureWidth=8;draw.state.textureHeight=8;
++            for(uint32_t y=0;y<8u;++y) for(uint32_t x=0;x<8u;++x)
++                backend.WriteVram(0,256,1,x,y,0x80000000u|x*29u|((y*29u)<<8));
++            if(fixture==2u) {
++                draw.state.context.tex1=(1ull<<5)|(1ull<<6);
++                draw.state.linearFilter=true;
++                for(auto &v:draw.vertices) {v.u=12;v.v=12;v.s=0.75f/8;v.t=0.75f/8;v.q=1;}
++                for(const bool fst : {true,false}) {
++                    draw.state.prim.fst=fst;
++                    backend.ClearFramebuffer(draw.state.context,0x80332211u);backend.Submit(draw);
++                    t.Equals(backend.ReadVram(0,0,1,24,24),0x80000707u,
++                             "UV=0.75: pesos lineales 3/4 y 1/4 conservan la fraccion");
++                }
++            } else {
++                draw.vertices[1].u=128;draw.vertices[1].v=128;
++                for(unsigned reverse=0;reverse<4u;++reverse) {
++                    backend.ClearFramebuffer(draw.state.context,0x80332211u);
++                    auto submitted=draw;
++                    if(reverse&1u) {std::swap(submitted.vertices[0].x,submitted.vertices[1].x);std::swap(submitted.vertices[0].u,submitted.vertices[1].u);}
++                    if(reverse&2u) {std::swap(submitted.vertices[0].y,submitted.vertices[1].y);std::swap(submitted.vertices[0].v,submitted.vertices[1].v);}
++                    // El scissor recorta la cobertura, no el origen de interpolacion.
++                    submitted.state.context.scissor={22,26,21,25};
++                    backend.Submit(submitted);
++                    for(uint32_t y=20;y<28u;++y) for(uint32_t x=20;x<28u;++x) {
++                        const uint32_t expected=x>=22u&&x<=26u&&y>=21u&&y<=25u
++                                                   ? 0x80000000u|((x-20u)*29u)|(((y-20u)*29u)<<8):0x80332211u;
++                        if(backend.ReadVram(0,0,1,x,y)!=expected) {
++                            t.Fail("Sprite invertido/recortado conserva texels: x="+std::to_string(x)+" y="+std::to_string(y));return;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
+     void transferRoundtrip(TestCase &t, GSRasterBackend &b)
+     {
+         GSTransferCommand c{};
+@@ -720,6 +794,22 @@
+             std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
+             backend.Initialize(vram.data(),uint32_t(vram.size())); triangleSampling(t,backend,2);
+         });
++        t.Run("CPU sprites preserve fractional XYOFFSET and coverage", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size())); spriteSampling(t,backend,0);
++        });
++        t.Run("CPU sprites with zero width or height do not draw", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size())); spriteSampling(t,backend,1);
++        });
++        t.Run("CPU sprite linear filtering preserves UV fractional bits", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size())); spriteSampling(t,backend,2);
++        });
++        t.Run("CPU sprite texture axes preserve reversed and clipped texels", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize); GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size())); spriteSampling(t,backend,3);
++        });
+         t.Run("GPU swizzle matches existing GS memory for all 13 formats", [](TestCase &t) {
+             GSMem::InitLookupTables();
+             const uint32_t formats[]={0,1,2,10,19,20,27,36,44,48,49,50,58};
+@@ -767,6 +857,15 @@
+                     t.Equals(backend.GetTransferSnapshot().direction,3u,"La transferencia importada termina");
+                 }
+             });
++            t.Run("OpenGL compute and hardware follow GS sprite sampling rules",[](TestCase &t){
++                for(const bool hardware : {false,true}) {
++                    std::vector<uint8_t> vram(GSSwizzle::kMemorySize); auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();
++                    raw->SetHardwareRasterAllowed(hardware); GSThreadedBackend backend(std::move(gpu));
++                    backend.Initialize(vram.data(),uint32_t(vram.size()));
++                    if(dynamic_cast<GSGpuBackend *>(&backend.Inner())!=raw || !raw->IsReady()) {t.Fail("OpenGL requerido");return;}
++                    for(unsigned fixture=0;fixture<4u;++fixture) spriteSampling(t,backend,fixture);
++                }
++            });
+             t.Run("OpenGL compute and hardware follow GS triangle sampling rules",[](TestCase &t){
+                 for(const bool hardware : {false,true}) {
+                     std::vector<uint8_t> vram(GSSwizzle::kMemorySize); auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -1002,7 +1002,8 @@
+             gs.writeRegister(GS_REG_UV, kUvRow1);
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+             gs.writeRegister(GS_REG_UV, kUvRow1);
+-            gs.writeRegister(GS_REG_XYZ2, 0ull);
++            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
++            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
+ 
+             const uint32_t dstPixel = readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u);
+             t.Equals(dstPixel, static_cast<uint32_t>(kSourceColor),
+@@ -2653,7 +2654,8 @@
+             gs.writeRegister(GS_REG_UV, 0ull);
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+             gs.writeRegister(GS_REG_UV, 0ull);
+-            gs.writeRegister(GS_REG_XYZ2, 0ull);
++            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
++            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
+ 
+             uint32_t pixel = 0u;
+             std::memcpy(&pixel, vram.data(), sizeof(pixel));
+@@ -2798,7 +2800,8 @@
+             gs.writeRegister(GS_REG_UV, 0ull);
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+             gs.writeRegister(GS_REG_UV, 0ull);
+-            gs.writeRegister(GS_REG_XYZ2, 0ull);
++            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
++            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
+ 
+             uint32_t pixel = 0u;
+             std::memcpy(&pixel, vram.data(), sizeof(pixel));
+@@ -2860,7 +2863,8 @@
+             gs.writeRegister(GS_REG_UV, 0ull);
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+             gs.writeRegister(GS_REG_UV, 0ull);
+-            gs.writeRegister(GS_REG_XYZ2, 0ull);
++            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
++            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
+ 
+             uint32_t pixel = 0u;
+             std::memcpy(&pixel, vram.data(), sizeof(pixel));
+@@ -2926,7 +2930,8 @@
+             gs.writeRegister(GS_REG_UV, 0ull);
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+             gs.writeRegister(GS_REG_UV, 0ull);
+-            gs.writeRegister(GS_REG_XYZ2, 0ull);
++            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
++            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
+ 
+             uint32_t pixel = 0u;
+             std::memcpy(&pixel, vram.data(), sizeof(pixel));
+@@ -4447,7 +4452,8 @@
+             gs.writeRegister(GS_REG_UV, 0ull);
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+             gs.writeRegister(GS_REG_UV, 0ull);
+-            gs.writeRegister(GS_REG_XYZ2, 0ull);
++            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
++            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
+ 
+             uint32_t pixelHL = 0u;
+             std::memcpy(&pixelHL, vram.data(), sizeof(pixelHL));
+@@ -4470,7 +4476,8 @@
+             gs.writeRegister(GS_REG_UV, 0ull);
+             gs.writeRegister(GS_REG_XYZ2, 0ull);
+             gs.writeRegister(GS_REG_UV, 0ull);
+-            gs.writeRegister(GS_REG_XYZ2, 0ull);
++            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
++            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
+ 
+             uint32_t pixelHH = 0u;
+             std::memcpy(&pixelHH, vram.data(), sizeof(pixelHH));
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -1478,7 +1478,8 @@
+             // With XYOFFSET=(1,1), vertex at (2,2) draws to pixel (1,1).
+             const uint64_t xyz = (32ull) | (32ull << 16) | (0ull << 32);
+             gs.writeRegister(GS_REG_XYZ2, xyz);
+-            gs.writeRegister(GS_REG_XYZ2, xyz);
++            // GOW-Port: segundo extremo una unidad mas alla en cada eje: sprite de 1x1.
++            gs.writeRegister(GS_REG_XYZ2, xyz + 16ull + (16ull << 16));
+ 
+             const uint32_t insideOff = frameOffsetBytes(1u, 1u, 1u);
+             t.Equals(vram[insideOff + 0u], static_cast<uint8_t>(200u), "inside draw should write R");
+@@ -1492,7 +1493,8 @@
+             const uint64_t scissorOutside = (3ull) | (4ull << 16) | (3ull << 32) | (4ull << 48);
+             gs.writeRegister(GS_REG_SCISSOR_1, scissorOutside);
+             gs.writeRegister(GS_REG_XYZ2, xyz);
+-            gs.writeRegister(GS_REG_XYZ2, xyz);
++            // GOW-Port: segundo extremo una unidad mas alla en cada eje: sprite de 1x1.
++            gs.writeRegister(GS_REG_XYZ2, xyz + 16ull + (16ull << 16));
+ 
+             bool anyWrite = false;
+             for (size_t i = 0; i < 1024u; ++i)
+@@ -1541,7 +1543,8 @@
+ 
+             const uint64_t xyz = (16ull) | (16ull << 16) | (0ull << 32); // pixel (1,1)
+             gs.writeRegister(GS_REG_XYZ2, xyz);
+-            gs.writeRegister(GS_REG_XYZ2, xyz);
++            // GOW-Port: segundo extremo una unidad mas alla en cada eje: sprite de 1x1.
++            gs.writeRegister(GS_REG_XYZ2, xyz + 16ull + (16ull << 16));
+ 
+             // ((200 - 40) * 64 >> 7) + 40 = 120
+             t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(120u), "alpha blend should update R with FIX factor");

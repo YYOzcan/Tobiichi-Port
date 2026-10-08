@@ -1,0 +1,701 @@
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index f8386b3..ce41a17 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -117,38 +117,75 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VILWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; ctx->vi[{}] = static_cast<uint16_t>(READ32(addr)); }}", inst.rd, inst.rt); // VILWR.<f> vit, (vis)
++        const uint8_t destMask = inst.vectorInfo.vectorField;
++        if (inst.rt == 0)
++        {
++            return "{ }";
++        }
++        const int lane = (destMask & 0x8) ? 0 : (destMask & 0x4) ? 1 : (destMask & 0x2) ? 2 : 3;
++        return fmt::format("{{ uint16_t value; std::memcpy(&value, runtime->memory().getVU0Data() + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4) + {}u, sizeof(value)); ctx->vi[{}] = value; }}",
++                           inst.rd, lane * 4, inst.rt);
+     }
+ 
+     std::string CodeGenerator::translateVU_VISWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; WRITE32(addr, (uint32_t)ctx->vi[{}]); }}", inst.rd, inst.rt); // VISWR.<f> vit, (vis)
++        const uint8_t destMask = inst.vectorInfo.vectorField;
++        std::string code = fmt::format("{{ uint8_t *vu0Mem = runtime->memory().getVU0Data() + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4); const uint32_t value = ctx->vi[{}]; ",
++                                       inst.rd, inst.rt);
++        for (int lane = 0; lane < 4; ++lane)
++        {
++            if (destMask & (0x8 >> lane))
++            {
++                code += fmt::format("std::memcpy(vu0Mem + {}u, &value, sizeof(value)); ", lane * 4);
++            }
++        }
++        return code + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VIADD(const Instruction &inst)
+     {
+-        return fmt::format("ctx->vi[{}] = ctx->vi[{}] + ctx->vi[{}];", inst.sa, inst.rd, inst.rt); // vid, vis, vit
++        if (inst.sa == 0)
++        {
++            return "{ }";
++        }
++        return fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] + ctx->vi[{}]);", inst.sa, inst.rd, inst.rt);
+     }
+ 
+     std::string CodeGenerator::translateVU_VISUB(const Instruction &inst)
+     {
+-        return fmt::format("ctx->vi[{}] = ctx->vi[{}] - ctx->vi[{}];", inst.sa, inst.rd, inst.rt); // vid, vis, vit
++        if (inst.sa == 0)
++        {
++            return "{ }";
++        }
++        return fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] - ctx->vi[{}]);", inst.sa, inst.rd, inst.rt);
+     }
+ 
+     std::string CodeGenerator::translateVU_VIADDI(const Instruction &inst)
+     {
+         int32_t imm5 = (inst.sa & 0x10) ? static_cast<int32_t>(inst.sa | ~0x1F) : static_cast<int32_t>(inst.sa);
+-        return fmt::format("ctx->vi[{}] = ctx->vi[{}] + {};", inst.rt, inst.rd, imm5); // vit, vis, imm5
++        if (inst.rt == 0)
++        {
++            return "{ }";
++        }
++        return fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] + {});", inst.rt, inst.rd, imm5);
+     }
+ 
+     std::string CodeGenerator::translateVU_VIAND(const Instruction &inst)
+     {
+-        return fmt::format("ctx->vi[{}] = ctx->vi[{}] & ctx->vi[{}];", inst.sa, inst.rd, inst.rt); // vid, vis, vit
++        if (inst.sa == 0)
++        {
++            return "{ }";
++        }
++        return fmt::format("ctx->vi[{}] = ctx->vi[{}] & ctx->vi[{}];", inst.sa, inst.rd, inst.rt);
+     }
+ 
+     std::string CodeGenerator::translateVU_VIOR(const Instruction &inst)
+     {
+-        return fmt::format("ctx->vi[{}] = ctx->vi[{}] | ctx->vi[{}];", inst.sa, inst.rd, inst.rt); // vid, vis, vit
++        if (inst.sa == 0)
++        {
++            return "{ }";
++        }
++        return fmt::format("ctx->vi[{}] = ctx->vi[{}] | ctx->vi[{}];", inst.sa, inst.rd, inst.rt);
+     }
+ 
+     std::string CodeGenerator::translateVU_VCALLMS(const Instruction &inst)
+@@ -181,22 +218,18 @@ namespace ps2recomp
+             vis_reg_idx);
+     }
+ 
++    // GOW-Port: VRNEXT/VRINIT/VRXOR/VRGET siguen el registro R del hardware (LFSR, fork de SotC, e36fbf1).
+     std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
+     {
+-        return fmt::format(
+-            "{{\n"
+-            "    uint32_t r_vals[4];\n"
+-            "    _mm_storeu_si128((__m128i*)r_vals, _mm_castps_si128(ctx->vu0_r));\n"
+-            "\n"
+-            "    // Simple LFSR-based random number generation (PS2-like behavior)\n"
+-            "    uint32_t feedback = r_vals[0] ^ (r_vals[0] << 13) ^ (r_vals[1] >> 19) ^ (r_vals[2] << 7);\n"
+-            "    r_vals[0] = r_vals[1];\n"
+-            "    r_vals[1] = r_vals[2];\n"
+-            "    r_vals[2] = r_vals[3];\n"
+-            "    r_vals[3] = feedback;\n"
+-            "\n"
+-            "    ctx->vu0_r = _mm_castsi128_ps(_mm_loadu_si128((__m128i*)r_vals));\n"
+-            "}}");
++        std::string code = "{ uint32_t r = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_castps_si128(ctx->vu0_r))); "
++                           "r = (((r << 1) ^ ((r >> 4) & 1u) ^ ((r >> 22) & 1u)) & 0x007FFFFFu) | 0x3F800000u; "
++                           "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(r))); ";
++        if (inst.rt != 0)
++        {
++            code += fmt::format("ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], ctx->vu0_r, {}); ",
++                                inst.rt, inst.rt, codegen::vuMaskExpr(inst.vectorInfo.vectorField));
++        }
++        return code + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VMADD_Field(const Instruction &inst)
+@@ -753,138 +786,106 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VFTOI(const Instruction &inst, int shift)
+     {
+-        uint8_t vfs = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        float scale = (shift == 0) ? 1.0f : static_cast<float>(1 << shift);
+-
+-        return fmt::format("{{ __m128 src = ctx->vu0_vf[{}]; "
+-                           "src = _mm_mul_ps(src, _mm_set1_ps({})); "
+-                           "__m128i res_i = _mm_cvttps_epi32(src); "
+-                           "__m128 res = _mm_castsi128_ps(res_i); "
+-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+-                           vfs, codegen::formatFloatLiteral(scale),
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           inst.rt, inst.rt);
+-    }
+-
++        if (inst.rt == 0)
++        {
++            return "{ }";
++        }
++        const float scale = (shift == 0) ? 1.0f : static_cast<float>(1 << shift);
++        return fmt::format("{{ const __m128 src = _mm_mul_ps(ctx->vu0_vf[{}], _mm_set1_ps({})); "
++                           "const __m128i positiveOverflow = _mm_andnot_si128(_mm_srai_epi32(_mm_castps_si128(src), 31), _mm_castps_si128(_mm_cmpnlt_ps(src, _mm_set1_ps(2147483648.0f)))); "
++                           "const __m128 res = _mm_castsi128_ps(_mm_xor_si128(_mm_cvttps_epi32(src), positiveOverflow)); "
++                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, {}); }}",
++                           inst.rd, codegen::formatFloatLiteral(scale), inst.rt, inst.rt, codegen::vuMaskExpr(inst.vectorInfo.vectorField));
++    }
++
++    namespace
++    {
++        std::string vu0MemoryLoad(uint8_t ft, uint8_t is, uint8_t destMask, bool preDecrement, bool postIncrement)
++        {
++            std::string code = "{ ";
++            if (preDecrement && is != 0)
++            {
++                code += fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] - 1u); ", is, is);
++            }
++            if (ft != 0)
++            {
++                code += fmt::format("__m128 res; std::memcpy(&res, runtime->memory().getVU0Data() + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4), sizeof(res)); "
++                                    "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, {}); ",
++                                    is, ft, ft, codegen::vuMaskExpr(destMask));
++            }
++            if (postIncrement && is != 0)
++            {
++                code += fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] + 1u); ", is, is);
++            }
++            return code + "}";
++        }
++
++        std::string vu0MemoryStore(uint8_t fs, uint8_t it, uint8_t destMask, bool preDecrement, bool postIncrement)
++        {
++            std::string code = "{ ";
++            if (preDecrement && it != 0)
++            {
++                code += fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] - 1u); ", it, it);
++            }
++            code += fmt::format("uint8_t *vu0Mem = runtime->memory().getVU0Data() + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4); "
++                                "__m128 old; std::memcpy(&old, vu0Mem, sizeof(old)); "
++                                "const __m128 res = _mm_blendv_ps(old, ctx->vu0_vf[{}], {}); "
++                                "std::memcpy(vu0Mem, &res, sizeof(res)); ",
++                                it, fs, codegen::vuMaskExpr(destMask));
++            if (postIncrement && it != 0)
++            {
++                code += fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] + 1u); ", it, it);
++            }
++            return code + "}";
++        }
++    }
++
++    // GOW-Port: VLQI/VSQI/VLQD/VSQD/VILWR/VISWR usan la memoria de datos de VU0 ((vi & 0xFF) << 4), no la RAM del EE
++    // desde la direccion 0; VSQI/VSQD guardan Fs en la direccion de It (fork de SotC, 03d18df).
+     std::string CodeGenerator::translateVU_VLQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           inst.rt, inst.rt,
+-                           vis, vis);
++        return vu0MemoryLoad(inst.rt, inst.rd, inst.vectorInfo.vectorField, false, true);
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128i old_val = READ128(addr); "
+-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+-                           "WRITE128(addr, _mm_castps_si128(res)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           inst.rt,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           vis, vis);
++        return vu0MemoryStore(inst.rd, inst.rt, inst.vectorInfo.vectorField, false, true);
+     }
+ 
+     std::string CodeGenerator::translateVU_VLQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+-                           vis, vis,
+-                           vis,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           inst.rt, inst.rt);
++        return vu0MemoryLoad(inst.rt, inst.rd, inst.vectorInfo.vectorField, true, false);
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128i old_val = READ128(addr); "
+-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+-                           "WRITE128(addr, _mm_castps_si128(res)); }}",
+-                           vis, vis,
+-                           vis,
+-                           inst.rt,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
++        return vu0MemoryStore(inst.rd, inst.rt, inst.vectorInfo.vectorField, true, false);
+     }
+ 
+     std::string CodeGenerator::translateVU_VRGET(const Instruction &inst)
+     {
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ __m128 res = ctx->vu0_r; __m128i mask = _mm_set_epi32({}, {}, {}, {}); ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}", (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0, (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, ft_reg, ft_reg);
++        if (inst.rt == 0)
++        {
++            return "{ }";
++        }
++        return fmt::format("{{ const __m128 res = _mm_castsi128_ps(_mm_shuffle_epi32(_mm_castps_si128(ctx->vu0_r), 0)); "
++                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, {}); }}",
++                           inst.rt, inst.rt, codegen::vuMaskExpr(inst.vectorInfo.vectorField));
+     }
+ 
+     std::string CodeGenerator::translateVU_VRINIT(const Instruction &inst)
+     {
+-        uint8_t fs_reg = inst.rd;
+-        uint8_t fsf = inst.vectorInfo.fsf;
+-
+-        return fmt::format(
+-            "{{\n"
+-            "    float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})));\n"
+-            "    uint32_t seed; std::memcpy(&seed, &src, sizeof(seed));\n"
+-            "\n"
+-            "    // PS2 uses a specific LFSR initialization pattern\n"
+-            "    if (seed == 0) seed = 1;\n"
+-            "\n"
+-            "    uint32_t r0 = seed;\n"
+-            "    uint32_t r1 = seed * 0x41C64E6D + 0x3039;\n"
+-            "    uint32_t r2 = r1 * 0x41C64E6D + 0x3039;\n"
+-            "    uint32_t r3 = r2 * 0x41C64E6D + 0x3039;\n"
+-            "\n"
+-            "    ctx->vu0_r = _mm_castsi128_ps(_mm_set_epi32(r3, r2, r1, r0));\n"
+-            "}}",
+-            fs_reg, fs_reg, fsf);
++        return fmt::format("{{ alignas(16) uint32_t fs[4]; _mm_store_si128(reinterpret_cast<__m128i *>(fs), _mm_castps_si128(ctx->vu0_vf[{}])); "
++                           "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(0x3F800000u | (fs[{}] & 0x007FFFFFu)))); }}",
++                           inst.rd, inst.vectorInfo.fsf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VRXOR(const Instruction &inst)
+     {
+-        uint8_t fs_reg = inst.rd;
+-        uint8_t fsf = inst.vectorInfo.fsf;
+-
+-        return fmt::format(
+-            "{{\n"
+-            "    float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})));\n"
+-            "    uint32_t src_bits; std::memcpy(&src_bits, &src, sizeof(src_bits));\n"
+-            "    __m128i r_current = _mm_castps_si128(ctx->vu0_r);\n"
+-            "    __m128i fs_data = _mm_set1_epi32((int)src_bits);\n"
+-            "\n"
+-            "    // XOR the current random value with the data from the VU vector register\n"
+-            "    __m128i xored = _mm_xor_si128(r_current, fs_data);\n"
+-            "\n"
+-            "    // Apply a simple mixing function similar to PS2's LFSR\n"
+-            "    __m128i mixed = _mm_xor_si128(xored, _mm_slli_epi32(xored, 7));\n"
+-            "    mixed = _mm_xor_si128(mixed, _mm_srli_epi32(mixed, 9));\n"
+-            "\n"
+-            "    ctx->vu0_r = _mm_castsi128_ps(mixed);\n"
+-            "}}",
+-            fs_reg, fs_reg, fsf);
++        return fmt::format("{{ alignas(16) uint32_t fs[4]; _mm_store_si128(reinterpret_cast<__m128i *>(fs), _mm_castps_si128(ctx->vu0_vf[{}])); "
++                           "const uint32_t r = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_castps_si128(ctx->vu0_r))); "
++                           "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(0x3F800000u | ((r ^ fs[{}]) & 0x007FFFFFu)))); }}",
++                           inst.rd, inst.vectorInfo.fsf);
+     }
+ 
+ }
+diff --git a/ps2xRecomp/src/lib/vu_translator.cpp b/ps2xRecomp/src/lib/vu_translator.cpp
+index d0fc95d..b15696b 100644
+--- a/ps2xRecomp/src/lib/vu_translator.cpp
++++ b/ps2xRecomp/src/lib/vu_translator.cpp
+@@ -87,7 +87,7 @@ namespace ps2recomp
+             case VU0_CR_CLIP:
+                 return fmt::format("ctx->vu0_clip_flags = GPR_U32(ctx, {}) & 0x00FFFFFFu;", rt);
+             case VU0_CR_R:
+-                return fmt::format("ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(GPR_U32(ctx, {}))));", rt);
++                return fmt::format("ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(0x3F800000u | (GPR_U32(ctx, {}) & 0x007FFFFFu))));", rt);
+             case VU0_CR_I:
+                 return fmt::format("{{ uint32_t tmp = GPR_U32(ctx, {}); std::memcpy(&ctx->vu0_i, &tmp, sizeof(tmp)); }}", rt);
+             case VU0_CR_Q:
+@@ -227,7 +227,9 @@ namespace ps2recomp
+                 case VU0_S2_VABS:
+                 {
+                     uint8_t dest_mask = inst.vectorInfo.vectorField;
+-                    return fmt::format("{{ __m128 res = _mm_and_ps(ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))); "
++                    return fmt::format("{{ const __m128i bits = _mm_castps_si128(ctx->vu0_vf[{}]); "
++                                       "const __m128i denormal = _mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128()); "
++                                       "__m128 res = _mm_castsi128_ps(_mm_andnot_si128(denormal, _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)))); "
+                                        "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                                        "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+                                        inst.rd,
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index c8a77c8..8bf01ca 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -399,6 +399,8 @@ private:
+     void copyMainContextToRuntime();
+     void publishDebugContext(const R5900Context &context);
+     void publishIdleDebugContext();
++    void loadSharedVu0Random(R5900Context &context);
++    void saveSharedVu0Random(const R5900Context &context);
+ 
+     PS2Runtime &m_runtime;
+     uint8_t *m_rdram = nullptr;
+@@ -424,6 +426,8 @@ private:
+     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
+     int m_currentThreadId = 0;
+     bool m_rescheduleRequested = false;
++    bool m_sharedVu0RandomValid = false;
++    __m128 m_sharedVu0Random{};
+     bool m_timeSliceExpired = false;
+     bool m_insideInterrupt = false;
+     uint32_t m_pendingEeTimerInterrupts = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 6648374..a1a078d 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -299,12 +299,15 @@ void EeScheduler::run()
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+             m_guestExecuting.store(true, std::memory_order_release);
+             ps2_perf::guestEntry(context.pc);
++            loadSharedVu0Random(context);
+             function(m_rdram, &context, &m_runtime);
++            saveSharedVu0Random(context);
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+         }
+         catch (const EeDispatcherTransfer &)
+         {
++            saveSharedVu0Random(context);
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+         }
+@@ -2145,6 +2148,22 @@ void EeScheduler::copyMainContextToRuntime()
+     }
+ }
+ 
++void EeScheduler::loadSharedVu0Random(R5900Context &context)
++{
++    if (!m_sharedVu0RandomValid)
++    {
++        saveSharedVu0Random(context);
++        return;
++    }
++    context.vu0_r = m_sharedVu0Random;
++}
++
++void EeScheduler::saveSharedVu0Random(const R5900Context &context)
++{
++    m_sharedVu0Random = context.vu0_r;
++    m_sharedVu0RandomValid = true;
++}
++
+ void EeScheduler::publishDebugContext(const R5900Context &context)
+ {
+     m_runtime.m_debugPc.store(context.pc, std::memory_order_relaxed);
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 9dd9251..3e65a8e 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -3,6 +3,7 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "ps2_log.h"
+ #include <atomic>
++#include <cstdio>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -1348,7 +1349,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    // GOW-Port: las cadenas largas (mas de 4096 tags) se cortaban y dejaban el GIF en modo IMAGE
++                    // (fork de SotC, e36fbf1).
++                    const int kMaxChainTags = 1 << 20;
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1525,6 +1528,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             break;
+                     }
+ 
++                    if (tagsProcessed >= kMaxChainTags)
++                    {
++                        std::fprintf(stderr, "[dma] chain on 0x%08x stopped after %d tags at 0x%08x\n", channelBase, tagsProcessed, tagAddr);
++                        std::fflush(stderr);
++                    }
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 58fab65..ed78df3 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2recomp/instructions.h"
+ #include "ps2recomp/r5900_decoder.h"
+ #include "ps2recomp/ps2_recompiler.h"
++#include "ps2recomp/r5900_decoder.h"
+ #include "ps2recomp/types.h"
+ #include <filesystem>
+ #include <fstream>
+@@ -1495,6 +1496,144 @@ void register_code_generator_tests()
+             t.IsTrue(out.find("ctx->vi[20]") == std::string::npos, "S2 VLQI must not use rs(format) as VI index");
+         });
+ 
++        tc.Run("VU0 macro VSQI/VLQD matrix stack uses fs/it fields and VU0 data memory", [](TestCase &t) {
++            R5900Decoder decoder;
++            CodeGenerator gen({}, {});
++
++            const Instruction vsqi = decoder.decodeInstruction(0x1B33D0u, 0x4BEF0B7Du);
++            const std::string push = gen.translateInstruction(vsqi);
++            printGeneratedCode("vsqi.xyzw $vf1, ($vi15++)", push);
++            t.IsTrue(push.find("ctx->vu0_vf[1]") != std::string::npos, "VSQI must store Fs (rd = vf1)");
++            t.IsTrue(push.find("ctx->vu0_vf[15]") == std::string::npos, "VSQI must not store vf15");
++            t.IsTrue(push.find("ctx->vi[15] = static_cast<uint16_t>(ctx->vi[15] + 1u)") != std::string::npos,
++                     "VSQI must post-increment It (rt = vi15)");
++            t.IsTrue(push.find("ctx->vi[1]") == std::string::npos, "VSQI must not address memory through vi1");
++            t.IsTrue(push.find("getVU0Data()") != std::string::npos, "VSQI must write VU0 data memory");
++            t.IsTrue(push.find("WRITE128") == std::string::npos && push.find("READ128") == std::string::npos,
++                     "VSQI must not touch EE RAM");
++
++            const Instruction vlqd = decoder.decodeInstruction(0x1B33E8u, 0x4BE47B7Eu);
++            const std::string pop = gen.translateInstruction(vlqd);
++            printGeneratedCode("vlqd.xyzw $vf4, (--$vi15)", pop);
++            t.IsTrue(pop.find("ctx->vi[15] = static_cast<uint16_t>(ctx->vi[15] - 1u)") != std::string::npos,
++                     "VLQD must pre-decrement Is (rd = vi15)");
++            t.IsTrue(pop.find("ctx->vu0_vf[4] = _mm_blendv_ps(ctx->vu0_vf[4]") != std::string::npos,
++                     "VLQD must load into Ft (rt = vf4)");
++            t.IsTrue(pop.find("getVU0Data()") != std::string::npos, "VLQD must read VU0 data memory");
++            t.IsTrue(pop.find("READ128") == std::string::npos, "VLQD must not read EE RAM");
++            t.IsTrue(pop.find("& 0xFFu) << 4") != std::string::npos, "VU0 data memory addresses wrap at 4 KB");
++            t.IsTrue(pop.find("ctx->vi[15] - 1u); __m128 res") != std::string::npos, "VLQD must decrement before loading");
++        });
++
++        tc.Run("VU0 macro VSQD/VLQI and VI ops never write VI0 or VF0", [](TestCase &t) {
++            CodeGenerator gen({}, {});
++            Instruction inst{};
++            inst.vectorInfo.vectorField = 0xF;
++
++            inst.rd = 5;
++            inst.rt = 0;
++            const std::string vsqd = gen.translateVU_VSQD(inst);
++            t.IsTrue(vsqd.find("ctx->vi[0] =") == std::string::npos, "VSQD with It = vi0 must not decrement vi0");
++            t.IsTrue(vsqd.find("ctx->vu0_vf[5]") != std::string::npos, "VSQD must store Fs (rd)");
++
++            inst.rd = 0;
++            inst.rt = 3;
++            const std::string vlqi = gen.translateVU_VLQI(inst);
++            t.IsTrue(vlqi.find("ctx->vi[0] =") == std::string::npos, "VLQI with Is = vi0 must not increment vi0");
++            t.IsTrue(vlqi.find("ctx->vu0_vf[3]") != std::string::npos, "VLQI must load Ft (rt)");
++
++            inst.rd = 2;
++            inst.rt = 0;
++            t.IsTrue(gen.translateVU_VLQI(inst).find("ctx->vu0_vf[0]") == std::string::npos, "VLQI must not write vf0");
++            t.IsTrue(gen.translateVU_VIADDI(inst).find("ctx->vi[0]") == std::string::npos, "VIADDI must not write vi0");
++            t.IsTrue(gen.translateVU_VILWR(inst).find("ctx->vi[0]") == std::string::npos, "VILWR must not write vi0");
++
++            inst.sa = 0;
++            inst.rd = 1;
++            inst.rt = 2;
++            t.IsTrue(gen.translateVU_VIADD(inst).find("ctx->vi[0]") == std::string::npos, "VIADD must not write vi0");
++            t.IsTrue(gen.translateVU_VISUB(inst).find("ctx->vi[0]") == std::string::npos, "VISUB must not write vi0");
++            t.IsTrue(gen.translateVU_VIAND(inst).find("ctx->vi[0]") == std::string::npos, "VIAND must not write vi0");
++            t.IsTrue(gen.translateVU_VIOR(inst).find("ctx->vi[0]") == std::string::npos, "VIOR must not write vi0");
++        });
++
++        tc.Run("VU0 macro VISWR/VILWR address qwords in VU0 data memory per field", [](TestCase &t) {
++            CodeGenerator gen({}, {});
++            Instruction inst{};
++            inst.rd = 7;
++            inst.rt = 9;
++
++            inst.vectorInfo.vectorField = 0x5;
++            const std::string iswr = gen.translateVU_VISWR(inst);
++            t.IsTrue(iswr.find("getVU0Data() + ((static_cast<uint32_t>(ctx->vi[7]) & 0xFFu) << 4)") != std::string::npos,
++                     "VISWR must address qword vi[is] of VU0 data memory");
++            t.IsTrue(iswr.find("const uint32_t value = ctx->vi[9]") != std::string::npos, "VISWR must store vi[it]");
++            t.IsTrue(iswr.find("vu0Mem + 4u") != std::string::npos && iswr.find("vu0Mem + 12u") != std::string::npos,
++                     "VISWR.yw must write the y and w words");
++            t.IsTrue(iswr.find("vu0Mem + 0u") == std::string::npos && iswr.find("vu0Mem + 8u") == std::string::npos,
++                     "VISWR.yw must not write the x and z words");
++            t.IsTrue(iswr.find("WRITE32") == std::string::npos, "VISWR must not touch EE RAM");
++
++            inst.vectorInfo.vectorField = 0x2;
++            const std::string ilwr = gen.translateVU_VILWR(inst);
++            t.IsTrue(ilwr.find("<< 4) + 8u") != std::string::npos, "VILWR.z must read the z word");
++            t.IsTrue(ilwr.find("ctx->vi[9] = value") != std::string::npos, "VILWR must write vi[it]");
++            t.IsTrue(ilwr.find("READ32") == std::string::npos, "VILWR must not read EE RAM");
++        });
++
++        tc.Run("VU0 macro random ops follow the PS2 R register", [](TestCase &t) {
++            R5900Decoder decoder;
++            CodeGenerator gen({}, {});
++
++            const std::string rnext = gen.translateInstruction(decoder.decodeInstruction(0x1B9580u, 0x4B05043Cu));
++            printGeneratedCode("vrnext.x $vf5, $R", rnext);
++            t.IsTrue(rnext.find("((r >> 4) & 1u) ^ ((r >> 22) & 1u)") != std::string::npos, "VRNEXT must step the PS2 LFSR (bits 4 and 22)");
++            t.IsTrue(rnext.find("| 0x3F800000u") != std::string::npos, "VRNEXT must keep R in [1, 2)");
++            t.IsTrue(rnext.find("ctx->vu0_vf[5] = _mm_blendv_ps(ctx->vu0_vf[5], ctx->vu0_r") != std::string::npos,
++                     "VRNEXT must write the new R to Ft");
++
++            const std::string rinit = gen.translateInstruction(decoder.decodeInstruction(0x1B9570u, 0x4A002C3Eu));
++            t.IsTrue(rinit.find("0x3F800000u | (fs[0] & 0x007FFFFFu)") != std::string::npos, "VRINIT must take the mantissa of Fs.x");
++
++            const std::string rxor = gen.translateInstruction(decoder.decodeInstruction(0x1B9574u, 0x4A00343Fu));
++            t.IsTrue(rxor.find("0x3F800000u | ((r ^ fs[0]) & 0x007FFFFFu)") != std::string::npos, "VRXOR must xor the mantissa into R");
++            t.IsTrue(rxor.find("ctx->vu0_vf[6]") != std::string::npos, "VRXOR must read Fs (rd = vf6)");
++
++            Instruction rget{};
++            rget.rt = 7;
++            rget.vectorInfo.vectorField = 0xF;
++            t.IsTrue(gen.translateVU_VRGET(rget).find("_mm_shuffle_epi32(_mm_castps_si128(ctx->vu0_r), 0)") != std::string::npos,
++                     "VRGET must broadcast R");
++
++            Instruction ctc2{};
++            ctc2.opcode = OPCODE_COP2;
++            ctc2.rs = COP2_CTC2;
++            ctc2.rt = 3;
++            ctc2.rd = VU0_CR_R;
++            t.IsTrue(gen.translateInstruction(ctc2).find("0x3F800000u | (GPR_U32(ctx, 3) & 0x007FFFFFu)") != std::string::npos,
++                     "CTC2 to R must keep only the mantissa");
++        });
++
++        tc.Run("VU0 macro VFTOI saturates and VABS flushes denormals", [](TestCase &t) {
++            CodeGenerator gen({}, {});
++            Instruction inst{};
++            inst.rd = 5;
++            inst.rt = 6;
++            inst.vectorInfo.vectorField = 0xF;
++            const std::string ftoi = gen.translateVU_VFTOI(inst, 15);
++            t.IsTrue(ftoi.find("_mm_cmpnlt_ps(src, _mm_set1_ps(2147483648.0f))") != std::string::npos,
++                     "VFTOI must detect positive overflow");
++            t.IsTrue(ftoi.find("_mm_xor_si128(_mm_cvttps_epi32(src), positiveOverflow)") != std::string::npos,
++                     "VFTOI must turn positive overflow into 0x7FFFFFFF");
++            inst.rt = 0;
++            t.IsTrue(gen.translateVU_VFTOI(inst, 0).find("vu0_vf[0]") == std::string::npos, "VFTOI must not write vf0");
++
++            R5900Decoder decoder;
++            const std::string abs = gen.translateInstruction(decoder.decodeInstruction(0x1000u, 0x4BE629FDu));
++            t.IsTrue(abs.find("_mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128())") != std::string::npos,
++                     "VABS must flush denormal inputs to zero");
++        });
++
+         tc.Run("JAL to known function emits call and check", [](TestCase &t) {
+             Function func;
+             func.name = "jal_test";
+@@ -2081,35 +2220,6 @@ void register_code_generator_tests()
+                      "jalr fallback should not dispatch directly to tail-jump delay slot");
+         });
+ 
+-        tc.Run("VU random helpers emit line comments on separate lines", [](TestCase &t) {
+-            CodeGenerator gen({}, {});
+-
+-            Instruction inst{};
+-            inst.rd = 7;
+-            inst.vectorInfo.fsf = 2;
+-
+-            std::string vrnext = gen.translateVU_VRNEXT(inst);
+-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRNEXT", vrnext);
+-            t.IsTrue(vrnext.find("// Simple LFSR-based random number generation (PS2-like behavior)\n"
+-                                 "    uint32_t feedback") != std::string::npos,
+-                     "VRNEXT should place the generated line comment on its own line");
+-
+-            std::string vrinit = gen.translateVU_VRINIT(inst);
+-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRINIT", vrinit);
+-            t.IsTrue(vrinit.find("// PS2 uses a specific LFSR initialization pattern\n"
+-                                 "    if (seed == 0) seed = 1;") != std::string::npos,
+-                     "VRINIT should place the generated line comment on its own line");
+-
+-            std::string vrxor = gen.translateVU_VRXOR(inst);
+-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRXOR", vrxor);
+-            t.IsTrue(vrxor.find("// XOR the current random value with the data from the VU vector register\n"
+-                                "    __m128i xored") != std::string::npos,
+-                     "VRXOR should keep the XOR comment on its own line");
+-            t.IsTrue(vrxor.find("// Apply a simple mixing function similar to PS2's LFSR\n"
+-                                "    __m128i mixed") != std::string::npos,
+-                     "VRXOR should keep the LFSR comment on its own line");
+-        });
+-
+         tc.Run("resolveStubTarget allows leading underscore alias", [](TestCase &t) {
+             t.Equals(PS2Recompiler::resolveStubTarget("_rand"), StubTarget::Stub,
+                      "_rand should resolve via rand stub alias");
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 6fcbfe3..b5b3a25 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -1254,6 +1254,46 @@ void register_ps2_memory_tests()
+             t.IsTrue(contentOk, "scratchpad alias chain payload should match scratchpad bytes");
+         });
+ 
++        tc.Run("GIF DMA chain longer than 4096 tags is transferred to its END tag", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            constexpr uint32_t kGifCh = 0x1000A000u;
++            constexpr uint32_t kChain = 0x00100000u;
++            constexpr uint32_t kCntTags = 6000u;
++
++            uint8_t *rdram = mem.getRDRAM();
++            uint32_t addr = kChain;
++            for (uint32_t i = 0; i <= kCntTags; ++i)
++            {
++                const bool last = i == kCntTags;
++                writeDmaTag(rdram, addr, makeDmaTag(1u, last ? 7u : 1u, 0u, false));
++                const uint32_t marker = last ? 0xE0D0E0D0u : i;
++                std::memset(rdram + addr + 16u, 0, 16u);
++                std::memcpy(rdram + addr + 16u, &marker, sizeof(marker));
++                addr += 32u;
++            }
++
++            std::vector<uint8_t> captured;
++            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
++            {
++                captured.insert(captured.end(), data, data + sizeBytes);
++            });
++
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kChain), "write TADR should succeed");
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write CHCR STR|CHAIN should succeed");
++            mem.processPendingTransfers();
++
++            t.Equals(captured.size(), static_cast<size_t>((kCntTags + 1u) * 16u), "every tag's payload should be transferred");
++            uint32_t lastMarker = 0u;
++            if (captured.size() >= 16u)
++            {
++                std::memcpy(&lastMarker, captured.data() + captured.size() - 16u, sizeof(lastMarker));
++            }
++            t.Equals(lastMarker, 0xE0D0E0D0u, "the END tag's payload should arrive last");
++        });
++
+         tc.Run("native GIF image upload recognizes canonical load-image chain", [](TestCase &t)
+         {
+             PS2Memory mem;

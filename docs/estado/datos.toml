@@ -1,0 +1,254 @@
+# Datos del mapa de estado (docs/estado/mapa.*.svg y docs/estado/detalle.*.md).
+# Tras editar este archivo, regenera con:  python tools/estado/generar.py
+# (La accion de GitHub "Mapa de estado" lo hace sola al subir cambios a main.)
+#
+# Estados: "ok" (funciona), "parcial" (funciona con fallos o sin verificar), "pendiente" (no funciona / no emulado).
+
+# ---------------------------------------------------------------------------------------------------------
+# Panel 1: librerias estaticas del SDK de Sony enlazadas en SCUS_973.99.
+# Cada funcion de config/funcmap.csv entre `desde` y `hasta` es una celda. Una libreria empieza en `inicio`
+# y llega hasta el inicio de la siguiente (el enlazador las coloca seguidas). Los inicios salen de las
+# funciones con nombre de config/recomp.template.toml. Varias entradas con el mismo `nombre` se juntan.
+# ---------------------------------------------------------------------------------------------------------
+[librerias]
+desde = 0x0026F228
+hasta = 0x0029BBA4
+
+[[librerias.grupo]]
+nombre = "libmpeg"
+inicio = 0x0026F228
+estado = "parcial"
+nota = { es = "La intro FMV se decodifica por software y se presenta sin GOW_SKIP_FMV; falta verificar el resto de vídeos", en = "The FMV intro is software-decoded and displayed without GOW_SKIP_FMV; other videos remain unverified", pt = "A intro FMV é decodificada por software e exibida sem GOW_SKIP_FMV; os demais vídeos ainda precisam ser verificados" }
+
+[[librerias.grupo]]
+nombre = "libipu"
+inicio = 0x002792E8
+estado = "parcial"
+nota = { es = "sceIpuInit corregido; la ruta MPEG por software funciona, sin verificar todas las operaciones de la IPU", en = "sceIpuInit fixed; the software MPEG path works, but full IPU operation coverage is unverified", pt = "sceIpuInit corrigido; a rota MPEG por software funciona, mas a cobertura completa das operações da IPU não foi verificada" }
+
+[[librerias.grupo]]
+nombre = "libgraph"
+inicio = 0x00279838
+estado = "ok"
+
+[[librerias.grupo]]
+nombre = "libdma"
+inicio = 0x00279E50
+estado = "ok"
+
+[[librerias.grupo]]
+nombre = "libcdvd"
+inicio = 0x0027A340
+estado = "ok"
+nota = { es = "Lee la ISO original", en = "Reads the original ISO", pt = "Lê a ISO original" }
+
+[[librerias.grupo]]
+nombre = "libdbc"
+inicio = 0x0027ACA8
+estado = "parcial"
+nota = { es = "RPC de dbcman y SIO2 verificados al cargar y guardar en tarjeta; los mandos SIO2 aún se ven desconectados", en = "dbcman RPC and SIO2 verified for card loading and saving; SIO2 controllers still read as disconnected", pt = "RPC de dbcman e SIO2 verificados ao carregar e salvar no cartão; os controles SIO2 ainda aparecem desconectados" }
+
+[[librerias.grupo]]
+nombre = "libpad2"
+inicio = 0x0027B7E8
+estado = "parcial"
+nota = { es = "HLE del primer puerto (teclado o gamepad); presiones 0/255", en = "HLE for the first port (keyboard or gamepad); pressures 0/255", pt = "HLE da primeira porta (teclado ou gamepad); pressões 0/255" }
+
+[[librerias.grupo]]
+nombre = "libvib"
+inicio = 0x0027BF90
+estado = "pendiente"
+nota = { es = "Sin vibración: el HLE no anuncia actuadores", en = "No rumble: the HLE reports no actuators", pt = "Sem vibração: o HLE não anuncia atuadores" }
+
+[[librerias.grupo]]
+nombre = "libmc2"
+inicio = 0x0027C100
+estado = "parcial"
+nota = { es = "Listar, cargar, guardar y recargar verificados con una copia de tarjeta PCSX2 de 8 MB con ECC; faltan formateo y reapertura en PCSX2", en = "Listing, loading, saving and reloading verified with a copied 8 MB PCSX2 card with ECC; formatting and reopening in PCSX2 remain unverified", pt = "Listar, carregar, salvar e recarregar verificados com uma cópia de cartão PCSX2 de 8 MB com ECC; faltam formatação e reabertura no PCSX2" }
+
+[[librerias.grupo]]
+nombre = "libscf"
+inicio = 0x00282FD8
+estado = "ok"
+
+[[librerias.grupo]]
+nombre = "libgcc"
+inicio = 0x00283790
+estado = "ok"
+
+[[librerias.grupo]]
+nombre = "C++ EH"
+inicio = 0x00285490
+estado = "ok"
+
+[[librerias.grupo]]
+nombre = "libm"
+inicio = 0x00287378
+estado = "ok"
+
+[[librerias.grupo]]
+nombre = "libc"
+inicio = 0x00289200
+estado = "ok"
+
+[[librerias.grupo]]
+nombre = "libkernel"
+inicio = 0x002940B0
+estado = "ok"
+
+[[librerias.grupo]]
+nombre = "sif"
+inicio = 0x00296518
+estado = "ok"
+nota = { es = "Comandos y RPC del SIF", en = "SIF commands and RPC", pt = "Comandos e RPC do SIF" }
+
+[[librerias.grupo]]
+nombre = "fileio"
+inicio = 0x002976C8
+estado = "ok"
+
+[[librerias.grupo]]
+nombre = "loadfile"
+inicio = 0x00298770
+estado = "ok"
+nota = { es = "Heap del IOP y carga de módulos", en = "IOP heap and module loading", pt = "Heap do IOP e carga de módulos" }
+
+[[librerias.grupo]]
+nombre = "libkernel"
+inicio = 0x00299230
+estado = "ok"
+
+[[librerias.grupo]]
+nombre = "libgcc"
+inicio = 0x0029ADE0
+estado = "ok"
+
+# ---------------------------------------------------------------------------------------------------------
+# Panel 2: hardware de la PS2. Cada componente es un rectangulo de tamano `peso`.
+# `corto` es la etiqueta que se dibuja; `nombre` aparece en la tabla de detalle y al pasar el raton.
+# ---------------------------------------------------------------------------------------------------------
+[[hardware.grupo]]
+nombre = "EE"
+
+  [[hardware.grupo.componente]]
+  corto = "R5900"
+  nombre = { es = "CPU R5900 (recompilada a C++)", en = "R5900 CPU (recompiled to C++)", pt = "CPU R5900 (recompilada para C++)" }
+  estado = "ok"
+  peso = 5
+
+  [[hardware.grupo.componente]]
+  corto = "Kernel"
+  nombre = { es = "Kernel: hilos, semáforos y alarmas", en = "Kernel: threads, semaphores and alarms", pt = "Kernel: threads, semáforos e alarmes" }
+  estado = "ok"
+  peso = 3
+
+  [[hardware.grupo.componente]]
+  corto = "FPU/MMI"
+  nombre = { es = "FPU (COP1) e instrucciones MMI", en = "FPU (COP1) and MMI instructions", pt = "FPU (COP1) e instruções MMI" }
+  estado = "ok"
+  peso = 2
+
+  [[hardware.grupo.componente]]
+  corto = "INTC"
+  nombre = { es = "INTC: VSync e interrupción del GS", en = "INTC: VSync and GS interrupt", pt = "INTC: VSync e interrupção do GS" }
+  estado = "ok"
+  peso = 2
+
+  [[hardware.grupo.componente]]
+  corto = "DMAC"
+  nombre = { es = "Controlador DMA", en = "DMA controller", pt = "Controlador DMA" }
+  estado = "ok"
+  peso = 2
+  nota = { es = "Las cadenas fromSPR/toSPR ya copian la paleta de huesos; formas de Kratos y enemigos verificadas en partida", en = "fromSPR/toSPR chains now copy the bone palette; Kratos and enemy shapes verified in gameplay", pt = "As cadeias fromSPR/toSPR já copiam a paleta de ossos; formas de Kratos e inimigos verificadas na partida" }
+
+  [[hardware.grupo.componente]]
+  corto = "Timers"
+  nombre = { es = "Temporizadores", en = "Timers", pt = "Temporizadores" }
+  estado = "ok"
+  peso = 1
+
+[[hardware.grupo]]
+nombre = "GS / VU"
+
+  [[hardware.grupo.componente]]
+  corto = "GS"
+  nombre = { es = "GS: primitivas y framebuffer", en = "GS: primitives and framebuffer", pt = "GS: primitivas e framebuffer" }
+  estado = "parcial"
+  peso = 3
+  nota = { es = "CPU/OpenGL conservados; barco, Kratos, enemigos y HUD visibles. Orden color/Z y alias por ancho/vuelta validados. Feedback inestable acotado a 33 envíos; snapshot opcional estable en 64 pasadas, aún distinto de CPU. Z de solo lectura retenido; profiler GPU por variante y frontera de consultas verificado; falta cobertura completa", en = "CPU/OpenGL retained; ship, Kratos, enemies and HUD visible. Color/Z ordering and width/wrap aliases validated. Unstable feedback narrowed to 33 submissions; optional snapshot stable over 64 passes, still different from CPU. Read-only depth optimization withheld; per-variant GPU profiling and query boundary verified; coverage remains incomplete", pt = "CPU/OpenGL mantidos; barco, Kratos, inimigos e HUD visíveis. Ordem cor/Z e aliases por largura/volta validados. Feedback instável limitado a 33 envios; snapshot opcional estável em 64 passagens, ainda diferente da CPU. Z de somente leitura retido; profiler GPU por variante e limite de consultas verificado; falta cobertura completa" }
+
+  [[hardware.grupo.componente]]
+  corto = "VIF1/VU1"
+  nombre = { es = "VIF1 y VU1", en = "VIF1 and VU1", pt = "VIF1 e VU1" }
+  estado = "parcial"
+  peso = 3
+  nota = { es = "Bloques compilados, flags persistentes, SSE de cuatro carriles y enlace opcional del microcódigo local integrados; regresión FTZ/DAZ conserva underflow. Modelos y HUD visibles tras MMI/EFU/SPR; falta certificar cobertura y rendimiento sostenido", en = "Compiled blocks, persistent flags, four-lane SSE and optional local microcode linking integrated; FTZ/DAZ regression preserves underflow. Models and HUD visible after MMI/EFU/SPR fixes; coverage and sustained performance remain unverified", pt = "Blocos compilados, flags persistentes, SSE de quatro vias e vínculo opcional do microcódigo local integrados; regressão FTZ/DAZ preserva underflow. Modelos e HUD visíveis após MMI/EFU/SPR; falta verificar cobertura e rendimento sustentado" }
+
+  [[hardware.grupo.componente]]
+  corto = "Tex/CLUT"
+  nombre = { es = "GS: texturas, CLUT y fuentes", en = "GS: textures, CLUT and fonts", pt = "GS: texturas, CLUT e fontes" }
+  estado = "parcial"
+  peso = 2
+  nota = { es = "HUD visible; bilineal y nearest STQ CPU/OpenGL verificados, incluidos límites 16.16 con signo, con patrones procedurales de PCSX2 software; feedback GPU estable en modo experimental; lotes de texturas regionales optimizados y verificados en los 13 PSM; quedan pendientes la caché GS real y la cobertura de fuentes/CLUT", en = "HUD visible; CPU/OpenGL bilinear and nearest STQ verified, including signed 16.16 boundaries, against procedural PCSX2 software patterns; GPU feedback stable in an experimental mode; regional texture batches optimized and verified across all 13 PSMs; real GS cache and full font/CLUT coverage remain unverified", pt = "HUD visível; bilinear e nearest STQ CPU/OpenGL verificados, incluindo limites 16.16 com sinal, com padrões procedurais de PCSX2 software; feedback GPU estável em modo experimental; lotes de texturas regionais otimizados e verificados nos 13 PSMs; cache GS real e cobertura de fontes/CLUT ainda não verificadas" }
+
+  [[hardware.grupo.componente]]
+  corto = "GIF"
+  nombre = { es = "GIF (PATH1-3)", en = "GIF (PATH1-3)", pt = "GIF (PATH1-3)" }
+  estado = "ok"
+  peso = 2
+
+  [[hardware.grupo.componente]]
+  corto = "IPU"
+  nombre = { es = "IPU: vídeo FMV", en = "IPU: FMV video", pt = "IPU: vídeo FMV" }
+  estado = "parcial"
+  peso = 2
+  nota = { es = "La intro FMV funciona por decodificación MPEG por software; no demuestra emulación completa del hardware IPU", en = "The FMV intro works through software MPEG decoding; this does not establish complete IPU hardware emulation", pt = "A intro FMV funciona por decodificação MPEG por software; isso não comprova emulação completa do hardware IPU" }
+
+[[hardware.grupo]]
+nombre = "IOP"
+
+  [[hardware.grupo.componente]]
+  corto = "R3000A"
+  nombre = { es = "CPU R3000A (intérprete)", en = "R3000A CPU (interpreter)", pt = "CPU R3000A (interpretador)" }
+  estado = "ok"
+  peso = 3
+  nota = { es = "Planificador ocioso de Opus integrado y validado con GS/VU1: recuerda el próximo despertar; su perfil reduce IOP de ~1300–1500 a ~570–650 ms cada 5 s; falta una comparación de FPS sin compilaciones concurrentes", en = "Opus idle scheduler integrated and validated with GS/VU1: caches the next wake-up; its profile reduces IOP from ~1300–1500 to ~570–650 ms per 5 s; an FPS comparison without concurrent builds remains pending", pt = "Escalonador ocioso de Opus integrado e validado com GS/VU1: guarda o próximo despertar; seu perfil reduz IOP de ~1300–1500 para ~570–650 ms a cada 5 s; falta comparar FPS sem compilações simultâneas" }
+
+  [[hardware.grupo.componente]]
+  corto = "SPU2"
+  nombre = { es = "SPU2: salida de audio", en = "SPU2: audio output", pt = "SPU2: saída de áudio" }
+  estado = "parcial"
+  peso = 3
+  nota = { es = "Bancos cargados y sonido continuo en tiempo emulado verificados; a ~2 fps se oye entrecortado; faltan reverb y ADMA", en = "Bank loading and continuous sound in emulated time verified; at ~2 fps playback stutters; reverb and ADMA are missing", pt = "Carregamento de bancos e som contínuo em tempo emulado verificados; a ~2 fps o áudio tem cortes; faltam reverb e ADMA" }
+
+  [[hardware.grupo.componente]]
+  corto = "IRX"
+  nombre = { es = "Módulos IRX originales", en = "Original IRX modules", pt = "Módulos IRX originais" }
+  estado = "ok"
+  peso = 2
+
+  [[hardware.grupo.componente]]
+  corto = "SIF"
+  nombre = { es = "SIF: RPC y DMA EE ↔ IOP", en = "SIF: EE ↔ IOP RPC and DMA", pt = "SIF: RPC e DMA EE ↔ IOP" }
+  estado = "ok"
+  peso = 2
+
+  [[hardware.grupo.componente]]
+  corto = "CDVD"
+  nombre = { es = "CDVD: lectura de la ISO original", en = "CDVD: reading the original ISO", pt = "CDVD: leitura da ISO original" }
+  estado = "ok"
+  peso = 2
+
+  [[hardware.grupo.componente]]
+  corto = "Pad"
+  nombre = { es = "Mando DualShock 2", en = "DualShock 2 controller", pt = "Controle DualShock 2" }
+  estado = "parcial"
+  peso = 2
+  nota = { es = "libpad2 por HLE (primer puerto); en el SIO2 emulado los mandos se ven desconectados", en = "libpad2 via HLE (first port); controllers read as disconnected on the emulated SIO2", pt = "libpad2 por HLE (primeira porta); no SIO2 emulado os controles aparecem desconectados" }
+
+  [[hardware.grupo.componente]]
+  corto = "MC"
+  nombre = { es = "SIO2: memory card", en = "SIO2: memory card", pt = "SIO2: memory card" }
+  estado = "parcial"
+  peso = 2
+  nota = { es = "SIO2 y tarjeta de 8 MB con ECC: cargar, guardar y recargar verificados en el juego sobre una copia PCSX2; faltan formateo y reapertura en PCSX2", en = "SIO2 and 8 MB card with ECC: loading, saving and reloading verified in-game on a PCSX2 copy; formatting and reopening in PCSX2 remain unverified", pt = "SIO2 e cartão de 8 MB com ECC: carregar, salvar e recarregar verificados no jogo em uma cópia PCSX2; faltam formatação e reabertura no PCSX2" }

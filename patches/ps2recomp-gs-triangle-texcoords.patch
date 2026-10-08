@@ -1,0 +1,172 @@
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+@@ -460,7 +460,15 @@
+     }
+     else
+     {
+-        precise float invQ = 1.0 / fabsQ(q);
++        // GOW-Port: refinar el reciproco del driver antes de escalar S/T. Con Q=1.5
++        // una aproximacion inferior elegia el texel anterior incluso sin interpolacion.
++        float divisor = fabsQ(q);
++        precise float invQ = 1.0 / divisor;
++        if (invQ != 0.0)
++        {
++            precise float residual = fma(-divisor, invQ, 1.0);
++            invQ = invQ + invQ * residual;
++        }
+         texUf = ss * invQ * texW;
+         texVf = tt * invQ * texH;
+     }
+@@ -759,15 +767,19 @@
+             uint uv0 = pw(p, 29u);
+             uint uv1 = pw(p, 30u);
+             uint uv2 = pw(p, 31u);
+-            precise float fu = float(uv0 & 0xFFFFu) * w0 + float(uv1 & 0xFFFFu) * w1 + float(uv2 & 0xFFFFu) * w2;
+-            precise float fv = float(uv0 >> 16u) * w0 + float(uv1 >> 16u) * w1 + float(uv2 >> 16u) * w2;
++            // GOW-Port: diferencias float firmadas, constantes exactas y UV descendentes.
++            float u0 = float(uv0 & 0xFFFFu), v0 = float(uv0 >> 16u);
++            precise float fu = u0 + (float(uv1 & 0xFFFFu) - u0) * w1 + (float(uv2 & 0xFFFFu) - u0) * w2;
++            precise float fv = v0 + (float(uv1 >> 16u) - v0) * w1 + (float(uv2 >> 16u) - v0) * w2;
+             texel = sampleTexture(s, 0.0, 0.0, 1.0, uint(int(fu)) & 0xFFFFu, uint(int(fv)) & 0xFFFFu);
+         }
+         else
+         {
+-            precise float is = pf(p, 20u) * w0 + pf(p, 23u) * w1 + pf(p, 26u) * w2;
+-            precise float it = pf(p, 21u) * w0 + pf(p, 24u) * w1 + pf(p, 27u) * w2;
+-            precise float iq = pf(p, 22u) * w0 + pf(p, 25u) * w1 + pf(p, 28u) * w2;
++            // GOW-Port: interpolar S/T/Q homogeneos por diferencias, antes de dividir por Q.
++            float s0 = pf(p, 20u), t0 = pf(p, 21u), q0 = pf(p, 22u);
++            precise float is = s0 + (pf(p, 23u) - s0) * w1 + (pf(p, 26u) - s0) * w2;
++            precise float it = t0 + (pf(p, 24u) - t0) * w1 + (pf(p, 27u) - t0) * w2;
++            precise float iq = q0 + (pf(p, 25u) - q0) * w1 + (pf(p, 28u) - q0) * w2;
+             texel = sampleTexture(s, is, it, iq, 0u, 0u);
+         }
+         color = combineTexture(s, color, texel);
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1434,7 +1434,6 @@
+                 edge[i] += triangle.a[i] * 16;
+             if (!gsTriangleCovers(triangle, e))
+                 continue;
+-            const float w0 = gsTriangleWeight(triangle, e[0]);
+             const float w1 = gsTriangleWeight(triangle, e[1]);
+             const float w2 = gsTriangleWeight(triangle, e[2]);
+             // Conservar una Z plana de 32 bits incluso cuando los pesos se redondean.
+@@ -1464,20 +1463,21 @@
+                 uint16_t iu, iv;
+                 if (state.prim.fst)
+                 {
+-                    iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
+-                    iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
++                    // GOW-Port: UV 12.4 constantes no pierden un subtexel por sumar pesos.
++                    // La resta se hace con signo para admitir ejes descendentes.
++                    iu = static_cast<uint16_t>(v0.u + (v1.u - v0.u) * w1 + (v2.u - v0.u) * w2);
++                    iv = static_cast<uint16_t>(v0.v + (v1.v - v0.v) * w1 + (v2.v - v0.v) * w2);
+                     is = 0.0f;
+                     it = 0.0f;
+                     iq = 1.0f;
+                 }
+                 else
+                 {
+-                    // The GS DDA interpolates the homogeneous S, T and Q
+-                    // values. Texel coordinates are calculated from S/Q and
+-                    // T/Q only after interpolation.
+-                    is = v0.s * w0 + v1.s * w1 + v2.s * w2;
+-                    it = v0.t * w0 + v1.t * w1 + v2.t * w2;
+-                    iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
++                    // GOW-Port: conservar S/T/Q constantes; seguir interpolando valores
++                    // homogeneos y dividir S/Q y T/Q solo al muestrear la textura.
++                    is = v0.s + (v1.s - v0.s) * w1 + (v2.s - v0.s) * w2;
++                    it = v0.t + (v1.t - v0.t) * w1 + (v2.t - v0.t) * w2;
++                    iq = v0.q + (v1.q - v0.q) * w1 + (v2.q - v0.q) * w2;
+                     iu = 0;
+                     iv = 0;
+                 }
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -257,6 +257,52 @@
+             }
+         }
+     }
++
++    // GOW-Port: UV/STQ constantes deben seleccionar el mismo texel que un sprite 1x1.
++    void triangleTextureConstants(TestCase &t,GSRasterBackend &backend,bool fst)
++    {
++        auto draw=sprite();draw.vertexCount=3;draw.state.prim.type=GS_PRIM_TRIANGLE;
++        draw.state.prim.tme=true;draw.state.prim.fst=fst;
++        draw.state.context.tex0.tbp0=256;draw.state.context.tex0.tbw=1;
++        draw.state.context.tex0.tfx=1;draw.state.context.tex0.tcc=1;
++        draw.state.textureWidth=8;draw.state.textureHeight=8;
++        draw.vertices[0].x=20;draw.vertices[0].y=20;
++        draw.vertices[1].x=37;draw.vertices[1].y=20;
++        draw.vertices[2].x=20;draw.vertices[2].y=39;
++        for(auto &v:draw.vertices){v.u=32;v.v=48;v.q=1.5f;v.s=.375f;v.t=.5625f;}
++        for(uint32_t y=0;y<8u;++y)for(uint32_t x=0;x<8u;++x)
++            backend.WriteVram(0,256,1,x,y,0x80000000u|(x*29u)|((y*29u)<<8));
++        for(const bool linear:{false,true})for(const bool reverse:{false,true}){
++            auto submitted=draw;submitted.state.linearFilter=linear;
++            submitted.state.context.tex1=linear?((1ull<<5)|(1ull<<6)):0;
++            if(reverse)std::swap(submitted.vertices[0],submitted.vertices[2]);
++            auto control=submitted;control.vertexCount=2;control.state.prim.type=GS_PRIM_SPRITE;
++            control.vertices[0].x=24;control.vertices[0].y=24;
++            control.vertices[1].x=25;control.vertices[1].y=25;
++            backend.ClearFramebuffer(draw.state.context,0x80332211u);backend.Submit(control);
++            const uint32_t expected=backend.ReadVram(0,0,1,24,24);
++            t.Equals(expected,linear?0x8000492cu:0x8000573au,"Control texturizado exacto");
++            backend.ClearFramebuffer(draw.state.context,0x80332211u);backend.Submit(submitted);
++            for(uint32_t y=20;y<39u;++y)for(uint32_t x=20;x<37u;++x){
++                if((x-20u)*19u+(y-20u)*17u>=323u)continue;
++                if(backend.ReadVram(0,0,1,x,y)!=expected){
++                    t.Fail(std::string(fst?"UV":"STQ")+" constante selecciona otro texel: x="+
++                           std::to_string(x)+" y="+std::to_string(y));return;
++                }
++            }
++        }
++        // Conservar gradientes descendentes y Q variable; centros lejos de fronteras de texel.
++        auto gradient=draw;
++        gradient.vertices[0].u=116;gradient.vertices[0].v=20;
++        gradient.vertices[1].u=20;gradient.vertices[1].v=20;
++        gradient.vertices[2].u=116;gradient.vertices[2].v=100;
++        for(unsigned i=0;i<3u;++i){auto &v=gradient.vertices[i];v.q=float(i+1u);
++            v.s=float(v.u)*v.q/128.0f;v.t=float(v.v)*v.q/128.0f;}
++        backend.ClearFramebuffer(draw.state.context,0x80332211u);backend.Submit(gradient);
++        t.Equals(backend.ReadVram(0,0,1,24,24),fst?0x80003a91u:0x80005791u,
++                 "Gradiente mantiene UV firmadas y division por Q despues de interpolar");
++    }
++
+ 
+     void transferRoundtrip(TestCase &t, GSRasterBackend &b)
+     {
+@@ -849,6 +895,14 @@
+             std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSCpuBackend backend;
+             backend.Initialize(vram.data(),uint32_t(vram.size()));triangleConstants(t,backend,true);
+         });
++        t.Run("CPU triangles preserve constant UV texture coordinates",[](TestCase &t){
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size()));triangleTextureConstants(t,backend,true);
++        });
++        t.Run("CPU triangles preserve constant homogeneous STQ coordinates",[](TestCase &t){
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size()));triangleTextureConstants(t,backend,false);
++        });
+         t.Run("GPU swizzle matches existing GS memory for all 13 formats", [](TestCase &t) {
+             GSMem::InitLookupTables();
+             const uint32_t formats[]={0,1,2,10,19,20,27,36,44,48,49,50,58};
+@@ -913,6 +967,14 @@
+                     triangleConstants(t,backend,false);triangleConstants(t,backend,true);
+                 }
+             });
++            t.Run("OpenGL compute and hardware preserve constant triangle UV and STQ",[](TestCase &t){
++                for(const bool hardware:{false,true}){
++                    std::vector<uint8_t> vram(GSSwizzle::kMemorySize);auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
++                    raw->SetHardwareRasterAllowed(hardware);GSThreadedBackend backend(std::move(gpu));backend.Initialize(vram.data(),uint32_t(vram.size()));
++                    if(dynamic_cast<GSGpuBackend *>(&backend.Inner())!=raw||!raw->IsReady()){t.Fail("OpenGL requerido");return;}
++                    triangleTextureConstants(t,backend,true);triangleTextureConstants(t,backend,false);
++                }
++            });
+             t.Run("OpenGL compute and hardware follow GS triangle sampling rules",[](TestCase &t){
+                 for(const bool hardware : {false,true}) {
+                     std::vector<uint8_t> vram(GSSwizzle::kMemorySize); auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();

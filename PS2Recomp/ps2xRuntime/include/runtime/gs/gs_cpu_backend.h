@@ -1,13 +1,15 @@
 #pragma once
 
 #include "runtime/gs/gs_backend.h"
+#include "runtime/gs/gs_backend_state.h" // GOW-Port: estado para repetir los mismos comandos.
 #include "runtime/gs/gs_texture_page_cache.h"
+#include "runtime/gs/gs_upload24.h" // GOW-Port: continuacion del pixel entre cargas.
 
 #include <array>
 #include <mutex>
 #include <vector>
 
-class GSCpuBackend final : public GSRasterBackend
+class GSCpuBackend final : public GSRasterBackend, public GSBackendStateAccess
 {
 public:
     GSCpuBackend();
@@ -33,8 +35,12 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    bool ExportState(GSBackendState &out) override;
+    bool ImportState(const GSBackendState &state) override;
+
 private:
     void ResetUnlocked();
+    void UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes);
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
     uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
@@ -76,6 +82,7 @@ private:
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};
+    GSUpload24State m_upload24{};
     std::vector<uint8_t> m_localToHostBuffer;
     size_t m_localToHostReadPos = 0;
 };

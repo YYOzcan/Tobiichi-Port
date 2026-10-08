@@ -292,11 +292,6 @@ namespace ps2_syscalls
         case static_cast<uint32_t>(-0x78):
             ps2_stubs::sceSifSetDChain(rdram, ctx, runtime);
             return true;
-        case 0x7A:
-        case static_cast<uint32_t>(-0x7A):
-            ctx->r[2] = _mm_set_epi64x(0, 2);
-            return true;
-            return true;
         case 0x7F:
             GetMemorySize(rdram, ctx, runtime);
             return true;

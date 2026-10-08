@@ -1,0 +1,168 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -681,8 +681,6 @@
+         uint64_t tagHi = loadLE64(data + offset + 8);
+         offset += 16;
+ 
+-        m_curQ = 1.0f;
+-
+         uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFF);
+         uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3);
+         uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
+@@ -691,7 +689,12 @@
+ 
+         recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
+ 
+-        bool pre = ((tagLo >> 46) & 1) != 0;
++        // GOW-Port: NLOOP=0 no emite registros; conserva PRIM, la cola de vertices y Q.
++        if (nloop == 0u)
++            continue;
++        m_curQ = 1.0f;
++        // GOW-Port: PRE/PRIM solo tienen efecto en PACKED, no en REGLIST ni IMAGE.
++        bool pre = flg == GIF_FMT_PACKED && ((tagLo >> 46) & 1) != 0;
+         if (pre)
+         {
+             writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
+@@ -753,9 +756,12 @@
+ 
+     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
+                                                 {
++        recordGifTagDebugEventUnlocked(sizeBytes, tag.nloop, GIF_FMT_PACKED, tag.nreg);
++
++        // GOW-Port: aplicar la misma regla NLOOP=0 en la ruta nativa validada.
++        if (tag.nloop == 0u)
++            return true;
+         m_curQ = 1.0f;
+-
+-        recordGifTagDebugEventUnlocked(sizeBytes, tag.nloop, GIF_FMT_PACKED, tag.nreg);
+ 
+         const bool pre = ((tag.lo >> 46u) & 1u) != 0u;
+         if (pre)
+@@ -877,6 +883,11 @@
+     if (offset + imageBytes != sizeBytes)
+         return false;
+ 
++    // GOW-Port: el atajo conserva los efectos de las etiquetas no vacias del parser general.
++    // Solo PRE del setup PACKED cambia PRIM; PRE de IMAGE no tiene efecto.
++    m_curQ = 1.0f;
++    if ((setupTagLo & (1ull << 46u)) != 0u)
++        writeRegisterUnlocked(GS_REG_PRIM, (setupTagLo >> 47u) & 0x7FFu);
+     uploadImageNativeUnlocked(regs[0], regs[1], regs[2], regs[3], data + offset, imageBytes);
+     return true;
+ }
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/gs_gpu_backend.h"
+ #include "runtime/gs/gs_threaded_backend.h"
++#include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_swizzle.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include <algorithm>
+@@ -238,6 +239,103 @@
+ void register_ps2_gs_backend_tests()
+ {
+     MiniTest::Case("GOW GS backends", [](TestCase &t) {
++        // GOW-Port: etiquetas vacias y PRE no deben cambiar la geometria que sigue.
++        t.Run("empty GIFtags ignore PRE in generic and native PACKED paths", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
++            GS gs; gs.init(vram.data(),static_cast<uint32_t>(vram.size()));
++            for(const bool native : {false,true}) for(uint64_t format=0;format<4;++format)
++            {
++                if(native && format!=GIF_FMT_PACKED) continue;
++                gs.writeRegister(GS_REG_PRIM,static_cast<uint64_t>(GS_PRIM_TRIANGLE)|(1ull<<9));
++                const uint64_t tag[]={(1ull<<15)|(1ull<<46)|
++                    (static_cast<uint64_t>(GS_PRIM_SPRITE)<<47)|(format<<58)|(15ull<<60),0ull};
++                if(native) t.IsTrue(gs.processNativePackedGIFPacket(reinterpret_cast<const uint8_t *>(tag),sizeof(tag)),"Etiqueta PACKED vacia valida");
++                else gs.processGIFPacket(reinterpret_cast<const uint8_t *>(tag),sizeof(tag));
++                const auto state=gs.getDebugSnapshot();
++                t.Equals(state.prim.type,static_cast<uint8_t>(GS_PRIM_TRIANGLE),"NLOOP=0 conserva la topologia");
++                t.IsTrue(state.prim.ctxt,"NLOOP=0 conserva el contexto");
++            }
++        });
++        t.Run("empty GIFtags preserve pending triangle vertices and Q", [](TestCase &t) {
++            for(const bool native : {false,true}) for(const bool pre : {false,true})
++            {
++                Recording r;
++                std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
++                GS gs; gs.init(vram.data(),static_cast<uint32_t>(vram.size()));
++                gs.setRasterBackend(std::make_unique<Recorder>(r));
++                gs.writeRegister(GS_REG_PRIM,GS_PRIM_TRIANGLE);
++                gs.writeRegister(GS_REG_RGBAQ,0x4000000080112233ull); // Q=2.
++                gs.writeRegister(GS_REG_XYZ2,0x00100010ull);
++                gs.writeRegister(GS_REG_XYZ2,0x00100040ull);
++                // PRE=0 aisla Q; PRE=1 con el mismo PRIM detecta el descarte de vertices.
++                const uint64_t empty[]={(1ull<<15)|(pre ? (1ull<<46)|(static_cast<uint64_t>(GS_PRIM_TRIANGLE)<<47) : 0ull),0ull};
++                if(native) t.IsTrue(gs.processNativePackedGIFPacket(reinterpret_cast<const uint8_t *>(empty),sizeof(empty)),"Etiqueta PACKED vacia valida");
++                else gs.processGIFPacket(reinterpret_cast<const uint8_t *>(empty),sizeof(empty));
++                gs.writeRegister(GS_REG_XYZ2,0x00400010ull);
++                t.Equals(r.draws.size(),size_t(1),"La etiqueta vacia conserva los dos vertices previos");
++                if(!r.draws.empty()) for(int i=0;i<3;++i)
++                    t.Equals(r.draws[0].vertices[i].q,2.0f,"NLOOP=0 no reinicia Q");
++
++                // Una etiqueta no vacia sigue reiniciando Q aunque su unico registro sea NOP.
++                gs.writeRegister(GS_REG_RGBAQ,0x4000000080112233ull);
++                const uint64_t nonempty[]={1ull|(1ull<<15)|(1ull<<60),0xfull,0ull,0ull};
++                if(native) t.IsTrue(gs.processNativePackedGIFPacket(reinterpret_cast<const uint8_t *>(nonempty),sizeof(nonempty)),"PACKED no vacio valido");
++                else gs.processGIFPacket(reinterpret_cast<const uint8_t *>(nonempty),sizeof(nonempty));
++                gs.writeRegister(GS_REG_XYZ2,0x00100010ull);
++                gs.writeRegister(GS_REG_XYZ2,0x00100040ull);
++                gs.writeRegister(GS_REG_XYZ2,0x00400010ull);
++                t.Equals(r.draws.size(),size_t(2),"El siguiente triangulo tambien llega al backend");
++                if(r.draws.size()==2) for(int i=0;i<3;++i)
++                    t.Equals(r.draws[1].vertices[i].q,1.0f,"Una etiqueta no vacia reinicia Q");
++            }
++        });
++        t.Run("GIFtag PRE applies only to nonempty PACKED packets", [](TestCase &t) {
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
++            GS gs; gs.init(vram.data(),static_cast<uint32_t>(vram.size()));
++            for(const uint64_t format : {uint64_t(GIF_FMT_REGLIST),uint64_t(GIF_FMT_IMAGE)})
++            {
++                gs.writeRegister(GS_REG_PRIM,GS_PRIM_TRIANGLE);
++                const uint64_t tag[]={1ull|(1ull<<15)|(1ull<<46)|
++                    (static_cast<uint64_t>(GS_PRIM_SPRITE)<<47)|(format<<58)|(2ull<<60),0xffull,0ull,0ull};
++                gs.processGIFPacket(reinterpret_cast<const uint8_t *>(tag),sizeof(tag));
++                t.Equals(gs.getDebugSnapshot().prim.type,static_cast<uint8_t>(GS_PRIM_TRIANGLE),"REGLIST e IMAGE ignoran PRE");
++            }
++            for(const bool native : {false,true})
++            {
++                gs.writeRegister(GS_REG_PRIM,GS_PRIM_TRIANGLE);
++                const uint64_t packed[]={1ull|(1ull<<15)|(1ull<<46)|
++                    (static_cast<uint64_t>(GS_PRIM_SPRITE)<<47)|(1ull<<60),0xfull,0ull,0ull};
++                if(native) t.IsTrue(gs.processNativePackedGIFPacket(reinterpret_cast<const uint8_t *>(packed),sizeof(packed)),"PACKED con PRE valido");
++                else gs.processGIFPacket(reinterpret_cast<const uint8_t *>(packed),sizeof(packed));
++                t.Equals(gs.getDebugSnapshot().prim.type,static_cast<uint8_t>(GS_PRIM_SPRITE),"PACKED no vacio aplica PRE");
++            }
++        });
++        t.Run("native IMAGE upload honors setup PRE and resets Q without IMAGE PRE", [](TestCase &t) {
++            for(const bool pre : {false,true})
++            {
++                Recording r;
++                std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
++                GS gs; gs.init(vram.data(),static_cast<uint32_t>(vram.size()));
++                gs.setRasterBackend(std::make_unique<Recorder>(r));
++                gs.writeRegister(GS_REG_PRIM,GS_PRIM_TRIANGLE);
++                gs.writeRegister(GS_REG_RGBAQ,0x4000000080112233ull);
++                const uint64_t packet[]={4ull|(1ull<<60)|
++                    (pre ? (1ull<<46)|(static_cast<uint64_t>(GS_PRIM_SPRITE)<<47) : 0ull),0xeull,
++                    (96ull<<32)|(1ull<<48),GS_REG_BITBLTBUF,
++                    0ull,GS_REG_TRXPOS,4ull|(1ull<<32),GS_REG_TRXREG,0ull,GS_REG_TRXDIR,
++                    1ull|(1ull<<15)|(1ull<<46)|(uint64_t(GIF_FMT_IMAGE)<<58),0ull,
++                    0x8044556680112233ull,0x80aabbcc80778899ull};
++                gs.processGIFPacket(reinterpret_cast<const uint8_t *>(packet),sizeof(packet));
++                t.Equals(gs.nativeImageUploadCount(),uint64_t(1),"Se ejercita la subida IMAGE nativa");
++                t.Equals(gs.getDebugSnapshot().prim.type,static_cast<uint8_t>(pre ? GS_PRIM_SPRITE : GS_PRIM_TRIANGLE),"Solo PRE del setup PACKED cambia PRIM");
++                t.Equals(r.uploaded.size(),size_t(16),"La subida conserva los cuatro pixeles");
++                if(r.uploaded.size()==16) t.IsTrue(std::memcmp(r.uploaded.data(),packet+12,16)==0,"Los bytes de IMAGE no cambian");
++                gs.writeRegister(GS_REG_PRIM,GS_PRIM_POINT);
++                gs.writeRegister(GS_REG_XYZ2,0x00100010ull);
++                t.Equals(r.draws.size(),size_t(1),"El siguiente punto llega al backend");
++                if(!r.draws.empty()) t.Equals(r.draws[0].vertices[0].q,1.0f,"Las etiquetas no vacias reinician Q tambien en el atajo IMAGE");
++            }
++        });
+         t.Run("queue owns upload and draw payloads; Flush is a barrier", [](TestCase &t) {
+             Recording r;
+             GSThreadedBackend b(std::make_unique<Recorder>(r)); b.Initialize(nullptr,0);

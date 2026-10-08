@@ -512,6 +512,8 @@ namespace ps2_stubs
             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
             int64_t firstPresentedPts90k = -1;
             uint64_t ptsPresentationBaseTickQ32 = 0u;
+            // GOW-Port: bytes aceptados por sceMpegDemuxPssRing, para saber si sceMpegCbNodata aporto datos.
+            uint64_t demuxedBytes = 0u;
         };
 
         struct MpegStreamCallbackEvent
@@ -561,6 +563,8 @@ namespace ps2_stubs
         constexpr uint8_t kMpegPrivateStream1 = 0xBDu;
         constexpr size_t kStartCodeNotFound = std::numeric_limits<size_t>::max();
         constexpr uint32_t kMpegCallbackDataSize = 0x20u;
+        // GOW-Port: sceMpegCbType de libmpeg (sceMpegCbError = 0, sceMpegCbNodata = 1, ...).
+        constexpr uint32_t kMpegCbNodata = 1u;
 
         uint64_t mpegPictureIntervalQ32(uint8_t frameRateCode, uint8_t frameRateExtensionN = 0u, uint8_t frameRateExtensionD = 0u)
         {
@@ -1768,6 +1772,13 @@ namespace ps2_stubs
         resetMpegStubStateUnlocked();
     }
 
+    // GOW-Port: estado del decodificador para las pruebas (¿falta la cabecera de secuencia?).
+    bool mpegWaitingForSequenceHeaderForTesting(uint32_t mpegAddr)
+    {
+        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        return getPlaybackState(mpegAddr).waitingForVideoSequenceHeader;
+    }
+
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr)
     {
         constexpr int kTestFrameWidth = 16;
@@ -1926,6 +1937,15 @@ namespace ps2_stubs
         g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
             MpegRegisteredCallback{callbackType, 0u, callbackFunc, callbackData, handle, false});
 
+        // GOW-Port: registro acotado de los callbacks que registra el juego (tipo 1 = sceMpegCbNodata).
+        static uint32_t s_addCallbackTrace = 0u;
+        if (s_addCallbackTrace < 16u)
+        {
+            ++s_addCallbackTrace;
+            std::cerr << "[MPEG:AddCallback] mpeg=0x" << std::hex << mpegAddr << " type=" << std::dec << callbackType
+                      << " func=0x" << std::hex << callbackFunc << " data=0x" << callbackData << std::dec << std::endl;
+        }
+
         setReturnU32(ctx, handle);
     }
 
@@ -2000,7 +2020,16 @@ namespace ps2_stubs
 
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
-            getPlaybackState(param_1) = makeFreshPlaybackState();
+            // GOW-Port: God of War demultiplexa el primer bloque del PSS (con la cabecera de secuencia)
+            // antes de sceMpegCreate. Reiniciar aquí descartaba esa cabecera; como el vídeo no la repite,
+            // el decodificador esperaba para siempre y el juego se quedaba en sceMpegGetPicture.
+            // Se conserva la entrada ya demultiplexada del flujo en curso.
+            MpegPlaybackState &existing = getPlaybackState(param_1);
+            const bool keepPendingInput = existing.sawInput && !existing.streamEnded && !existing.decoderFailed &&
+                                          existing.picturesServed == 0u &&
+                                          existing.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
+            if (!keepPendingInput)
+                existing = makeFreshPlaybackState();
         }
 
         const uint32_t puVar4 = uVar3 + 0x108u;
@@ -2190,6 +2219,7 @@ namespace ps2_stubs
                     ringSize,
                     callbackEvents);
                 recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
+                playback.demuxedBytes += consumed;
             }
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
@@ -2280,6 +2310,86 @@ namespace ps2_stubs
         setReturnU32(ctx, getPlaybackState(mpegAddr).decodeMode);
     }
 
+    // GOW-Port: sceMpegCbNodata registrado para mpegAddr (requiere g_mpeg_stub_mutex).
+    static bool findNodataCallbackUnlocked(uint32_t mpegAddr, PS2Runtime *runtime, MpegRegisteredCallback &out)
+    {
+        auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+        if (it == g_mpeg_stub_state.callbacksByMpeg.end() || !runtime)
+        {
+            return false;
+        }
+        for (const MpegRegisteredCallback &callback : it->second)
+        {
+            if (!callback.stream && callback.type == kMpegCbNodata && callback.func != 0u &&
+                runtime->hasFunction(callback.func))
+            {
+                out = callback;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // GOW-Port: llama a sceMpegCbNodata(mpeg, &cbData{type = Nodata}, data) en el hilo actual y despues vuelve a
+    // evaluar sceMpegGetPicture. Si el callback no aporto datos, espera al siguiente VSync antes de reintentar
+    // para no acaparar la CPU que necesita el hilo que lee del disco.
+    [[noreturn]] static void dispatchNodataCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                                                    uint32_t mpegAddr, const MpegRegisteredCallback &callback,
+                                                    uint64_t demuxedBefore)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.bindMainContextForSyscall(*ctx, rdram);
+
+        const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+        if (uint8_t *data = getMemPtr(rdram, cbDataAddr))
+        {
+            std::memset(data, 0, kMpegCallbackDataSize);
+            *reinterpret_cast<uint32_t *>(data) = kMpegCbNodata;
+        }
+
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::HleCall;
+        invocation.context = *ctx;
+        invocation.context.pc = callback.func;
+        SET_GPR_U32(&invocation.context, 4, mpegAddr);
+        SET_GPR_U32(&invocation.context, 5, cbDataAddr);
+        SET_GPR_U32(&invocation.context, 6, callback.data);
+        SET_GPR_U32(&invocation.context, 29, 0u);
+        SET_GPR_U32(&invocation.context, 31, 0u);
+        invocation.onComplete = [rdram, runtime, mpegAddr, cbDataAddr, demuxedBefore](const R5900Context &,
+                                                                                      R5900Context &parent)
+        {
+            if (cbDataAddr != 0u)
+            {
+                runtime->guestFree(cbDataAddr);
+            }
+            bool progressed = false;
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+                progressed = playback.demuxedBytes != demuxedBefore || !playback.decodedFrames.empty() ||
+                             playback.streamEnded || playback.decoderFailed ||
+                             g_mpeg_stub_state.currentCdStreamEofSeen;
+            }
+            if (!progressed)
+            {
+                runtime->eeScheduler().waitVSync(
+                    runtime->eeScheduler().currentVSyncTick(),
+                    -1,
+                    [rdram, runtime](R5900Context &resumeContext)
+                    {
+                        if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+                        {
+                            return;
+                        }
+                        sceMpegGetPicture(rdram, &resumeContext, runtime);
+                    });
+            }
+            sceMpegGetPicture(rdram, &parent, runtime);
+        };
+        scheduler.invokeCurrent(std::move(invocation));
+    }
+
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t mpegAddr = getRegU32(ctx, 4);
@@ -2297,6 +2407,15 @@ namespace ps2_stubs
                 !playback.streamEnded &&
                 !playback.decoderFailed)
             {
+                // GOW-Port: como libmpeg, sin datos se llama primero a sceMpegCbNodata en el hilo que pide la
+                // imagen; ese callback suele leer del anillo y llamar a sceMpegDemuxPssRing.
+                MpegRegisteredCallback nodata{};
+                if (findNodataCallbackUnlocked(mpegAddr, runtime, nodata))
+                {
+                    const uint64_t demuxedBefore = playback.demuxedBytes;
+                    lock.unlock();
+                    dispatchNodataCallback(rdram, ctx, runtime, mpegAddr, nodata, demuxedBefore);
+                }
                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
                 {
                     PS2_IF_AGRESSIVE_LOGS({

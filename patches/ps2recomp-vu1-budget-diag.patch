@@ -1,0 +1,125 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -90,6 +90,9 @@
+     static void registerCompiledProgram(CompiledProgramFn program);
+     static uint64_t hashMicrocode(const uint8_t *code, uint32_t size);
+     void setCompiledProgramsEnabled(bool enabled) { m_compiledEnabled = enabled; }
++
++    // GOW-Port: última ejecución detenida por presupuesto, sin E ni D/T.
++    bool lastRunHitBudget() const { return m_lastRunHitBudget; }
+ 
+     VU1State &state() { return m_state; }
+     const VU1State &state() const { return m_state; }
+@@ -298,6 +301,7 @@
+     bool m_stopRequested = false;
+     bool m_pendingHaltD = false;
+     bool m_pendingHaltT = false;
++    bool m_lastRunHitBudget = false; // GOW-Port: PR #12
+ 
+     void run(uint8_t *vuCode, uint32_t codeSize,
+              uint8_t *vuData, uint32_t dataSize,
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -104,6 +104,7 @@
+ 
+ void VU1Interpreter::resetScheduler()
+ {
++    m_lastRunHitBudget = false; // GOW-Port
+     m_nextCommitCycle = ~0ull;
+     m_flagPipeline = {};
+     m_fdiv = {};
+@@ -1757,6 +1758,7 @@
+     const int previousRoundingMode = std::fegetround();
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+     StepContext context{vuCode, codeSize, vuData, dataSize, &gs, memory, m_cycle + maxCycles, false};
++    m_lastRunHitBudget = false; // GOW-Port: funciona también con un despachador compilado.
+     if (CompiledProgramFn program = compiledProgramFor(vuCode, codeSize, memory))
+         program(*this, context);
+     else
+@@ -1773,6 +1775,7 @@
+         m_pendingHaltD = false;
+         m_pendingHaltT = false;
+     }
++    m_lastRunHitBudget = !programEnded && !m_stopRequested && m_cycle >= context.budgetEnd; // GOW-Port
+     m_state.cycles = m_cycle;
+     if (useVuRounding && previousRoundingMode != -1)
+         std::fesetround(previousRoundingMode);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -728,6 +728,23 @@
+     return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
+ }
+ 
++// GOW-Port: diagnóstico de PR #12 (927c7b93), adaptado a StepContext de PR #18.
++// GOW_VU1_BUDGET_DIAG=1 observa cortes por presupuesto; no aumenta el límite.
++static void gowReportVu1Budget(const VU1Interpreter &vu1, const char *kind, uint32_t startPC)
++{
++    static const bool enabled = [] {
++        const char *value = std::getenv("GOW_VU1_BUDGET_DIAG");
++        return value && *value && *value != '0';
++    }();
++    if (!enabled || !vu1.lastRunHitBudget()) return;
++    static std::atomic<uint64_t> hits{0u};
++    const uint64_t count = hits.fetch_add(1u, std::memory_order_relaxed) + 1u;
++    if (count <= 32u || (count % 1024u) == 0u)
++        std::fprintf(stderr, "[gow-vu1-budget] %s start=0x%04X pc=0x%04X cycles=%llu hits=%llu\n",
++                     kind, startPC, vu1.state().pc, static_cast<unsigned long long>(vu1.state().cycles),
++                     static_cast<unsigned long long>(count));
++}
++
+ bool PS2Runtime::syncCoreSubsystems()
+ {
+     uint8_t *const rdram = m_memory.getRDRAM();
+@@ -762,6 +779,7 @@
+                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                    m_gs, &m_memory, startPC, top, itop, 65536);
++                                     gowReportVu1Budget(m_vu1, "MSCAL", startPC);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+@@ -780,6 +798,7 @@
+                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                   m_gs, &m_memory, top, itop, 65536);
++                                     gowReportVu1Budget(m_vu1, "MSCNT", 0xFFFFu);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -245,6 +245,30 @@
+ {
+     MiniTest::Case("PS2VU1", [](TestCase &tc)
+     {
++        // GOW-Port: PR #12 adaptada al intérprete/StepContext compilado de PR #18.
++        tc.Run("VU1 budget diagnostic distinguishes exhaustion, resume, E bit and reset", [](TestCase &t)
++        {
++            Vu1Fixture fx;
++            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++            constexpr uint32_t lowerNop = 0x8000033Cu;
++            for (uint32_t pc=0u; pc<64u; pc+=8u)
++                writeVuInstructionPair(fx.code, pc, lowerNop, kVuUpperNop);
++            writeVuInstructionPair(fx.code, 64u, lowerNop, kVuUpperNop | 0x40000000u);
++            writeVuInstructionPair(fx.code, 72u, lowerNop, kVuUpperNop);
++            for (bool direct : {false, true}) {
++                VU1Interpreter vu;
++                vu.setDirectRegisterWrites(direct);
++                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 4u);
++                t.IsTrue(vu.lastRunHitBudget(), "the NOP program exhausts a short budget");
++                vu.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 65536u);
++                t.IsFalse(vu.lastRunHitBudget(), "resume reaches E and clears the previous exhaustion");
++                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 0u);
++                t.IsTrue(vu.lastRunHitBudget(), "a zero budget executes no pairs");
++                vu.reset();
++                t.IsFalse(vu.lastRunHitBudget(), "reset clears the diagnostic");
++            }
++        });
++
+         tc.Run("upper ADD applies the destination mask", [](TestCase &t)
+         {
+             Vu1Fixture fx;

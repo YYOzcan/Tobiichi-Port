@@ -1,0 +1,195 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl b/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl
+index 2b7d4d9..807546d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.inl
+@@ -10,6 +10,12 @@
+ 
+ #include <cmath>
+ #include <cstring>
++#if defined(_MSC_VER) || defined(__SSE4_1__)
++#include <immintrin.h>
++#define VU1C_SIMD 1
++#else
++#define VU1C_SIMD 0
++#endif
+ 
+ // GOW-Port: la aritmética de VU no depende de /fp:fast. El runtime se compila con /fp:fast, que deja al
+ // compilador fusionar a*b+c en FMA según dónde esté el código: el intérprete y el microcódigo compilado
+@@ -153,6 +159,28 @@ namespace vu1c
+             return std::numeric_limits<int32_t>::min();
+         return static_cast<int32_t>(scaled);
+     }
++#if VU1C_SIMD
++    // normalizeOperand en los cuatro carriles: exponente 0 -> cero con signo; exponente 255 -> máximo con signo.
++    VU1_STEP_INLINE __m128 normalize4(__m128 v)
++    {
++        const __m128i bits = _mm_castps_si128(v);
++        const __m128i expMask = _mm_set1_epi32(0x7F800000);
++        const __m128i exp = _mm_and_si128(bits, expMask);
++        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
++        __m128i r = _mm_blendv_epi8(bits, sign, _mm_cmpeq_epi32(exp, _mm_setzero_si128()));
++        r = _mm_blendv_epi8(r, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)), _mm_cmpeq_epi32(exp, expMask));
++        return _mm_castsi128_ps(r);
++    }
++    VU1_STEP_INLINE __m128i exponent4(__m128 v)
++    {
++        return _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(v), 23), _mm_set1_epi32(0xFF));
++    }
++    // Carriles activos de una máscara DEST (x = carril 0) como bits de movemask / blend.
++    constexpr int laneBits(uint32_t dest)
++    {
++        return ((dest & 8u) ? 1 : 0) | ((dest & 4u) ? 2 : 0) | ((dest & 2u) ? 4 : 0) | ((dest & 1u) ? 8 : 0);
++    }
++#endif
+     constexpr uint32_t crossLeft(uint32_t c) { return c == 0 ? 1u : c == 1 ? 2u : c == 2 ? 0u : 3u; }
+     constexpr uint32_t crossRight(uint32_t c) { return c == 0 ? 2u : c == 1 ? 0u : c == 2 ? 1u : 3u; }
+ }
+@@ -324,6 +352,118 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
+         m_currentUpperInstruction = Upper;
+         constexpr uint32_t dest = (Upper >> 21) & 0xFu;
+         constexpr uint32_t fd = (Upper >> 6) & 0x1Fu;
++#if VU1C_SIMD
++        // Los cuatro carriles con SSE. Mismas operaciones en float que fmacLaneT (cada producto y suma se
++        // redondea por separado con el MXCSR del VU), así que el resultado es el mismo bit a bit. Si algún
++        // carril activo saldría del camino rápido de los flags (resultado o producto cerca de cero, de los
++        // extremos o con cancelación), se rehace todo con el código escalar de abajo.
++        constexpr bool cross = info.kind == vu1c::Kind::Opmsub || info.kind == vu1c::Kind::Opmula;
++        if constexpr (dest != 0u && !(cross && (dest & 1u) != 0u))
++        {
++            constexpr uint32_t fs = (Upper >> 11) & 0x1Fu;
++            constexpr uint32_t ft = (Upper >> 16) & 0x1Fu;
++            constexpr int lanes = vu1c::laneBits(dest);
++            constexpr bool productSum = info.kind == vu1c::Kind::Madd || info.kind == vu1c::Kind::Msub ||
++                                        info.kind == vu1c::Kind::Opmsub;
++            __m128 vs = vu1c::normalize4(_mm_loadu_ps(m_state.vf[fs]));
++            if constexpr (cross)
++                vs = _mm_shuffle_ps(vs, vs, _MM_SHUFFLE(3, 0, 2, 1));
++            __m128 right;
++            if constexpr (info.source == vu1c::Source::Q)
++                right = _mm_set1_ps(normalizeOperand(m_state.q));
++            else if constexpr (info.source == vu1c::Source::I)
++                right = _mm_set1_ps(normalizeOperand(m_state.i));
++            else
++            {
++                right = vu1c::normalize4(_mm_loadu_ps(m_state.vf[ft]));
++                if constexpr (cross)
++                    right = _mm_shuffle_ps(right, right, _MM_SHUFFLE(3, 1, 0, 2));
++                else if constexpr (info.source == vu1c::Source::Broadcast)
++                    right = _mm_shuffle_ps(right, right, _MM_SHUFFLE(info.bc, info.bc, info.bc, info.bc));
++            }
++            __m128 r;
++            __m128 product = _mm_setzero_ps();
++            bool fast = true;
++            int zeroLanes = 0;   // carriles con flag Z (resultado exactamente cero)
++            int zeroProduct = 0; // carriles con producto exactamente cero (un operando es cero)
++            if constexpr (info.kind == vu1c::Kind::Max)
++                r = _mm_max_ps(vs, right);
++            else if constexpr (info.kind == vu1c::Kind::Mini)
++                r = _mm_min_ps(vs, right);
++            else
++            {
++                if constexpr (info.kind == vu1c::Kind::Add)
++                    r = _mm_add_ps(vs, right);
++                else if constexpr (info.kind == vu1c::Kind::Sub)
++                    r = _mm_sub_ps(vs, right);
++                else if constexpr (productSum)
++                {
++                    const __m128 acc = vu1c::normalize4(_mm_loadu_ps(m_state.acc));
++                    product = _mm_mul_ps(vs, right);
++                    r = info.kind == vu1c::Kind::Madd ? _mm_add_ps(acc, product) : _mm_sub_ps(acc, product);
++                }
++                else
++                    r = _mm_mul_ps(vs, right); // Mul, Opmula
++                const __m128i er = vu1c::exponent4(r);
++                const __m128i absMask = _mm_set1_epi32(0x7FFFFFFF);
++                // Un operando normalizado es cero: el producto exacto es cero con signo (como el redondeado).
++                const __m128i opZero = _mm_or_si128(
++                    _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(vs), absMask), _mm_setzero_si128()),
++                    _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(right), absMask), _mm_setzero_si128()));
++                __m128i ok;
++                if constexpr (productSum)
++                {
++                    // productSumFlagsFast (exponente del resultado 2..0xFD y no mucho menor que el del producto)
++                    // y productStickyFlags (exponente del producto 2..0xFD, o producto exactamente cero).
++                    const __m128i ep = vu1c::exponent4(product);
++                    ok = _mm_and_si128(_mm_cmpgt_epi32(er, _mm_set1_epi32(1)), _mm_cmplt_epi32(er, _mm_set1_epi32(0xFE)));
++                    ok = _mm_and_si128(ok, _mm_cmpgt_epi32(er, _mm_sub_epi32(ep, _mm_set1_epi32(21))));
++                    const __m128i epOk = _mm_and_si128(_mm_cmpgt_epi32(ep, _mm_set1_epi32(1)), _mm_cmplt_epi32(ep, _mm_set1_epi32(0xFE)));
++                    ok = _mm_and_si128(ok, _mm_or_si128(epOk, opZero));
++                    zeroProduct = _mm_movemask_ps(_mm_castsi128_ps(opZero)) & lanes;
++                }
++                else
++                {
++                    // Add, Sub, Mul: exponente del resultado 1..0xFD, o cero exacto.
++                    // GOW-Port: con FTZ, r==0 tambien puede ocultar una cancelacion subnormal.
++                    // Comprobar operandos opuestos/iguales conserva su flag U en el camino escalar.
++                    ok = _mm_and_si128(_mm_cmpgt_epi32(er, _mm_setzero_si128()), _mm_cmplt_epi32(er, _mm_set1_epi32(0xFE)));
++                    __m128i exactZero;
++                    if constexpr (info.kind == vu1c::Kind::Add)
++                        exactZero = _mm_castps_si128(_mm_cmpeq_ps(vs, _mm_xor_ps(right,
++                            _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u))))));
++                    else if constexpr (info.kind == vu1c::Kind::Sub)
++                        exactZero = _mm_castps_si128(_mm_cmpeq_ps(vs, right));
++                    else
++                        exactZero = opZero;
++                    ok = _mm_or_si128(ok, exactZero);
++                    zeroLanes = _mm_movemask_ps(_mm_castsi128_ps(exactZero)) & lanes;
++                }
++                fast = (_mm_movemask_ps(_mm_castsi128_ps(ok)) & lanes) == lanes;
++            }
++            if (fast)
++            {
++                if constexpr (info.kind != vu1c::Kind::Max && info.kind != vu1c::Kind::Mini)
++                {
++                    const int signs = _mm_movemask_ps(r) & lanes;
++                    const uint32_t productSticky =
++                        productSum ? ((_mm_movemask_ps(product) & lanes) != 0 ? 0x2u : 0u) | (zeroProduct != 0 ? 0x1u : 0u) : 0u;
++                    if (DeadFlags && m_statusQuiet)
++                        m_state.status |= ((signs != 0 ? 0x2u : 0u) | (zeroLanes != 0 ? 0x1u : 0u) | productSticky) << 6;
++                    else
++                    {
++                        const auto laneFlag = [&](int bit) -> uint8_t
++                        { return static_cast<uint8_t>(((signs & bit) ? 2u : 0u) | ((zeroLanes & bit) ? 1u : 0u)); };
++                        const uint8_t laneFlags[4] = {laneFlag(1), laneFlag(2), laneFlag(4), laneFlag(8)};
++                        updateFmacFlags(laneFlags, static_cast<uint8_t>(dest), productSticky);
++                    }
++                }
++                float *target = info.toAcc ? m_state.acc : m_state.vf[fd];
++                _mm_storeu_ps(target, _mm_blend_ps(_mm_loadu_ps(target), r, lanes));
++                return;
++            }
++        }
++#endif
+         float result[4]{};
+         uint8_t laneFlags[4]{};
+         uint8_t productFlags[4]{};
+@@ -531,6 +671,29 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
+     else if constexpr (opHi == 0x40u && funct >= 0x3Cu && funct2 == 0x3Bu) // WAITQ
+     {
+     }
++    else if constexpr (opHi == 0x40u && funct >= 0x3Cu && funct2 == 0x38u) // DIV
++    {
++        // GOW-Port: DIV resuelto en compilacion; misma normalizacion, flags D/I y latencia que el interprete.
++        constexpr int fsf = (instr >> 21) & 0x3;
++        constexpr int ftf = (instr >> 23) & 0x3;
++        const float num = normalizeOperand(m_state.vf[fs][fsf]);
++        const float den = normalizeOperand(m_state.vf[ft][ftf]);
++        uint32_t statusDi = 0u;
++        float result = 0.0f;
++        if (den == 0.0f)
++        {
++            statusDi = num == 0.0f ? 0x10u : 0x20u;
++            result = std::signbit(num) != std::signbit(den) ? -std::numeric_limits<float>::max()
++                                                            : std::numeric_limits<float>::max();
++        }
++        else
++        {
++            result = num / den;
++        }
++        uint32_t ignoredFlags = 0u;
++        result = normalizeResult(result, ignoredFlags);
++        queueQ(result, 7u, statusDi);
++    }
+     else if constexpr (opHi == 0x40u && funct >= 0x3Cu && funct2 == 0x3Cu) // MTIR
+     {
+         constexpr uint32_t comp = (instr >> 21) & 0x3u;

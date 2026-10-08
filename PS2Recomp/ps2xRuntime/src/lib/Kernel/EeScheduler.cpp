@@ -1,6 +1,7 @@
 #include "runtime/ee_scheduler.h"
 
 #include "ps2_log.h"
+#include "runtime/ps2_perf.h"
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
@@ -53,6 +54,41 @@ namespace
     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+
+    inline std::chrono::microseconds getVBlankPeriod()
+    {
+        static const auto period = []() {
+            const char *fpsEnv = std::getenv("GOW_TARGET_FPS");
+            const char *unlocked = std::getenv("GOW_UNLOCKED_FPS");
+            int fps = 60;
+            if (fpsEnv && fpsEnv[0] != '\0')
+            {
+                fps = std::atoi(fpsEnv);
+            }
+            else if (unlocked && (unlocked[0] == '1' || unlocked[0] == 'u' || unlocked[0] == 'U'))
+            {
+                fps = 120;
+            }
+            fps = std::clamp(fps, 15, 360);
+            return std::chrono::microseconds(1000000 / fps);
+        }();
+        return period;
+    }
+
+    inline uint64_t getVBlankPeriodCycles()
+    {
+        static const uint64_t cycles = microsecondsToEeCycles(static_cast<uint64_t>(getVBlankPeriod().count()));
+        return cycles;
+    }
+
+    inline bool isUnlockedFps()
+    {
+        static const bool unlocked = []() {
+            const char *val = std::getenv("GOW_UNLOCKED_FPS");
+            return val && (val[0] == '1' || val[0] == 'u' || val[0] == 'U');
+        }();
+        return unlocked;
+    }
 
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
@@ -146,14 +182,15 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
-                  std::chrono::steady_clock::now() + kVBlankPeriod,
+    scheduleEvent(m_eeCycle + getVBlankPeriodCycles(),
+                  std::chrono::steady_clock::now() + getVBlankPeriod(),
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
 }
 
 void EeScheduler::run()
 {
+    ps2_perf::Scope perf(ps2_perf::Bucket::Ee); // GOW-Port: tiempos exclusivos del ejecutor.
     assertExecutor();
     m_running.store(true, std::memory_order_release);
 
@@ -296,12 +333,16 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            ps2_perf::guestEntry(context.pc);
+            loadSharedVu0Random(context);
             function(m_rdram, &context, &m_runtime);
+            saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
         catch (const EeDispatcherTransfer &)
         {
+            saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
@@ -357,12 +398,10 @@ void EeScheduler::postEvent(EeEvent event)
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
-    ++m_checkpointCalls;
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
     {
-        ++m_checkpointHits;
         return true;
     }
 
@@ -370,7 +409,6 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
     {
         m_checkpointPending.store(true, std::memory_order_release);
-        ++m_checkpointHits;
         return true;
     }
 
@@ -384,7 +422,6 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     {
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
-        ++m_checkpointHits;
         return true;
     }
 
@@ -842,7 +879,6 @@ int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uin
     semaphore.attr = attr;
     semaphore.option = option;
     m_semaphores.emplace(id, std::move(semaphore));
-    m_lastCreatedSemaphoreId = id;
     publishSnapshot();
     return id;
 }
@@ -1643,8 +1679,10 @@ void EeScheduler::makeRunning(GuestThread &item)
     renewTimeSlice();
 }
 
+void gowDumpBranchRing(const char *why);
 void EeScheduler::makeDormant(GuestThread &item)
 {
+    { static int n = 0; if (item.id == 1 && n++ < 1) gowDumpBranchRing("main thread dormant"); }
     removeReady(item);
     removeFromWaitObject(item);
     item.status = EeThreadStatus::Dormant;
@@ -1745,6 +1783,31 @@ void EeScheduler::applyPendingPreemption()
     m_timeSliceExpired = false;
 }
 
+namespace
+{
+    // GOW-Port: estado del flanco de la interrupcion del GS (solo se usa en el hilo ejecutor). Se guarda
+    // aqui y no en EeScheduler para no cambiar el tamano de la clase.
+    uint32_t g_gsIrqLatched = 0u;
+}
+
+void EeScheduler::pollGsInterrupt()
+{
+    // GOW-Port: el runtime marcaba CSR.FINISH/SIGNAL pero nunca lanzaba la interrupcion del GS (INTC 0).
+    // God of War espera el fin de cada cadena DMA con un manejador de esa interrupcion
+    // (vid::WaitForDMAComplete se queda esperando una bandera que solo pone ese manejador).
+    // IMR: bit 8 = SIGMSK, bit 9 = FINISHMSK (1 = enmascarada). El manejador borra el bit escribiendo CSR.
+    auto &gs = m_runtime.memory().gs();
+    const uint32_t csr = static_cast<uint32_t>(gs.csr.load(std::memory_order_acquire)) & 0x3u;
+    const uint32_t masked = static_cast<uint32_t>(gs.imr >> 8) & 0x3u;
+    const uint32_t active = csr & ~masked;
+    const uint32_t rising = active & ~g_gsIrqLatched;
+    g_gsIrqLatched = active;
+    if (rising != 0u)
+    {
+        dispatchIrq(false, 0u);
+    }
+}
+
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
@@ -1758,6 +1821,7 @@ void EeScheduler::processPendingEvents()
             dispatchIrq(false, 9u + timer);
         }
     }
+    pollGsInterrupt();
     std::deque<EeEvent> pending;
     {
         std::lock_guard lock(m_eventMutex);
@@ -1855,8 +1919,8 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                scheduleEvent(scheduled.deadlineCycle + getVBlankPeriodCycles(),
+                              scheduled.hostDeadline + getVBlankPeriod(),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -2001,6 +2065,7 @@ void EeScheduler::writeGuestU32(uint32_t address, uint32_t value)
 
 void EeScheduler::waitForEvent()
 {
+    ps2_perf::Scope perf(ps2_perf::Bucket::GuestWait);
     std::unique_lock lock(m_eventMutex);
     if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
     {
@@ -2041,6 +2106,12 @@ void EeScheduler::waitForEvent()
         }
     }
 
+    if (isUnlockedFps())
+    {
+        hostDeadline = std::min(hostDeadline, std::chrono::steady_clock::now());
+    }
+
+    m_runtime.advanceIopEeCycles(0u);
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
@@ -2116,6 +2187,22 @@ void EeScheduler::copyMainContextToRuntime()
     {
         m_runtime.m_cpuContext = main->context;
     }
+}
+
+void EeScheduler::loadSharedVu0Random(R5900Context &context)
+{
+    if (!m_sharedVu0RandomValid)
+    {
+        saveSharedVu0Random(context);
+        return;
+    }
+    context.vu0_r = m_sharedVu0Random;
+}
+
+void EeScheduler::saveSharedVu0Random(const R5900Context &context)
+{
+    m_sharedVu0Random = context.vu0_r;
+    m_sharedVu0RandomValid = true;
 }
 
 void EeScheduler::publishDebugContext(const R5900Context &context)

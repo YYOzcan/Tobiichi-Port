@@ -1,0 +1,117 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,6 +1,8 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include <cstring>
++#include <cstdio>
++#include <cstdlib>
+
+ enum VIFCmd : uint8_t
+ {
+@@ -341,6 +343,17 @@
+         const bool irq = (cmd & 0x80000000u) != 0u;
+
+         // Track most-recent command for VIFn_CODE emulation.
++        static const bool traceVif = std::getenv("GOW_VIF_DIAG") != nullptr;
++        if (traceVif)
++        {
++            static uint64_t commands = 0u, irqCommands = 0u;
++            ++commands;
++            if (irq) ++irqCommands;
++            if (commands == 1u || (commands % 4096u) == 0u || (irq && irqCommands <= 32u))
++                std::fprintf(stderr, "[gow-vif] commands=%llu irq=%llu code=0x%08X offset=0x%X bytes=%u tops=%u\n",
++                             static_cast<unsigned long long>(commands), static_cast<unsigned long long>(irqCommands),
++                             cmd, pos - 4u, sizeBytes, vif1_regs.tops);
++        }
+         vif1_regs.code = cmd;
+         vif1_regs.num = num;
+         if (irq)
+@@ -406,6 +419,19 @@
+
+             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
+             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
++            if (traceVif)
++            {
++                static unsigned launches = 0u;
++                if (++launches <= 24u && m_vu1Data)
++                {
++                    uint64_t lo = 0u, hi = 0u;
++                    std::memcpy(&lo, m_vu1Data + runItop * 16u, 8u);
++                    std::memcpy(&hi, m_vu1Data + runItop * 16u + 8u, 8u);
++                    std::fprintf(stderr, "[gow-vif-launch] launch=%u pc=0x%X top=%u itop=%u input=%016llX:%016llX offset=0x%X\n",
++                                 launches, startPC, runTop, runItop,
++                                 static_cast<unsigned long long>(hi), static_cast<unsigned long long>(lo), pos - 4u);
++                }
++            }
+             vif1_regs.top = runTop;
+             vif1_regs.itop = runItop;
+
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -845,12 +845,26 @@
+     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
+         return;
+
++    auto traceRejectedTag = [&](const char *reason, uint32_t offset)
++    {
++        static const bool enabled = std::getenv("GOW_VIF_DIAG") != nullptr;
++        static unsigned rejected = 0u;
++        if (!enabled || ++rejected > 32u) return;
++        uint64_t lo = 0u, hi = 0u;
++        std::memcpy(&lo, m_xgkick.packet.data() + offset, 8u);
++        std::memcpy(&hi, m_xgkick.packet.data() + offset + 8u, 8u);
++        std::fprintf(stderr, "[gow-xgkick:reject] reason=%s pc=0x%X source=0x%X offset=0x%X lo=%016llX hi=%016llX\n",
++                     reason, m_state.pc, m_xgkick.sourceAddress, offset,
++                     static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi));
++    };
++
+     ++m_xgkick.cycleCredit;
+     while (m_xgkick.active && m_xgkick.cycleCredit >= 2u)
+     {
+         m_xgkick.cycleCredit -= 2u;
+         if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
+         {
++            traceRejectedTag("buffer-full", m_xgkick.copiedBytes - 16u);
+             reportReservedInstruction(false, 0xFFFFFFFBu);
+             m_xgkick.active = false;
+             return;
+@@ -873,6 +887,20 @@
+             uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+             if (nreg == 0u)
+                 nreg = 16u;
++
++            static const bool traceKick = std::getenv("GOW_VIF_DIAG") != nullptr;
++            if (traceKick)
++            {
++                static unsigned tags = 0u;
++                if (++tags <= 96u || (tags % 4096u) == 0u)
++                {
++                    uint64_t tagHi = 0u;
++                    std::memcpy(&tagHi, m_xgkick.packet.data() + qwordOffset + 8u, sizeof(tagHi));
++                    std::fprintf(stderr, "[gow-xgkick] tag=%u pc=0x%X source=0x%X offset=0x%X lo=%016llX hi=%016llX\n",
++                                 tags, m_state.pc, m_xgkick.sourceAddress, qwordOffset,
++                                 static_cast<unsigned long long>(tagLo), static_cast<unsigned long long>(tagHi));
++                }
++            }
+
+             uint64_t tagBytes = 16u;
+             if (format == 0u)
+@@ -883,6 +911,7 @@
+                 tagBytes += static_cast<uint64_t>(nloop) * 16u;
+             else
+             {
++                traceRejectedTag("format", qwordOffset);
+                 reportReservedInstruction(false, 0xFFFFFFF8u);
+                 m_xgkick.active = false;
+                 return;
+@@ -890,6 +919,7 @@
+
+             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
+             {
++                traceRejectedTag("length", qwordOffset);
+                 reportReservedInstruction(false, 0xFFFFFFFBu);
+                 m_xgkick.active = false;
+                 return;

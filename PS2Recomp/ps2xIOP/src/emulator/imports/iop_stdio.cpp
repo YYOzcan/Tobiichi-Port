@@ -2,6 +2,7 @@
 
 #include "../core/iop_cpu.h"
 #include "../core/iop_memory.h"
+#include "iop_format.h"
 #include "ps2x/iop/iop_host.h"
 
 #include <string>
@@ -30,9 +31,24 @@ namespace ps2x::iop::detail
 
         switch (ordinal)
         {
-        case 4: // printf
-            logString("[IOP printf] ", a0);
+        case 4: // printf(fmt, ...): argumentos en a1..a3 y despues en la pila desde sp+16 (o32)
+        {
+            uint32_t argIndex = 0u;
+            const std::function<uint32_t()> nextArg = [&]() -> uint32_t
+            {
+                const uint32_t index = argIndex++;
+                if (index < 3u)
+                    return cpu.gpr[5u + index];
+                return m_memory.read32(cpu.gpr[29] + 16u + (index - 3u) * 4u);
+            };
+            std::string text = formatGuestString(m_memory, a0, nextArg, 2048u);
+            const size_t length = text.size();
+            while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+                text.pop_back();
+            m_host.log(LogLevel::Info, std::string("[IOP printf] ") + text);
+            setV0(static_cast<uint32_t>(length));
             return true;
+        }
         case 5: // getchar
         case 10:
             setV0(0xFFFFFFFFu);

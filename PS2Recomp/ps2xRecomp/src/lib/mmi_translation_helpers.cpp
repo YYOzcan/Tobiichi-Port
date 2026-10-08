@@ -81,7 +81,7 @@ namespace ps2recomp
         switch (subfunc)
         {
         case MMI1_PABSW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PABSW(GPR_VEC(ctx, {})));", rd, rs);
+            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PABSW(GPR_VEC(ctx, {})));", rd, rt); // GOW-Port: el operando es rt
         case MMI1_PCEQW:
             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PCEQW(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
         case MMI1_PMINW:
@@ -89,7 +89,7 @@ namespace ps2recomp
         case MMI1_PADSBH:
             return translatePADSBH(inst);
         case MMI1_PABSH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PABSH(GPR_VEC(ctx, {})));", rd, rs);
+            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PABSH(GPR_VEC(ctx, {})));", rd, rt); // GOW-Port: el operando es rt
         case MMI1_PCEQH:
             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PCEQH(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
         case MMI1_PMINH:
@@ -105,9 +105,10 @@ namespace ps2recomp
         case MMI1_PEXTUW:
             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXTUW(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
         case MMI1_PADDUH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_add_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+            // GOW-Port: PADDUH/PSUBUH saturan sin signo (0..0xFFFF), como PCSX2.
+            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_adds_epu16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
         case MMI1_PSUBUH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_sub_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_subs_epu16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
         case MMI1_PEXTUH:
             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXTUH(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
         case MMI1_PADDUB:
@@ -454,18 +455,15 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePEXEH(const Instruction &inst)
     {
-        // Swaps halfwords 1<->3 and 5<->7 within the 128-bit register
-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
-                           inst.rd, inst.rt);
+        // GOW-Port: permutacion corregida segun PCSX2 (ver ps2_runtime_macros.h).
+        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXEH(GPR_VEC(ctx, {})));", inst.rd, inst.rt);
     }
 
 
     std::string CodeGenerator::translatePREVH(const Instruction &inst)
     {
-        // Reverses the order of the 8 halfwords
-        return fmt::format("{{ __m128i mask = _mm_setr_epi8(14,15, 12,13, 10,11, 8,9, 6,7, 4,5, 2,3, 0,1); "
-                           "SET_GPR_VEC(ctx, {}, PS2_SHUFFLE_EPI8(GPR_VEC(ctx, {}), mask)); }}",
-                           inst.rd, inst.rt);
+        // GOW-Port: permutacion corregida segun PCSX2 (ver ps2_runtime_macros.h).
+        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PREVH(GPR_VEC(ctx, {})));", inst.rd, inst.rt);
     }
 
 
@@ -520,9 +518,8 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePROT3W(const Instruction &inst)
     {
-        // Rotates words left by 3: [d,c,b,a] -> [a,d,c,b]
-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(0,3,2,1)));",
-                           inst.rd, inst.rt);
+        // GOW-Port: permutacion corregida segun PCSX2 (ver ps2_runtime_macros.h).
+        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PROT3W(GPR_VEC(ctx, {})));", inst.rd, inst.rt);
     }
 
 
@@ -560,9 +557,8 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePEXCH(const Instruction &inst)
     {
-        // Parallel Exchange Center Halfword (same as MMI2 PEXEH)
-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
-                           inst.rd, inst.rt);
+        // GOW-Port: permutacion corregida segun PCSX2 (ver ps2_runtime_macros.h).
+        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXCH(GPR_VEC(ctx, {})));", inst.rd, inst.rt);
     }
 
 
@@ -577,9 +573,8 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePEXCW(const Instruction &inst)
     {
-        // Parallel Exchange Center Word (Swaps words 0<>2, 1<>3)
-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(1,0,3,2)));",
-                           inst.rd, inst.rt);
+        // GOW-Port: permutacion corregida segun PCSX2 (ver ps2_runtime_macros.h).
+        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXCW(GPR_VEC(ctx, {})));", inst.rd, inst.rt);
     }
 
 

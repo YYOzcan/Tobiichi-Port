@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -329,8 +330,10 @@ bool PS2Memory::initialize(size_t ramSize)
     m_codeRegions.clear();
     m_path3Masked = false;
     m_path3MaskedFifo.clear();
-    m_vif1PendingPath2ImageQwc = 0u;
-    m_vif1PendingPath2DirectHl = false;
+    // GOW-Port: descartar cualquier DIRECT incompleto al inicializar VIF1.
+    m_vif1DirectBytesRemaining = 0u;
+    m_vif1DirectHl = false;
+    m_vif1DirectPayload.clear();
     resetEeTimers();
 
     try
@@ -355,6 +358,7 @@ bool PS2Memory::initialize(size_t ramSize)
 
         // Initialize I/O registers
         m_ioRegisters.clear();
+        m_gifStatSlot = nullptr;
 
         // Initialize GS registers
         memset(&gs_regs, 0, sizeof(gs_regs));
@@ -413,9 +417,14 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
 
     constexpr uint32_t kGifStat = 0x10003020u;
     constexpr uint32_t kGifFqcMask = 0x1F000000u;
-    auto gifStatIt = m_ioRegisters.find(kGifStat);
-    if (gifStatIt != m_ioRegisters.end())
-        gifStatIt->second &= ~kGifFqcMask;
+    if (m_gifStatSlot == nullptr)
+    {
+        auto gifStatIt = m_ioRegisters.find(kGifStat);
+        if (gifStatIt != m_ioRegisters.end())
+            m_gifStatSlot = &gifStatIt->second;
+    }
+    if (m_gifStatSlot != nullptr)
+        *m_gifStatSlot &= ~kGifFqcMask;
 
     uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
@@ -1229,8 +1238,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             {
                 const bool wasPath3Masked = m_path3Masked;
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
-                m_vif1PendingPath2ImageQwc = 0u;
-                m_vif1PendingPath2DirectHl = false;
+                // GOW-Port: FBRST también descarta la carga DIRECT pendiente y su prioridad.
+                m_vif1DirectBytesRemaining = 0u;
+                m_vif1DirectHl = false;
+                m_vif1DirectPayload.clear();
                 m_path3Masked = false;
                 if (wasPath3Masked)
                     flushMaskedPath3Packets();
@@ -1313,13 +1324,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
             {
-                if (channelBase == 0x1000A000u)
-                {
-                    std::cerr << "[GIF DMA CHCR Write] val=0x" << std::hex << value
-                              << " madr=0x" << madr
-                              << " tadr=0x" << m_ioRegisters[channelBase + 0x30]
-                              << " qwc=0x" << qwc << std::dec << std::endl;
-                }
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
                 {
                     if (qwCount == 0)
@@ -1351,7 +1355,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // GOW-Port: las cadenas largas (mas de 4096 tags) se cortaban y dejaban el GIF en modo IMAGE
+                    // (fork de SotC, e36fbf1).
+                    const int kMaxChainTags = 1 << 20;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1528,6 +1534,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                     }
 
+                    if (tagsProcessed >= kMaxChainTags)
+                    {
+                        std::fprintf(stderr, "[dma] chain on 0x%08x stopped after %d tags at 0x%08x\n", channelBase, tagsProcessed, tagAddr);
+                        std::fflush(stderr);
+                    }
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
                     m_ioRegisters[channelBase + 0x40] = asr0;
                     m_ioRegisters[channelBase + 0x50] = asr1;
@@ -1599,6 +1610,12 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         return false;
 
     const uint32_t mode = (chcr >> 2u) & 0x3u;
+    // GOW-Port: modo cadena. fromSPR usa cadena de destino (etiquetas en el scratchpad que indican
+    // la dirección de RAM) y toSPR cadena de origen (etiquetas en RAM, datos seguidos en el scratchpad).
+    // God of War copia así la paleta de huesos que CalcSkinHierarchy deja en el scratchpad; sin esto
+    // los paquetes de VU1 quedaban a cero y los personajes se dibujaban como polígonos gigantes.
+    if (mode == 1u)
+        return processScratchpadChain(channelBase, chcr);
     if (mode != 0u)
         return false;
 
@@ -1646,6 +1663,140 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
     m_ioRegisters[channelBase + 0x10u] = (originalMadr + byteCount) & 0x7FFFFFF0u;
     m_ioRegisters[channelBase + 0x20u] = 0u;
     m_ioRegisters[channelBase + 0x80u] = (originalSadr + byteCount) & 0x3FF0u;
+    completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
+    return true;
+}
+
+// GOW-Port: cadenas DMA del scratchpad (canales 8 y 9), según la especificación del DMAC del EE.
+bool PS2Memory::processScratchpadChain(uint32_t channelBase, uint32_t chcr)
+{
+    static constexpr uint32_t kSprFromChannel = 0x1000D000u;
+    static constexpr int kMaxTags = 1 << 16;
+    const bool fromScratchpad = channelBase == kSprFromChannel;
+    const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+    uint32_t sadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+    uint32_t madr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
+    uint32_t lastTagUpper = (chcr >> 16u) & 0xFFFFu;
+    auto copyToSpr = [&](const uint8_t *src, uint32_t bytes)
+    {
+        for (uint32_t done = 0u; done < bytes;)
+        {
+            const uint32_t chunk = std::min(bytes - done, PS2_SCRATCHPAD_SIZE - sadr);
+            std::memcpy(m_scratchpad + sadr, src + done, chunk);
+            done += chunk;
+            sadr = (sadr + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+        }
+    };
+    // Origen en RAM o en el propio scratchpad (bit 31 de la dirección de la etiqueta).
+    auto sourcePointer = [&](uint32_t address, uint32_t bytes) -> const uint8_t *
+    {
+        if ((address & 0x80000000u) != 0u || isScratchpad(address))
+        {
+            const uint32_t offset = address & (PS2_SCRATCHPAD_SIZE - 1u);
+            return offset + bytes <= PS2_SCRATCHPAD_SIZE ? m_scratchpad + offset : nullptr;
+        }
+        uint32_t offset = 0u;
+        try { offset = translateAddress(address); } catch (const std::exception &) { return nullptr; }
+        return offset < PS2_RAM_SIZE && bytes <= PS2_RAM_SIZE - offset ? m_rdram + offset : nullptr;
+    };
+
+    if (fromScratchpad)
+    {
+        // Cadena de destino: etiqueta {QWC, ID, IRQ, ADDR} en el scratchpad; ID 0 = cnts, 1 = cnt, 7 = end.
+        for (int tags = 0; tags < kMaxTags; ++tags)
+        {
+            uint64_t tag = 0u;
+            std::memcpy(&tag, m_scratchpad + sadr, sizeof(tag));
+            sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+            const uint32_t qwc = static_cast<uint32_t>(tag & 0xFFFFu);
+            const uint32_t id = static_cast<uint32_t>((tag >> 28u) & 0x7u);
+            const bool irq = ((tag >> 31u) & 1u) != 0u;
+            lastTagUpper = static_cast<uint32_t>((tag >> 16u) & 0xFFFFu);
+            madr = static_cast<uint32_t>(tag >> 32u) & 0x7FFFFFF0u;
+            uint32_t offset = 0u;
+            bool valid = true;
+            try { offset = translateAddress(madr); } catch (const std::exception &) { valid = false; }
+            const uint32_t bytes = qwc * 16u;
+            if (valid && offset < PS2_RAM_SIZE && bytes <= PS2_RAM_SIZE - offset)
+            {
+                for (uint32_t done = 0u; done < bytes;)
+                {
+                    const uint32_t chunk = std::min(bytes - done, PS2_SCRATCHPAD_SIZE - sadr);
+                    std::memcpy(m_rdram + offset + done, m_scratchpad + sadr, chunk);
+                    done += chunk;
+                    sadr = (sadr + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+                }
+                markModified(offset, bytes);
+            }
+            else
+            {
+                sadr = (sadr + bytes) & (PS2_SCRATCHPAD_SIZE - 1u);
+            }
+            madr += bytes;
+            if (id == 7u || (id != 0u && id != 1u) || (irq && tieEnabled))
+                break;
+        }
+    }
+    else
+    {
+        // Cadena de origen: etiquetas en RAM (como VIF/GIF); los datos se escriben seguidos en el scratchpad.
+        uint32_t tadr = m_ioRegisters[channelBase + 0x30u];
+        uint32_t asp = (chcr >> 4u) & 0x3u;
+        uint32_t asr[2] = {m_ioRegisters[channelBase + 0x40u], m_ioRegisters[channelBase + 0x50u]};
+        const bool transferTag = (chcr & 0x40u) != 0u;
+        for (int tags = 0; tags < kMaxTags; ++tags)
+        {
+            const uint8_t *tagPointer = sourcePointer(tadr, 16u);
+            if (!tagPointer)
+                break;
+            uint64_t tag = 0u;
+            std::memcpy(&tag, tagPointer, sizeof(tag));
+            const uint32_t qwc = static_cast<uint32_t>(tag & 0xFFFFu);
+            const uint32_t id = static_cast<uint32_t>((tag >> 28u) & 0x7u);
+            const bool irq = ((tag >> 31u) & 1u) != 0u;
+            const uint32_t addr = static_cast<uint32_t>(tag >> 32u) & 0xFFFFFFF0u;
+            lastTagUpper = static_cast<uint32_t>((tag >> 16u) & 0xFFFFu);
+            uint32_t data = tadr + 16u;
+            bool end = false;
+            switch (id)
+            {
+            case 0u: data = addr; tadr += 16u; end = true; break; // refe
+            case 1u: tadr = data + qwc * 16u; break;              // cnt
+            case 2u: tadr = addr; break;                          // next
+            case 3u: case 4u: data = addr; tadr += 16u; break;    // ref, refs
+            case 5u:                                              // call
+                if (asp < 2u) asr[asp++] = data + qwc * 16u;
+                tadr = addr;
+                break;
+            case 6u:                                              // ret
+                if (asp > 0u) tadr = asr[--asp];
+                else end = true;
+                break;
+            default: end = true; break;                           // end
+            }
+            if (transferTag)
+                copyToSpr(tagPointer, 16u);
+            if (qwc != 0u)
+            {
+                if (const uint8_t *source = sourcePointer(data, qwc * 16u))
+                    copyToSpr(source, qwc * 16u);
+                else
+                    sadr = (sadr + qwc * 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+            }
+            madr = data + qwc * 16u;
+            if (end || (irq && tieEnabled))
+                break;
+        }
+        m_ioRegisters[channelBase + 0x30u] = tadr;
+        m_ioRegisters[channelBase + 0x40u] = asr[0];
+        m_ioRegisters[channelBase + 0x50u] = asr[1];
+        chcr = (chcr & ~(0x3u << 4u)) | ((asp & 0x3u) << 4u);
+    }
+
+    m_ioRegisters[channelBase + 0x00u] = (chcr & 0x0000FFFFu) | (lastTagUpper << 16u);
+    m_ioRegisters[channelBase + 0x10u] = madr & 0x7FFFFFF0u;
+    m_ioRegisters[channelBase + 0x20u] = 0u;
+    m_ioRegisters[channelBase + 0x80u] = sadr & 0x3FF0u;
     completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
     return true;
 }
@@ -2014,7 +2165,8 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
 
-    if (!m_rdram || !m_gsVRAM || m_path3Masked)
+    // GOW-Port: una etiqueta/payload pendiente debe completarse por el parser PATH3.
+    if (!m_rdram || !m_gsVRAM || m_path3Masked || gs.hasPendingGIFPacket(GifPathId::Path3))
         return false;
     if (m_gifArbiter && !m_gifArbiter->empty())
         return false;
@@ -2123,7 +2275,8 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
         return false;
 
     const uint64_t imageTagLo = loadScalar<uint64_t>(imageGifTag, 0u, 16u, "native gif image tag", imageTagDmaAddr + 16u);
-    if (gifTagFlg(imageTagLo) != GIF_FMT_IMAGE)
+    // GOW-Port: el atajo acepta los mismos formatos de imagen que el frontend.
+    if (gifTagFlg(imageTagLo) != GIF_FMT_IMAGE && gifTagFlg(imageTagLo) != GIF_FMT_IMAGE2)
         return false;
 
     const uint32_t imageQwc = gifTagNloop(imageTagLo);
@@ -2179,7 +2332,9 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
     m_seenGifCopy = true;
     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-    gs.uploadImageNative(setupRegs[0], setupRegs[1], setupRegs[2], setupRegs[3], imageData, imageBytes);
+    // GOW-Port: mantener los efectos de la GIFtag PACKED sin perder el atajo DMA de texturas.
+    const uint64_t setupGifTag = loadScalar<uint64_t>(setupPayload, 0u, 80u, "native gif setup tag", setupPayloadAddr);
+    gs.uploadImageNative(setupRegs[0], setupRegs[1], setupRegs[2], setupRegs[3], imageData, imageBytes, setupGifTag);
 
     m_ioRegisters[GIF_CHANNEL + 0x30u] = finalTadr;
     m_ioRegisters[GIF_CHANNEL + 0x40u] = 0u;
@@ -2254,7 +2409,7 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
     const uint8_t *payload = nullptr;
     if (!resolveContiguous(tadr + 16u, payloadBytes, payload))
         return false;
-    if (!gs.processNativePackedGIFPacket(payload, payloadBytes))
+    if (!gs.processNativePackedGIFPacket(payload, payloadBytes, GifPathId::Path3))
         return false;
 
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);

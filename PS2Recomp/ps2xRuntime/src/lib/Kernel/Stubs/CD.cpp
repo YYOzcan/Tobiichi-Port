@@ -210,6 +210,18 @@ namespace ps2_stubs
         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
 
+        // TEMPORARY (Tobiichi): trace disc traffic to see if hero data is
+        // ever requested. Remove after the hero-stream investigation.
+        {
+            static int s_cdReadLogs = 0;
+            if (s_cdReadLogs < 60)
+            {
+                std::cerr << "[tobiichi-cdread] lbn=" << a0 << " n=" << a1 << " dst=0x" << std::hex << a2
+                          << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+                ++s_cdReadLogs;
+            }
+        }
+
         struct CdReadArgs
         {
             uint32_t lbn = 0;

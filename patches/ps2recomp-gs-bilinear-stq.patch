@@ -1,0 +1,163 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1316,18 +1316,18 @@
+         return 0xFFFF00FFu;
+     };
+ 
++    // GOW-Port: ambos filtros convierten STQ a 16.16 (PCSX2 v2.8.2 SW).
++    // En bilinear, truncar ANTES de restar medio texel conserva los pesos signed.
++    const float fixedU = std::trunc(texUf * 65536.0f);
++    const float fixedV = std::trunc(texVf * 65536.0f);
+     if (!state.linearFilter)
+     {
+-        // GOW-Port: STQ pasa por 16.16 antes de elegir el texel (PCSX2 v2.8.2 SW).
+-        // Truncar directo a entero pierde negativos; floor directo falla cerca de cero.
+-        const float fixedU = std::trunc(texUf * 65536.0f);
+-        const float fixedV = std::trunc(texVf * 65536.0f);
+         return samplePoint(static_cast<int>(std::floor(fixedU / 65536.0f)),
+                            static_cast<int>(std::floor(fixedV / 65536.0f)));
+     }
+ 
+-    const float sampleU = texUf - 0.5f;
+-    const float sampleV = texVf - 0.5f;
++    const float sampleU = fixedU / 65536.0f - 0.5f;
++    const float sampleV = fixedV / 65536.0f - 0.5f;
+     const int u0 = static_cast<int>(std::floor(sampleU));
+     const int v0 = static_cast<int>(std::floor(sampleV));
+     const int u1 = u0 + 1;
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_gpu_shaders.cpp
+@@ -474,16 +474,16 @@
+         texUf = ss * invQ * texW;
+         texVf = tt * invQ * texH;
+     }
++    // GOW-Port: conversion 16.16 antes del medio texel, tambien para bilinear STQ.
++    precise float fixedU = trunc(texUf * 65536.0);
++    precise float fixedV = trunc(texVf * 65536.0);
+     if ((flags & F_LINEAR) == 0u)
+     {
+-        // GOW-Port: conversion 16.16 y eleccion signed del texel, igual que CPU.
+-        precise float fixedU = trunc(texUf * 65536.0);
+-        precise float fixedV = trunc(texVf * 65536.0);
+         return samplePoint(s, int(floor(fixedU / 65536.0)), int(floor(fixedV / 65536.0)));
+     }
+ 
+-    precise float sampleU = texUf - 0.5;
+-    precise float sampleV = texVf - 0.5;
++    precise float sampleU = fixedU / 65536.0 - 0.5;
++    precise float sampleV = fixedV / 65536.0 - 0.5;
+     int u0 = int(floor(sampleU));
+     int v0 = int(floor(sampleV));
+     precise float fx = sampleU - float(u0);
+diff --git a/ps2xTest/src/ps2_gs_backend_tests.cpp b/ps2xTest/src/ps2_gs_backend_tests.cpp
+--- a/ps2xTest/src/ps2_gs_backend_tests.cpp
++++ b/ps2xTest/src/ps2_gs_backend_tests.cpp
+@@ -310,6 +310,75 @@
+                 const uint64_t expected=fixture?0xed8981a5d009360dull:0xbbed71858c292ba5ull;
+                 t.IsTrue(hash==expected,"RGBA coincide con la referencia externa: negativos y limites 16.16 en sprites/triangulos");
+             }
++    }
++
++    // GOW-Port: oraculo RGBA externo PCSX2 v2.8.2 SW, bilinear STQ signed 16.16.
++    // SHA256 3566bc0c748d3948c2180c311562175df43c745a28bc8d7ad165d165b57d4e28.
++    // Texels 4x4 procedurales; 256 muestras cerca de cero/medios texels/pesos de 4 bits.
++    void bilinearStqReference(TestCase &t,GSRasterBackend &backend,GSGpuBackend *gpu=nullptr,bool hardware=false)
++    {
++        struct Restore {unsigned csr=_mm_getcsr();~Restore(){_mm_setcsr(csr);}} restore;
++        _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++        for(unsigned y=0;y<4;++y) for(unsigned x=0;x<4;++x) {
++            const unsigned i=y*4+x;
++            backend.WriteVram(GS_PSM_CT32,8192,8,x,y,
++                (17u*i<<24)|((231u-13u*i)<<16)|((19u+11u*i)<<8)|(7u+15u*i));
++        }
++        constexpr float e=1.0f/131072;
++        const float limits[]={-2-e,-1-e,-0.5f-e,-0.25f-e,-0.0625f-e,-e,-2*e,0,e,
++            0.0625f-e,0.0625f+e,0.5f-e,0.5f,0.5f+e,1-e,1+e};
++        bool observedHardware=false;
++        for(bool triangle:{false,true}) for(float q:{1.0f,2.0f})
++            for(unsigned mode:{_MM_ROUND_NEAREST,_MM_ROUND_TOWARD_ZERO,_MM_ROUND_UP,_MM_ROUND_DOWN}) {
++                _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++                GSPrimitiveBatch b{};b.vertexCount=triangle?3:2;
++                b.state.prim.type=triangle?GS_PRIM_TRIANGLE:GS_PRIM_SPRITE;b.state.prim.tme=true;
++                b.state.textureWidth=b.state.textureHeight=4;b.state.colclamp=1;b.state.linearFilter=true;
++                auto &c=b.state.context;c.frame.fbw=8;c.scissor={0,15,0,15};
++                c.zbuf.zbp=104;c.zbuf.psm=GS_PSM_Z24;c.zbuf.zmask=true;c.test=0x30000;
++                c.tex1=0x60;c.tex0.tbp0=8192;c.tex0.tbw=8;c.tex0.tw=c.tex0.th=2;c.tex0.tcc=1;c.tex0.tfx=1;
++                backend.ClearFramebuffer(c,0);
++                const auto statsBefore=gpu?gpu->GetStats():GSGpuBackend::Stats{};
++                const unsigned before=(restore.csr & ~_MM_ROUND_MASK)|mode;_mm_setcsr(before);
++                for(unsigned y=0;y<16;++y) for(unsigned x=0;x<16;++x) {
++                    const float u=limits[x];
++                    const float v=limits[y];
++                    for(auto &vertex:b.vertices) {
++                        vertex.r=vertex.g=vertex.b=vertex.a=128;vertex.z=7;
++                        vertex.s=u*q/4.0f;vertex.t=v*q/4.0f;vertex.q=q;
++                    }
++                    if(triangle) {
++                        b.vertices[0].x=float(x)-0.25f;b.vertices[0].y=float(y)-0.25f;
++                        b.vertices[1].x=float(x)+0.75f;b.vertices[1].y=float(y)-0.25f;
++                        b.vertices[2].x=float(x)-0.25f;b.vertices[2].y=float(y)+0.75f;
++                    } else {
++                        b.vertices[0].x=float(x);b.vertices[0].y=float(y);
++                        b.vertices[1].x=float(x+1);b.vertices[1].y=float(y+1);
++                    }
++                    backend.Submit(b);
++                }
++                backend.Sync(GSSyncReason::Finish);
++                const unsigned controls=_MM_ROUND_MASK|_MM_MASK_MASK|_MM_FLUSH_ZERO_MASK|0x40u;
++                t.IsTrue((_mm_getcsr()&controls)==(before&controls),"Bilinear STQ conserva los controles SSE del productor");
++                _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
++                std::vector<uint8_t> actual;backend.SnapshotVram(actual);
++                if(actual.size()!=GSSwizzle::kMemorySize){t.Fail("VRAM completa requerida");return;}
++                uint64_t hash=14695981039346656037ull;
++                const auto &format=GSSwizzle::GetFormat(GS_PSM_CT32);
++                for(unsigned y=0;y<16;++y) for(unsigned x=0;x<16;++x) {
++                    const auto p=GSSwizzle::Locate(format,0,8,x,y);
++                    for(unsigned channel=0;channel<4;++channel) hash=(hash^actual[p.byte+channel])*1099511628211ull;
++                }
++                const uint64_t expected=0xc6e49fa0342e621full;
++                t.IsTrue(hash==expected,"RGBA bilinear STQ coincide con la referencia externa en sprites/triangulos");
++                if(gpu) {
++                    const auto after=gpu->GetStats();
++                    t.IsTrue(after.prims-statsBefore.prims==256,"Las 256 primitivas se rasterizan en OpenGL");
++                    if(after.prims-statsBefore.prims==256 && after.tiles==statsBefore.tiles)observedHardware=true;
++                    if(!hardware)t.IsTrue(after.tiles>statsBefore.tiles,"La ruta compute se ejecuta sin fallback CPU");
++                }
++            }
++        if(gpu && hardware)t.IsTrue(observedHardware,"Al menos una matriz se rasteriza en hardware sin tiles compute");
+     }
+ 
+     struct Recording
+@@ -838,6 +907,15 @@
+             std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSThreadedBackend backend(std::make_unique<GSCpuBackend>());
+             backend.Initialize(vram.data(),uint32_t(vram.size()));nearestReference(t,backend);
+         });
++        t.Run("CPU bilinear STQ quantizes signed coordinates before filtering",[](TestCase &t){
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSCpuBackend backend;
++            backend.Initialize(vram.data(),uint32_t(vram.size()));bilinearStqReference(t,backend);
++        });
++        t.Run("Threaded CPU bilinear STQ matches the external RGBA reference",[](TestCase &t){
++            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSThreadedBackend backend(std::make_unique<GSCpuBackend>());
++            backend.Initialize(vram.data(),uint32_t(vram.size()));bilinearStqReference(t,backend);
++        });
++
+         // GOW-Port: exportación CPU adaptada de SotC ac9efa0 para repetir comandos GS.
+         t.Run("CPU and threaded CPU restore an incomplete CT24 transfer",[](TestCase &t) {
+             for(bool threaded:{false,true}) {
+@@ -1398,6 +1476,14 @@
+             });
+ 
+ 
++            t.Run("OpenGL bilinear STQ matches signed fixed-point filtering boundaries",[](TestCase &t){
++                for(bool hardware:{false,true}) {
++                    std::vector<uint8_t> vram(GSSwizzle::kMemorySize);auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
++                    raw->SetHardwareRasterAllowed(hardware);GSThreadedBackend backend(std::move(gpu));backend.Initialize(vram.data(),uint32_t(vram.size()));
++                    if(dynamic_cast<GSGpuBackend*>(&backend.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
++                    bilinearStqReference(t,backend,raw,hardware);
++                }
++            });
+             t.Run("OpenGL nearest STQ matches negative texels and fixed-point boundaries",[](TestCase &t){
+                 for(bool hardware:{false,true}) {
+                     std::vector<uint8_t> vram(GSSwizzle::kMemorySize);auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();

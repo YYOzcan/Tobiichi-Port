@@ -1,0 +1,44 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 2e7af81..740582f 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -452,6 +452,9 @@ public:
+     };
+ 
+     std::array<EeTimer, 4> m_eeTimers{};
++    // GOW-Port: GIF_STAT en m_ioRegisters (los elementos de unordered_map no se mueven; solo clear() lo
++    // invalida). advanceEeTimers lo usa ~1,5 millones de veces por segundo.
++    uint32_t *m_gifStatSlot = nullptr;
+     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+     bool processScratchpadChain(uint32_t channelBase, uint32_t chcr); // GOW-Port
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index b8bf59d..6b419a4 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -358,6 +358,7 @@ bool PS2Memory::initialize(size_t ramSize)
+ 
+         // Initialize I/O registers
+         m_ioRegisters.clear();
++        m_gifStatSlot = nullptr;
+ 
+         // Initialize GS registers
+         memset(&gs_regs, 0, sizeof(gs_regs));
+@@ -416,9 +417,14 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+ 
+     constexpr uint32_t kGifStat = 0x10003020u;
+     constexpr uint32_t kGifFqcMask = 0x1F000000u;
+-    auto gifStatIt = m_ioRegisters.find(kGifStat);
+-    if (gifStatIt != m_ioRegisters.end())
+-        gifStatIt->second &= ~kGifFqcMask;
++    if (m_gifStatSlot == nullptr)
++    {
++        auto gifStatIt = m_ioRegisters.find(kGifStat);
++        if (gifStatIt != m_ioRegisters.end())
++            m_gifStatSlot = &gifStatIt->second;
++    }
++    if (m_gifStatSlot != nullptr)
++        *m_gifStatSlot &= ~kGifFqcMask;
+ 
+     uint32_t interruptMask = 0u;
+     for (size_t index = 0; index < m_eeTimers.size(); ++index)

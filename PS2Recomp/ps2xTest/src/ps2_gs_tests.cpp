@@ -1002,7 +1002,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, kUvRow1);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, kUvRow1);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
 
             const uint32_t dstPixel = readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u);
             t.Equals(dstPixel, static_cast<uint32_t>(kSourceColor),
@@ -2653,7 +2654,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -2798,7 +2800,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -2860,7 +2863,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -2926,7 +2930,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -3471,7 +3476,9 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, 0ull);
-                gs.writeRegister(GS_REG_ST, packSt(1.0f, 0.0f));
+                // GOW-Port: en el centro GS (1,1), S=0.375 y U=0.75;
+                // queda entre texels incluso tras quitar el desplazamiento de medio pixel.
+                gs.writeRegister(GS_REG_ST, packSt(1.5f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, (64ull << 0) | (0ull << 16));
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
@@ -3638,7 +3645,9 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_ST, packSt(2.0f, 0.0f));
+            // GOW-Port: centro GS (1,1), pesos 1/2,1/4,1/4. S/Q da texel 2;
+            // interpolar S/Q por vertice daria texel 1 y debe seguir fallando.
+            gs.writeRegister(GS_REG_ST, packSt(3.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(2.0f));
             gs.writeRegister(GS_REG_XYZ2, 64ull);
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
@@ -3648,7 +3657,7 @@ void register_ps2_gs_tests()
             const uint32_t pixel =
                 readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
             t.Equals(pixel, kHomogeneousTexel,
-                     "the DDA should interpolate S=0.75 and Q=1.375, selecting texel 2 after S/Q");
+                     "DDA en (1,1): S=0.75 y Q=1.25; selecciona texel 2 despues de S/Q");
         });
 
         tc.Run("GS alpha-test AFAIL independently masks framebuffer and depth", [](TestCase &t)
@@ -3847,47 +3856,23 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZF2, makeXyzf(420u, 420u));
             gs.writeRegister(GS_REG_XYZF2, makeXyzf(102u, 420u));
 
-            bool sawFilledRow = false;
-            for (uint32_t y = 6u; y <= 26u; ++y)
+            // GOW-Port: VRAM CT32 es swizzled; leerla como filas lineales inventaba
+            // huecos y no comprobaba el quad de [6.375,26.25] en centros enteros.
+            for (uint32_t y = 0u; y <= 31u; ++y)
             {
-                int first = -1;
-                int last = -1;
-                for (uint32_t x = 6u; x <= 26u; ++x)
+                for (uint32_t x = 0u; x <= 31u; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
-                    if ((pixel & 0x00FFFFFFu) != 0u)
+                    const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, x, y);
+                    const uint32_t expected = x >= 7u && x <= 26u && y >= 7u && y <= 26u
+                                                  ? 0x80FFFFFFu : 0u;
+                    if (pixel != expected)
                     {
-                        if (first < 0)
-                        {
-                            first = static_cast<int>(x);
-                        }
-                        last = static_cast<int>(x);
-                    }
-                }
-
-                if (first < 0 || last < 0)
-                {
-                    continue;
-                }
-
-                sawFilledRow = true;
-                for (int x = first; x <= last; ++x)
-                {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
-                    if ((pixel & 0x00FFFFFFu) == 0u)
-                    {
-                        t.Fail("triangle fan quad should not leave interior holes within a covered row");
-                        break;
+                        t.Fail("Quad subpixel debe cubrir solo centros enteros interiores: x=" +
+                               std::to_string(x) + " y=" + std::to_string(y));
+                        return;
                     }
                 }
             }
-
-            t.IsTrue(sawFilledRow,
-                     "triangle fan quad should light at least one framebuffer row");
         });
 
         tc.Run("sceGsExecLoadImage and sceGsExecStoreImage roundtrip and free guest packets", [](TestCase &t)
@@ -4467,7 +4452,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
 
             uint32_t pixelHL = 0u;
             std::memcpy(&pixelHL, vram.data(), sizeof(pixelHL));
@@ -4490,7 +4476,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            // GOW-Port: sprite de 1x1; dos vertices iguales no generan pixels.
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
 
             uint32_t pixelHH = 0u;
             std::memcpy(&pixelHH, vram.data(), sizeof(pixelHH));

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <immintrin.h>
 
 namespace
 {
@@ -16,6 +17,24 @@ namespace
             return std::numeric_limits<int32_t>::min();
         return static_cast<int32_t>(scaled);
     }
+    static inline __m128 normalizeSimd(__m128 v)
+    {
+        const __m128i expMask = _mm_set1_epi32(0x7F800000);
+        const __m128i signMask = _mm_set1_epi32(static_cast<int32_t>(0x80000000u));
+        const __m128i maxFloat = _mm_set1_epi32(0x7F7FFFFF);
+
+        __m128i vi = _mm_castps_si128(v);
+        __m128i exp = _mm_and_si128(vi, expMask);
+        __m128i is_denorm = _mm_cmpeq_epi32(exp, _mm_setzero_si128());
+        __m128i is_nan_inf = _mm_cmpeq_epi32(exp, expMask);
+
+        __m128i signs = _mm_and_si128(vi, signMask);
+        __m128i nan_clamped = _mm_or_si128(signs, maxFloat);
+
+        __m128i res = _mm_blendv_epi8(vi, signs, is_denorm);
+        res = _mm_blendv_epi8(res, nan_clamped, is_nan_inf);
+        return _mm_castsi128_ps(res);
+    }
 }
 
 // ============================================================================
@@ -24,27 +43,46 @@ namespace
 void VU1Interpreter::execUpper(uint32_t instr)
 {
     m_currentUpperInstruction = instr;
-    uint8_t dest = DEST(instr);
-    uint8_t ft = FT(instr);
-    uint8_t fs = FS(instr);
-    uint8_t fd = FD(instr);
-    uint8_t op = instr & 0x3F;
+    if (__builtin_expect(instr == 0u, 0))
+        return;
+
+    const uint8_t op = instr & 0x3Fu;
+    const uint8_t dest = DEST(instr);
+
+    if (op >= 0x3Cu)
+    {
+        const uint8_t specialOp = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
+        if (specialOp == 0x2Fu || specialOp == 0x30u)
+            return; // NOP
+        if (dest == 0u && specialOp != 0x1Fu)
+            return; // dest == 0 and not CLIP
+    }
+    else if (dest == 0u)
+    {
+        return;
+    }
+
+    const uint8_t ft = FT(instr);
+    const uint8_t fs = FS(instr);
+    const uint8_t fd = FD(instr);
 
     float *vd = m_state.vf[fd];
-    float normalizedVs[4];
-    float normalizedVt[4];
-    float normalizedAcc[4];
-    for (uint32_t component = 0; component < 4u; ++component)
-    {
-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
-    }
-    const float *vs = normalizedVs;
-    const float *vt = normalizedVt;
-    const float *acc = normalizedAcc;
-    const float q = normalizeOperand(m_state.q);
-    const float i = normalizeOperand(m_state.i);
+    const __m128 v_vs = normalizeSimd(_mm_loadu_ps(m_state.vf[fs]));
+    const __m128 v_vt = normalizeSimd(_mm_loadu_ps(m_state.vf[ft]));
+    alignas(16) float vs[4];
+    alignas(16) float vt[4];
+    _mm_store_ps(vs, v_vs);
+    _mm_store_ps(vt, v_vt);
+
+    const auto getAcc = [this]() -> __m128 {
+        return normalizeSimd(_mm_loadu_ps(m_state.acc));
+    };
+    const auto getQ = [this]() -> float {
+        return normalizeOperand(m_state.q);
+    };
+    const auto getI = [this]() -> float {
+        return normalizeOperand(m_state.i);
+    };
     float result[4];
 
     // Upper opcode decoding (bits 5:0 of upper word)
@@ -55,9 +93,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x02:
     case 0x03: // ADDbc
     {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] + bc;
+        const float bc = vt[op & 3];
+        _mm_storeu_ps(result, _mm_add_ps(v_vs, _mm_set1_ps(bc)));
         applyFmacDest(vd, result, dest);
         return;
     }
@@ -66,9 +103,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x06:
     case 0x07: // SUBbc
     {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] - bc;
+        const float bc = vt[op & 3];
+        _mm_storeu_ps(result, _mm_sub_ps(v_vs, _mm_set1_ps(bc)));
         applyFmacDest(vd, result, dest);
         return;
     }
@@ -77,9 +113,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x0A:
     case 0x0B: // MADDbc
     {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] + vs[c] * bc;
+        const float bc = vt[op & 3];
+        _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(bc), getAcc()));
         applyFmacDest(vd, result, dest);
         return;
     }
@@ -88,9 +123,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x0E:
     case 0x0F: // MSUBbc
     {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] - vs[c] * bc;
+        const float bc = vt[op & 3];
+        _mm_storeu_ps(result, _mm_sub_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(bc))));
         applyFmacDest(vd, result, dest);
         return;
     }
@@ -99,9 +133,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x12:
     case 0x13: // MAXbc
     {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] > bc) ? vs[c] : bc;
+        const float bc = vt[op & 3];
+        _mm_storeu_ps(result, _mm_max_ps(v_vs, _mm_set1_ps(bc)));
         applyDest(vd, result, dest);
         return;
     }
@@ -110,9 +143,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x16:
     case 0x17: // MINIbc
     {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] < bc) ? vs[c] : bc;
+        const float bc = vt[op & 3];
+        _mm_storeu_ps(result, _mm_min_ps(v_vs, _mm_set1_ps(bc)));
         applyDest(vd, result, dest);
         return;
     }
@@ -121,112 +153,96 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x1A:
     case 0x1B: // MULbc
     {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] * bc;
+        const float bc = vt[op & 3];
+        _mm_storeu_ps(result, _mm_mul_ps(v_vs, _mm_set1_ps(bc)));
         applyFmacDest(vd, result, dest);
         return;
     }
     case 0x1C: // MULq
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] * q;
+        _mm_storeu_ps(result, _mm_mul_ps(v_vs, _mm_set1_ps(getQ())));
         applyFmacDest(vd, result, dest);
         return;
     case 0x1D: // MAXi
-        for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] > i) ? vs[c] : i;
+        _mm_storeu_ps(result, _mm_max_ps(v_vs, _mm_set1_ps(getI())));
         applyDest(vd, result, dest);
         return;
     case 0x1E: // MULi
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] * i;
+        _mm_storeu_ps(result, _mm_mul_ps(v_vs, _mm_set1_ps(getI())));
         applyFmacDest(vd, result, dest);
         return;
     case 0x1F: // MINIi
-        for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] < i) ? vs[c] : i;
+        _mm_storeu_ps(result, _mm_min_ps(v_vs, _mm_set1_ps(getI())));
         applyDest(vd, result, dest);
         return;
     case 0x20: // ADDq
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] + q;
+        _mm_storeu_ps(result, _mm_add_ps(v_vs, _mm_set1_ps(getQ())));
         applyFmacDest(vd, result, dest);
         return;
     case 0x21: // MADDq
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] + vs[c] * q;
+        _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(getQ()), getAcc()));
         applyFmacDest(vd, result, dest);
         return;
     case 0x22: // ADDi
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] + i;
+        _mm_storeu_ps(result, _mm_add_ps(v_vs, _mm_set1_ps(getI())));
         applyFmacDest(vd, result, dest);
         return;
     case 0x23: // MADDi
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] + vs[c] * i;
+        _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(getI()), getAcc()));
         applyFmacDest(vd, result, dest);
         return;
     case 0x24: // SUBq
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] - q;
+        _mm_storeu_ps(result, _mm_sub_ps(v_vs, _mm_set1_ps(getQ())));
         applyFmacDest(vd, result, dest);
         return;
     case 0x25: // MSUBq
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] - vs[c] * q;
+        _mm_storeu_ps(result, _mm_sub_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(getQ()))));
         applyFmacDest(vd, result, dest);
         return;
     case 0x26: // SUBi
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] - i;
+        _mm_storeu_ps(result, _mm_sub_ps(v_vs, _mm_set1_ps(getI())));
         applyFmacDest(vd, result, dest);
         return;
     case 0x27: // MSUBi
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] - vs[c] * i;
+        _mm_storeu_ps(result, _mm_sub_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(getI()))));
         applyFmacDest(vd, result, dest);
         return;
     case 0x28: // ADD
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] + vt[c];
+        _mm_storeu_ps(result, _mm_add_ps(v_vs, v_vt));
         applyFmacDest(vd, result, dest);
         return;
     case 0x29: // MADD
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] + vs[c] * vt[c];
+        _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, v_vt, getAcc()));
         applyFmacDest(vd, result, dest);
         return;
     case 0x2A: // MUL
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] * vt[c];
+        _mm_storeu_ps(result, _mm_mul_ps(v_vs, v_vt));
         applyFmacDest(vd, result, dest);
         return;
     case 0x2B: // MAX
-        for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] > vt[c]) ? vs[c] : vt[c];
+        _mm_storeu_ps(result, _mm_max_ps(v_vs, v_vt));
         applyDest(vd, result, dest);
         return;
     case 0x2C: // SUB
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] - vt[c];
+        _mm_storeu_ps(result, _mm_sub_ps(v_vs, v_vt));
         applyFmacDest(vd, result, dest);
         return;
     case 0x2D: // MSUB
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] - vs[c] * vt[c];
+        _mm_storeu_ps(result, _mm_sub_ps(getAcc(), _mm_mul_ps(v_vs, v_vt)));
         applyFmacDest(vd, result, dest);
         return;
     case 0x2E: // OPMSUB
-        result[0] = acc[0] - vs[1] * vt[2];
-        result[1] = acc[1] - vs[2] * vt[0];
-        result[2] = acc[2] - vs[0] * vt[1];
+    {
+        alignas(16) float accArr[4];
+        _mm_store_ps(accArr, getAcc());
+        result[0] = accArr[0] - vs[1] * vt[2];
+        result[1] = accArr[1] - vs[2] * vt[0];
+        result[2] = accArr[2] - vs[0] * vt[1];
         result[3] = 0.0f;
         applyFmacDest(vd, result, dest);
         return;
+    }
     case 0x2F: // MINI
-        for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] < vt[c]) ? vs[c] : vt[c];
+        _mm_storeu_ps(result, _mm_min_ps(v_vs, v_vt));
         applyDest(vd, result, dest);
         return;
 
@@ -249,9 +265,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x02:
         case 0x03: // ADDAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] + bc;
+            const float bc = vt[specialOp & 3];
+            _mm_storeu_ps(result, _mm_add_ps(v_vs, _mm_set1_ps(bc)));
             applyFmacDestAcc(result, dest);
             return;
         }
@@ -260,9 +275,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x06:
         case 0x07: // SUBAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] - bc;
+            const float bc = vt[specialOp & 3];
+            _mm_storeu_ps(result, _mm_sub_ps(v_vs, _mm_set1_ps(bc)));
             applyFmacDestAcc(result, dest);
             return;
         }
@@ -271,9 +285,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x0A:
         case 0x0B: // MADDAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] + vs[c] * bc;
+            const float bc = vt[specialOp & 3];
+            _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(bc), getAcc()));
             applyFmacDestAcc(result, dest);
             return;
         }
@@ -282,48 +295,39 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x0E:
         case 0x0F: // MSUBAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] - vs[c] * bc;
+            const float bc = vt[specialOp & 3];
+            _mm_storeu_ps(result, _mm_sub_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(bc))));
             applyFmacDestAcc(result, dest);
             return;
         }
         case 0x10: // ITOF0
-            for (int c = 0; c < 4; c++)
-            {
-                int32_t iv;
-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv);
-            }
+        {
+            __m128i iv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[fs]));
+            _mm_storeu_ps(result, _mm_cvtepi32_ps(iv));
             applyDest(vtDest, result, dest);
             return;
+        }
         case 0x11: // ITOF4
-            for (int c = 0; c < 4; c++)
-            {
-                int32_t iv;
-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv) / 16.0f;
-            }
+        {
+            __m128i iv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[fs]));
+            _mm_storeu_ps(result, _mm_mul_ps(_mm_cvtepi32_ps(iv), _mm_set1_ps(1.0f / 16.0f)));
             applyDest(vtDest, result, dest);
             return;
+        }
         case 0x12: // ITOF12
-            for (int c = 0; c < 4; c++)
-            {
-                int32_t iv;
-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv) / 4096.0f;
-            }
+        {
+            __m128i iv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[fs]));
+            _mm_storeu_ps(result, _mm_mul_ps(_mm_cvtepi32_ps(iv), _mm_set1_ps(1.0f / 4096.0f)));
             applyDest(vtDest, result, dest);
             return;
+        }
         case 0x13: // ITOF15
-            for (int c = 0; c < 4; c++)
-            {
-                int32_t iv;
-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv) / 32768.0f;
-            }
+        {
+            __m128i iv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[fs]));
+            _mm_storeu_ps(result, _mm_mul_ps(_mm_cvtepi32_ps(iv), _mm_set1_ps(1.0f / 32768.0f)));
             applyDest(vtDest, result, dest);
             return;
+        }
         case 0x14: // FTOI0
             for (int c = 0; c < 4; c++)
             {
@@ -361,25 +365,21 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x1A:
         case 0x1B: // MULAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] * bc;
+            const float bc = vt[specialOp & 3];
+            _mm_storeu_ps(result, _mm_mul_ps(v_vs, _mm_set1_ps(bc)));
             applyFmacDestAcc(result, dest);
             return;
         }
         case 0x1C: // MULAq
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] * q;
+            _mm_storeu_ps(result, _mm_mul_ps(v_vs, _mm_set1_ps(getQ())));
             applyFmacDestAcc(result, dest);
             return;
         case 0x1D: // ABS
-            for (int c = 0; c < 4; c++)
-                result[c] = std::fabs(vs[c]);
+            _mm_storeu_ps(result, _mm_andnot_ps(_mm_set1_ps(-0.0f), v_vs));
             applyDest(vtDest, result, dest);
             return;
         case 0x1E: // MULAi
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] * i;
+            _mm_storeu_ps(result, _mm_mul_ps(v_vs, _mm_set1_ps(getI())));
             applyFmacDestAcc(result, dest);
             return;
         case 0x1F: // CLIP
@@ -415,68 +415,55 @@ void VU1Interpreter::execUpper(uint32_t instr)
             return;
         }
         case 0x20: // ADDAq
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] + q;
+            _mm_storeu_ps(result, _mm_add_ps(v_vs, _mm_set1_ps(getQ())));
             applyFmacDestAcc(result, dest);
             return;
         case 0x21: // MADDAq
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] + vs[c] * q;
+            _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(getQ()), getAcc()));
             applyFmacDestAcc(result, dest);
             return;
         case 0x22: // ADDAi
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] + i;
+            _mm_storeu_ps(result, _mm_add_ps(v_vs, _mm_set1_ps(getI())));
             applyFmacDestAcc(result, dest);
             return;
         case 0x23: // MADDAi
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] + vs[c] * i;
+            _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(getI()), getAcc()));
             applyFmacDestAcc(result, dest);
             return;
         case 0x24: // SUBAq
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] - q;
+            _mm_storeu_ps(result, _mm_sub_ps(v_vs, _mm_set1_ps(getQ())));
             applyFmacDestAcc(result, dest);
             return;
         case 0x25: // MSUBAq
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] - vs[c] * q;
+            _mm_storeu_ps(result, _mm_sub_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(getQ()))));
             applyFmacDestAcc(result, dest);
             return;
         case 0x26: // SUBAi
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] - i;
+            _mm_storeu_ps(result, _mm_sub_ps(v_vs, _mm_set1_ps(getI())));
             applyFmacDestAcc(result, dest);
             return;
         case 0x27: // MSUBAi
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] - vs[c] * i;
+            _mm_storeu_ps(result, _mm_sub_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(getI()))));
             applyFmacDestAcc(result, dest);
             return;
         case 0x28: // ADDA
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] + vt[c];
+            _mm_storeu_ps(result, _mm_add_ps(v_vs, v_vt));
             applyFmacDestAcc(result, dest);
             return;
         case 0x29: // MADDA
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] + vs[c] * vt[c];
+            _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, v_vt, getAcc()));
             applyFmacDestAcc(result, dest);
             return;
         case 0x2A: // MULA
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] * vt[c];
+            _mm_storeu_ps(result, _mm_mul_ps(v_vs, v_vt));
             applyFmacDestAcc(result, dest);
             return;
         case 0x2C: // SUBA
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] - vt[c];
+            _mm_storeu_ps(result, _mm_sub_ps(v_vs, v_vt));
             applyFmacDestAcc(result, dest);
             return;
         case 0x2D: // MSUBA
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] - vs[c] * vt[c];
+            _mm_storeu_ps(result, _mm_sub_ps(getAcc(), _mm_mul_ps(v_vs, v_vt)));
             applyFmacDestAcc(result, dest);
             return;
         case 0x2E: // OPMULA
