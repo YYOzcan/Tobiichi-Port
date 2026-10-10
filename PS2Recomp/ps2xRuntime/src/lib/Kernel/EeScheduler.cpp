@@ -5,13 +5,33 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cassert>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 
+void gowCountGuestFrame(uint32_t pc, const uint8_t *rdram); // GOW-Port: ps2_runtime.cpp (contador del panel F1)
+
 namespace
 {
+    // GOW-Port: GOW_VBLANK_REALTIME=1 ata el VBlank al reloj del host. Normalmente un VBlank espera a la vez a
+    // su ciclo del EE y a su hora del host, así que con el juego a 20 cuadros/s solo hay ~20 VBlank por segundo
+    // y todo (lógica, animaciones, sonido) va a cámara lenta. Con la variable, si llega la hora de un VBlank y
+    // el EE va por detrás, se adelantan los ciclos del EE (temporizadores e IOP incluidos) hasta él: el tiempo
+    // emulado sigue al real y el juego pierde cuadros en vez de ralentizarse.
+    bool vblankRealtime()
+    {
+        static const bool on = [] {
+            const char *value = std::getenv("GOW_VBLANK_REALTIME");
+            return value && value[0] == '1';
+        }();
+        return on;
+    }
+    // Hora del host (ns de steady_clock) del próximo VBlankStart; la consulta checkpointDue al acabar cada rodaja.
+    std::atomic<int64_t> g_realtimeVblankNs{std::numeric_limits<int64_t>::max()};
+    constexpr auto kRealtimeMaxLag = std::chrono::milliseconds(200); // más atrás: se descartan VBlank (cargas)
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -334,6 +354,7 @@ void EeScheduler::run()
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
             ps2_perf::guestEntry(context.pc);
+            gowCountGuestFrame(context.pc, m_rdram);
             loadSharedVu0Random(context);
             function(m_rdram, &context, &m_runtime);
             saveSharedVu0Random(context);
@@ -415,6 +436,14 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     if (m_eeCycle < m_sliceEndCycle)
     {
         return false;
+    }
+
+    if (vblankRealtime() &&
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() >=
+            g_realtimeVblankNs.load(std::memory_order_relaxed))
+    {
+        m_checkpointPending.store(true, std::memory_order_release); // processDueDeadlines adelanta el EE
+        return true;
     }
 
     const GuestThread *running = currentThread();
@@ -1861,6 +1890,25 @@ void EeScheduler::processDueDeadlines()
                 }
             }
 
+            uint64_t catchUp = 0u;
+            if (vblankRealtime())
+            {
+                for (const ScheduledEvent &item : m_deadlines)
+                    if (item.event.type == EeEventType::VBlankStart && item.deadlineCycle > m_eeCycle && item.hostDeadline <= now)
+                        catchUp = std::max<uint64_t>(catchUp, item.deadlineCycle - m_eeCycle);
+            }
+            if (catchUp != 0u)
+            {
+                lock.unlock();
+                while (catchUp != 0u)
+                {
+                    const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(catchUp, std::numeric_limits<uint32_t>::max()));
+                    accountCycles(step);
+                    catchUp -= step;
+                }
+                continue; // ahora el VBlank vence también por ciclos
+            }
+
             if (pacingDeadline == std::chrono::steady_clock::time_point{})
             {
                 updateNextDeadline();
@@ -1919,8 +1967,10 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + getVBlankPeriodCycles(),
-                              scheduled.hostDeadline + getVBlankPeriod(),
+                auto nextHost = scheduled.hostDeadline + getVBlankPeriod();
+                if (vblankRealtime() && nextHost + kRealtimeMaxLag < std::chrono::steady_clock::now())
+                    nextHost = std::chrono::steady_clock::now(); // muy atrás (carga): no recuperar cada VBlank perdido
+                scheduleEvent(scheduled.deadlineCycle + getVBlankPeriodCycles(), nextHost,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -2139,6 +2189,9 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
         m_deadlines.push_back(ScheduledEvent{deadlineCycle, hostDeadline, event, ++m_eventSequence});
         updateNextDeadline();
     }
+    if (event.type == EeEventType::VBlankStart)
+        g_realtimeVblankNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(hostDeadline.time_since_epoch()).count(),
+                                 std::memory_order_relaxed);
     m_eventCv.notify_one();
 }
 

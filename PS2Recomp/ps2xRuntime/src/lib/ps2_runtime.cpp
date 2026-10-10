@@ -14,6 +14,7 @@
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#include "spu2_time_stretch.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -38,12 +39,32 @@ namespace
     AudioStream g_spu2Stream{};
     bool g_spu2StreamActive = false;
     constexpr size_t kSpu2MaxLatencyFrames = 4800u; // 100 ms a 48 kHz
+    // GOW-Port: estirado temporal (spu2_time_stretch.h): si la emulación va más lenta que el tiempo real, el
+    // sonido se alarga sin cambiar el tono en vez de cortarse. GOW_AUDIO_STRETCH=0 vuelve a la salida directa.
+    ps2_audio::TimeStretch g_spu2Stretch;
+    const bool g_spu2StretchEnabled = [] {
+        const char *setting = std::getenv("GOW_AUDIO_STRETCH");
+        return !(setting && setting[0] == '0');
+    }();
 
     void spu2AudioCallback(void *buffer, unsigned int frames)
     {
         int16_t *out = static_cast<int16_t *>(buffer);
+        ps2x::iop::IopSubsystem *source = g_spu2AudioSource.load(std::memory_order_acquire);
+        if (g_spu2StretchEnabled)
+        {
+            if (source)
+            {
+                int16_t chunk[2048u * 2u];
+                size_t drained = 0u;
+                while ((drained = source->drainAudio(chunk, 2048u)) != 0u)
+                    g_spu2Stretch.push(chunk, drained);
+            }
+            g_spu2Stretch.pull(out, frames);
+            return;
+        }
         size_t produced = 0u;
-        if (ps2x::iop::IopSubsystem *source = g_spu2AudioSource.load(std::memory_order_acquire))
+        if (source)
             produced = source->drainAudio(out, frames, kSpu2MaxLatencyFrames);
         std::fill(out + produced * 2u, out + static_cast<size_t>(frames) * 2u, int16_t{0}); // sin datos: silencio
     }
@@ -58,6 +79,7 @@ namespace
         SetAudioStreamBufferSizeDefault(0); // el resto de flujos conserva el tamano por defecto
         if (!IsAudioStreamValid(g_spu2Stream))
             return;
+        g_spu2Stretch.reset(); // el callback aún no corre
         g_spu2AudioSource.store(source, std::memory_order_release);
         SetAudioStreamCallback(g_spu2Stream, spu2AudioCallback);
         PlayAudioStream(g_spu2Stream);
@@ -80,6 +102,52 @@ namespace
 namespace ps2_stubs
 {
     void resetSifState();
+}
+
+// GOW-Port: cuadros del juego (entradas a GOW_PERF_FRAME_PC, vid::Flip en God of War) para el contador
+// del panel de depuración (F1). A diferencia de ps2_perf::guestFlips, no depende de GOW_PERF_DIAG.
+std::atomic<uint64_t> g_gowGuestFrames{0};
+// GOW-Port: velocidad del juego = tiempo de juego / tiempo real (1 = tiempo real; < 1 = cámara lenta). Suma el
+// paso de tiempo del juego (float en 0x29C64C de SCUS-97399) en cada cuadro. Con GOW_DELTA_DIAG=1 se imprime
+// cada segundo; el panel F1 lo muestra siempre (g_gowGameSpeed).
+std::atomic<float> g_gowGameSpeed{0.0f};
+void gowCountGuestFrame(uint32_t pc, const uint8_t *rdram)
+{
+    static const uint32_t framePc = [] {
+        const char *value = std::getenv("GOW_PERF_FRAME_PC");
+        return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    if (framePc == 0u || pc != framePc)
+        return;
+    g_gowGuestFrames.fetch_add(1, std::memory_order_relaxed);
+    if (!rdram)
+        return;
+    static const bool diag = [] { const char *v = std::getenv("GOW_DELTA_DIAG"); return v && v[0] == '1'; }();
+    static auto windowStart = std::chrono::steady_clock::now();
+    static double gameSeconds = 0.0;
+    static unsigned frames = 0;
+    float delta = 0.0f;
+    std::memcpy(&delta, rdram + 0x29C64Cu, sizeof(delta));
+    if (delta > 0.0f && delta < 1.0f)
+        gameSeconds += delta;
+    ++frames;
+    const auto now = std::chrono::steady_clock::now();
+    const double wall = std::chrono::duration<double>(now - windowStart).count();
+    if (wall >= 1.0)
+    {
+        g_gowGameSpeed.store(static_cast<float>(gameSeconds / wall), std::memory_order_relaxed);
+        if (diag)
+            std::fprintf(stderr, "[gow-delta] frames=%u wall=%.2f game=%.3f speed=%.2f last_delta=%.4f\n",
+                         frames, wall, gameSeconds, gameSeconds / wall, delta);
+        windowStart = now;
+        gameSeconds = 0.0;
+        frames = 0;
+    }
+}
+bool gowGuestFrameCounterEnabled()
+{
+    const char *value = std::getenv("GOW_PERF_FRAME_PC");
+    return value && std::strtoul(value, nullptr, 0) != 0u;
 }
 
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
@@ -537,6 +605,18 @@ PS2Runtime::PS2Runtime()
 
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
 
+    // GOW-Port: VU1 sin colas de escritura (un tercio más rápido); GOW_VU1_COLAS=1 vuelve al modelo con colas.
+    // Sin escrituras directas compiledProgramFor() no devuelve nunca el despachador compilado.
+    {
+        const char *queues = std::getenv("GOW_VU1_COLAS");
+        m_vu1.setDirectRegisterWrites(!(queues && std::strcmp(queues, "1") == 0));
+    }
+    // GOW-Port: GOW_VU1_SIN_COMPILAR=1 usa siempre el intérprete aunque haya microcódigo compilado enlazado.
+    {
+        const char *noCompiled = std::getenv("GOW_VU1_SIN_COMPILAR");
+        m_vu1.setCompiledProgramsEnabled(!(noCompiled && std::strcmp(noCompiled, "1") == 0));
+    }
+
     // Assign rather than memset: R5900Context's constructor zeroes itself and
     // then applies the COP0 reset values, which a memset here would discard.
     m_cpuContext = R5900Context{};
@@ -665,6 +745,23 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
+    // GOW-Port: GOW_IOP_BATCH=N (ciclos del EE) agrupa los avances del IOP. accountCycles llama aquí en cada
+    // punto de control con pocos ciclos, y cada runCycles atiende SPU2, DMA, temporizadores y el planificador
+    // aunque avance 1 ciclo del IOP. Con N=1024 el IOP va como mucho ~3,4 µs por detrás del EE.
+    // advanceIopEeCycles(0) (espera del planificador) vacía lo acumulado. Sin la variable: sin agrupar.
+    static const uint64_t batch = [] {
+        const char *value = std::getenv("GOW_IOP_BATCH");
+        return value ? static_cast<uint64_t>(std::strtoull(value, nullptr, 0)) : 0ull;
+    }();
+    if (batch != 0u)
+    {
+        static uint64_t pending = 0; // solo el hilo ejecutor del EE (EeScheduler) llama aquí
+        pending += eeCycles;
+        if (eeCycles != 0u && pending < batch)
+            return;
+        eeCycles = pending;
+        pending = 0;
+    }
     ps2_perf::Scope perf(ps2_perf::Bucket::Iop);
     m_iopSubsystem->runEeCycles(eeCycles);
 }
@@ -1477,6 +1574,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint64_t checkpointSerial = m_eeCheckpointSerial;
     const uint64_t jumpSerial = g_guestJumpSerial;
     ps2_perf::guestEntry(targetPc); // GOW-Port: también cuenta llamadas que no vuelven al dispatcher.
+    gowCountGuestFrame(targetPc, rdram);
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)

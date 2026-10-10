@@ -6,6 +6,7 @@
 #ifndef PS2_VU1_COMPILED_INL
 #define PS2_VU1_COMPILED_INL
 
+#include <atomic>
 #include "ps2_vu1_step.inl"
 
 #include <cmath>
@@ -272,19 +273,19 @@ VU1_STEP_INLINE void VU1Interpreter::fmacLaneT(float &result, uint8_t &laneFlags
                 return;
             }
         }
-        long double exact = 0.0L;
+        double exact = 0.0; // GOW-Port: double como en MSVC (ver calculateFmacExactResult)
         if constexpr (cross && C == 3u)
-            exact = 0.0L;
+            exact = 0.0;
         else if constexpr (info.kind == vu1c::Kind::Add)
-            exact = static_cast<long double>(vs) + static_cast<long double>(right);
+            exact = static_cast<double>(vs) + static_cast<double>(right);
         else if constexpr (info.kind == vu1c::Kind::Sub)
-            exact = static_cast<long double>(vs) - static_cast<long double>(right);
+            exact = static_cast<double>(vs) - static_cast<double>(right);
         else if constexpr (info.kind == vu1c::Kind::Madd)
-            exact = static_cast<long double>(acc) + static_cast<long double>(vs) * static_cast<long double>(right);
+            exact = static_cast<double>(acc) + static_cast<double>(vs) * static_cast<double>(right);
         else if constexpr (info.kind == vu1c::Kind::Msub || info.kind == vu1c::Kind::Opmsub)
-            exact = static_cast<long double>(acc) - static_cast<long double>(vs) * static_cast<long double>(right);
+            exact = static_cast<double>(acc) - static_cast<double>(vs) * static_cast<double>(right);
         else
-            exact = static_cast<long double>(vs) * static_cast<long double>(right);
+            exact = static_cast<double>(vs) * static_cast<double>(right);
         laneFlags = normalizeFmacExactResult(result, exact);
     }
 }
@@ -466,6 +467,23 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
                         productSum ? ((_mm_movemask_ps(product) & lanes) != 0 ? 0x2u : 0u) | (zeroProduct != 0 ? 0x1u : 0u) : 0u;
                     if (DeadFlags && m_statusQuiet)
                         m_state.status |= ((signs != 0 ? 0x2u : 0u) | (zeroLanes != 0 ? 0x1u : 0u) | productSticky) << 6;
+                    else if (m_flagCount < kMaxFlagEntries)
+                    {
+                        // GOW-Port: updateFmacFlags + pushFlagEntry en línea (era ~6 % del hilo del juego). En el
+                        // camino rápido solo hay Z y S. Máscara SSE: bit 0 = x; MAC: bit 3 = x (orden invertido).
+                        static constexpr uint8_t kReverse4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+                        FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + m_flagCount) % kMaxFlagEntries];
+                        ++m_flagCount;
+                        entry.mac = kReverse4[zeroLanes] | (static_cast<uint32_t>(kReverse4[signs]) << 4u);
+                        entry.status = (zeroLanes != 0 ? 0x1u : 0u) | (signs != 0 ? 0x2u : 0u);
+                        entry.extraSticky = productSticky;
+                        entry.clip = 0u;
+                        entry.valid = true;
+                        entry.writesMac = entry.writesStatus = true;
+                        entry.writesSticky = entry.writesClip = false;
+                        entry.issueCycle = m_cycle;
+                        entry.readyCycle = m_cycle + kFmacLatency;
+                    }
                     else
                     {
                         const auto laneFlag = [&](int bit) -> uint8_t
@@ -900,14 +918,14 @@ VU1_STEP_INLINE bool VU1Interpreter::stepPairT(StepContext &context)
     if constexpr (writtenVi != 0u && k.lowerUsage.delaysNextBranchRead)
         recordViWriteForBranch(static_cast<uint8_t>(writtenVi), oldVi);
 
-    if constexpr ((k.lowerUsage.vfWrite.reg == 0u && k.lowerUsage.vfWrite.lanes != 0u) ||
-                  (k.upperUsage.vfWrite.reg == 0u && k.upperUsage.vfWrite.lanes != 0u))
-    {
-        m_state.vf[0][0] = 0.0f;
-        m_state.vf[0][1] = 0.0f;
-        m_state.vf[0][2] = 0.0f;
-        m_state.vf[0][3] = 1.0f;
-    }
+    // GOW-Port: como stepPair, siempre. addVfWrite no registra escrituras a VF0 (la condición anterior, por
+    // vfWrite.reg == 0, nunca se cumplía) y execUpper/execLower escriben VF0/VI0 sin comprobarlo: en una
+    // racha de pares compilados VF0/VI0 quedaban con basura (VI0 es la base de casi todos los LQ/SQ).
+    m_state.vf[0][0] = 0.0f;
+    m_state.vf[0][1] = 0.0f;
+    m_state.vf[0][2] = 0.0f;
+    m_state.vf[0][3] = 1.0f;
+    m_state.vi[0] = 0;
 
     uint32_t nextPc = m_state.pc + 8u;
     if (nextPc >= context.codeSize)
@@ -969,6 +987,9 @@ VU1_STEP_INLINE bool VU1Interpreter::stepPairT(StepContext &context)
 }
 
 // Acceso del código generado (repartido en varios archivos) a lo que necesita del intérprete.
+// GOW-Port: versión de la micromemoria para el despachador compilado (definida en ps2_vu1_core.cpp).
+extern std::atomic<uint64_t> g_vu1CompiledEpoch;
+
 struct VU1CompiledAccess
 {
     using P = VU1Interpreter::DecodedInstructionPair;
@@ -982,6 +1003,18 @@ struct VU1CompiledAccess
     {
         return vu.blockPreconditions(c, pc, words, bytes);
     }
+    // GOW-Port: blockPreconditions sin comparar las palabras; el despachador generado ya comprobó que
+    // coinciden con la micromemoria en esta versión (epoch).
+    static VU1_STEP_INLINE bool blockReady(const VU1Interpreter &vu, C &c, uint32_t pc, size_t bytes)
+    {
+        if (vu.m_state.branchPending || vu.m_state.ebit || vu.m_state.haltAfterDelaySlot || vu.m_stopRequested)
+            return false;
+        const uint64_t maxBlockCycles = (bytes / 8u) * 4u + 64u;
+        return vu.m_cycle + maxBlockCycles < c.budgetEnd && pc + bytes <= c.codeSize;
+    }
+    // GOW-Port: cambia cuando puede haber cambiado la micromemoria (compiledProgramFor: nueva versión o
+    // nuevo intérprete); invalida las resoluciones del despachador generado.
+    static uint64_t epoch() { return g_vu1CompiledEpoch.load(std::memory_order_relaxed); }
 };
 
 #if defined(_MSC_VER)

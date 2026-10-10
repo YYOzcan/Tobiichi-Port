@@ -464,6 +464,17 @@ if(VU1_COMPILED_SRCS)
     list(APPEND RUNNER_SRC_FILES ${VU1_COMPILED_SRCS})
 endif()
 
+# GOW-Port: la FMAC de VU redondea el producto y la suma por separado. GCC/Clang con -mfma fusionan
+# a*b+c en FMA por defecto (-ffp-contract=fast); en MSVC lo evita #pragma float_control(precise).
+if(NOT MSVC)
+    set_source_files_properties(
+        src/lib/vu/ps2_vu1_core.cpp
+        src/lib/vu/ps2_vu1_upper.cpp
+        src/lib/vu/ps2_vu1_lower.cpp
+        ${VU1_COMPILED_SRCS}
+        PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+endif()
+
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 

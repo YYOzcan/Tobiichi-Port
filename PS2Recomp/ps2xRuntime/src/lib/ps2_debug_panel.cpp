@@ -29,10 +29,93 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <atomic>
+#include "runtime/ps2_perf.h"
+
+// GOW-Port: ps2_runtime.cpp. Cuadros del juego (entradas a GOW_PERF_FRAME_PC).
+extern std::atomic<uint64_t> g_gowGuestFrames;
+extern std::atomic<float> g_gowGameSpeed; // GOW-Port: 1 = tiempo real
+bool gowGuestFrameCounterEnabled();
 
 namespace
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+    // GOW-Port: contador de FPS en la cabecera del panel (F1): cuadros del juego por segundo (vid::Flip),
+    // tiempo por cuadro, presentaciones del host y, con GOW_PERF_DIAG=1, el reparto del hilo del juego.
+    void drawFpsHeader()
+    {
+        constexpr double kInterval = 0.5;
+        static double lastTime = 0.0;
+        static uint64_t lastFrames = 0;
+        static float fps = 0.0f;
+        static std::array<float, 120> history{}; // 60 s a 2 muestras por segundo
+        static size_t next = 0, filled = 0;
+        static std::array<uint64_t, ps2_perf::bucketCount> lastNanos{};
+        static std::array<float, ps2_perf::bucketCount> share{};
+
+        const double now = GetTime();
+        const uint64_t frames = g_gowGuestFrames.load(std::memory_order_relaxed);
+        if (lastTime == 0.0 || now - lastTime > 4.0 * kInterval)
+        {
+            // Primera vez o el panel estuvo cerrado: empezar de nuevo sin una muestra engañosa.
+            lastTime = now;
+            lastFrames = frames;
+            for (size_t i = 0; i < ps2_perf::bucketCount; ++i)
+                lastNanos[i] = ps2_perf::nanos[i].load(std::memory_order_relaxed);
+        }
+        else if (now - lastTime >= kInterval)
+        {
+            fps = static_cast<float>(static_cast<double>(frames - lastFrames) / (now - lastTime));
+            history[next] = fps;
+            next = (next + 1u) % history.size();
+            filled = std::min(filled + 1u, history.size());
+            uint64_t total = 0;
+            std::array<uint64_t, ps2_perf::bucketCount> delta{};
+            for (size_t i = 0; i < ps2_perf::bucketCount; ++i)
+            {
+                const uint64_t value = ps2_perf::nanos[i].load(std::memory_order_relaxed);
+                delta[i] = value - lastNanos[i];
+                lastNanos[i] = value;
+            }
+            for (size_t i : {0u, 1u, 2u, 3u}) // EE, VU, GS, IOP: tiempo exclusivo del hilo del juego
+                total += delta[i];
+            for (size_t i = 0; i < ps2_perf::bucketCount; ++i)
+                share[i] = total ? 100.0f * static_cast<float>(delta[i]) / static_cast<float>(total) : 0.0f;
+            lastTime = now;
+            lastFrames = frames;
+        }
+
+        if (!gowGuestFrameCounterEnabled())
+        {
+            ImGui::TextDisabled("Game FPS: n/a (set GOW_PERF_FRAME_PC)   Window: %d FPS", GetFPS());
+            return;
+        }
+        const ImVec4 color = fps >= 55.0f ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f)
+                           : fps >= 25.0f ? ImVec4(1.0f, 0.85f, 0.3f, 1.0f)
+                                          : ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+        ImGui::TextColored(color, "Game FPS: %.1f", fps);
+        ImGui::SameLine();
+        ImGui::Text("(%.1f ms/frame)   Window: %d FPS", fps > 0.0f ? 1000.0f / fps : 0.0f, GetFPS());
+        const float speed = g_gowGameSpeed.load(std::memory_order_relaxed);
+        ImGui::TextColored(speed >= 0.95f ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) : ImVec4(1.0f, 0.6f, 0.3f, 1.0f),
+                           "Game speed: %.0f%% of real time%s", speed * 100.0f, speed < 0.95f ? " (slow motion)" : "");
+        if (ps2_perf::enabled())
+            ImGui::Text("Game thread: EE %.0f%%  VU %.0f%%  GS %.0f%%  IOP %.0f%%",
+                        share[0], share[1], share[2], share[3]);
+        else
+            ImGui::TextDisabled("GOW_PERF_DIAG=1 shows the EE/VU/GS/IOP split");
+        if (filled > 0u)
+        {
+            // Orden cronológico: la muestra más antigua primero.
+            std::array<float, 120> ordered{};
+            for (size_t i = 0; i < filled; ++i)
+                ordered[i] = history[(next + history.size() - filled + i) % history.size()];
+            ImGui::PlotLines("##fps-history", ordered.data(), static_cast<int>(filled), 0, "last 60 s (0-60)",
+                             0.0f, 60.0f, ImVec2(-1.0f, 48.0f));
+        }
+        ImGui::Separator();
+    }
+
     const char *threadStatusName(EeThreadStatus status)
     {
         switch (status)
@@ -2226,6 +2309,8 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             ImGui::MenuItem("Registers", nullptr, &m_showRegisters);
             ImGui::EndMenuBar();
         }
+
+        drawFpsHeader();
 
         if (ImGui::BeginTabBar("debug-tabs"))
         {

@@ -2379,3 +2379,109 @@ VU1 anteriores y los nuevos de DIV, **100.800 FMAC aleatorios**, **2.016 FTZ/DAZ
 PAD2 y FINISH default/asíncrono. La CI de la integración también pasa en Linux.
 Las cifras de mejora de Opus pertenecen a sus capturas; esta revisión valida
 paridad y compilación y no certifica nuevos FPS de la partida cargada.
+
+### Linux: VU1 compilada sin activar, VBlank a 60 Hz y MADD sin FMA (10 de octubre)
+
+- **VU1 compilada nunca se usaba.** En la fusión de Linux se perdió de `PS2Runtime::PS2Runtime()` la llamada
+  `m_vu1.setDirectRegisterWrites(...)` (`ps2recomp-vu1-direct.patch`) y `setCompiledProgramsEnabled`
+  (`ps2recomp-vu1-runner.patch`). Sin escrituras directas `compiledProgramFor()` devuelve siempre nulo:
+  el intérprete con colas ejecutaba todo VU1. Restauradas ambas.
+- **Microcódigo regenerado.** Los `programa*.cpp` del árbol venían de una versión antigua del generador
+  (sin bloques). Con el generador actual y 1157 micromemorias: 5766 pares, 1360 bloques. En Linux
+  (GCC 16, `-O3 -march=native`), `vu1_compiled_test` da 60 casos y 38.144 DIV exactos.
+- **MADD sin FMA.** La reescritura SIMD de `execUpper` usaba `_mm_fmadd_ps` en MADD/MADDA (MSUB no), y GCC
+  con `-mfma` fusionaba además `a*b+c` (`-ffp-contract=fast` por defecto). La FMAC de la PS2 redondea
+  producto y suma por separado: ahora `mul`+`add` y `-ffp-contract=off` en los archivos de VU (fuera de
+  MSVC). Instrucciones FMA en los objetos de VU: 52 → 0. `vu1_fmac_test 200`: antes fallaba con 1 ulp en
+  un MADD normal; ahora solo en un caso de desbordamiento (intérprete `ff7ffffe`, compilado `ff7fffff`)
+  que también falla con el `execUpper` escalar anterior: pendiente (posible `long double` de 80 bits en GCC).
+- **VBlank a 60 Hz.** `run_gow.sh` pasa a `GOW_TARGET_FPS=60` y `GOW_UNLOCKED_FPS=0`. El modo
+  desbloqueado adelanta ciclos del EE/IOP sin esperar al reloj (`accountCycles` → `advanceIopEeCycles`),
+  y con ellos el SPU2.
+
+Medición (`run_gow.sh`, `GOW_PERF_DIAG=1 GOW_PAD_TEST=1`, 150 s, media de las 10 últimas ventanas):
+
+| | `vid::Flip`/s | VU ms por cuadro | IOP ms por cuadro |
+|---|---:|---:|---:|
+| Antes | 4,97 | 182 | 4,1 |
+| VU1 compilada activada | 13,83 | 53 | 4,6 |
+| + microcódigo regenerado, 60 Hz, sin FMA | 16,70 | 36 | 8,0 |
+
+No se verificó la imagen ni el audio en esta pasada. Siguiente: el IOP por cuadro se duplicó.
+
+**Corrección (mismo día):** las dos últimas filas de la tabla se midieron con la imagen rota. Con VU1
+compilada el juego pintaba personajes blancos y sin texturas: `stepPairT` (`ps2_vu1_compiled.inl`) solo
+restauraba VF0 si `vfWrite.reg == 0`, condición que nunca se cumple (`addVfWrite` ignora VF0), y nunca
+restauraba VI0, mientras que `execUpper`/`execLower` y el LQ especializado escriben VF0/VI0 sin
+comprobarlo. En una racha de pares compilados VF0/VI0 quedaban con basura (VI0 es la base de casi todos los
+LQ/SQ) y los programas hacían menos trabajo, por eso parecían más rápidos. Se localizó con
+`GOW_VU1C_RANGO` (0–1F8 y 200–3F8 por separado bien, juntos mal) y se arregla restaurando VF0/VI0 en cada
+par, como `stepPair`. Regresión nueva en `tests/vu1_compiled_test.cpp` (LQ a VF00 y luego ADD con VF00):
+falla sin el arreglo (`vf4=0,0,0,2/6,10,14,18`) y pasa con él.
+
+Medición correcta (misma pasada de 150 s, 10 últimas ventanas; capturas comprobadas: menú, cubierta del
+barco, Kratos, HUD y enemigos con texturas y colores correctos):
+
+| | `vid::Flip`/s | VU ms por cuadro | IOP ms por cuadro |
+|---|---:|---:|---:|
+| Antes | 4,97 | 182 | 4,1 |
+| Intérprete con escrituras directas (`GOW_VU1_SIN_COMPILAR=1`) | 5,57 | 152 | 7,7 |
+| VU1 compilada con VF0/VI0 corregidos | 8,24 | 83 | 11,1 |
+
+**Audio:** `ps2xRuntime/src/lib/spu2_time_stretch.h` (WSOLA: segmentos de 40 ms, solape de 8 ms,
+búsqueda de ±7,5 ms) alarga la salida del SPU2 sin cambiar el tono cuando la emulación va más lenta que el
+tiempo real, con un colchón de 100–300 ms que crece si la entrada llega a ráfagas. `GOW_AUDIO_STRETCH=0`
+vuelve a la salida directa. Pruebas en `ps2xTest/src/ps2_spu2_tests.cpp`: sin huecos, 440 Hz conservados
+a 0,3x y en ráfagas, sin saltos en las uniones, latencia acotada y silencio al cortarse la entrada.
+
+### Linux: perfil por muestreo, despachador de VU1 con caché y contador de FPS (10 de octubre)
+
+- **Perfil.** Sin `perf` (y con `ptrace_scope=1`), un muestreador propio que lanza el juego como hijo y lee el
+  RIP de cada hilo con `ptrace` cada 2 ms (40 s de partida, 266.580 muestras). Hilo del juego: VU1 compilada
+  39 %, ayudantes del intérprete de VU1 llamados desde ella 18 % (`commitReadyPipelines`, `updateFmacFlags`,
+  `normalizeFmacExactResult`, `calculateFmacProductSticky`), IOP 11 %, VIF/GIF/GS 8 %, `accountCycles` y
+  puntos de control 6 %, libc 6 %, código del EE recompilado 5 %. El hilo del GS espera el 90 % del tiempo.
+- **Despachador con caché.** El `run()` generado probaba en cada entrada todos los bloques candidatos de la
+  dirección y cada uno comparaba sus palabras con la micromemoria (`memcmp`; con 1157 micromemorias hay muchos
+  candidatos por dirección). Ahora `tools/vu1/generar_vu1.cpp` genera tablas de candidatos y una resolución por
+  dirección que se repite solo cuando cambia `VU1CompiledAccess::epoch()` (lo incrementa `compiledProgramFor`
+  con cada versión nueva de la micromemoria o intérprete nuevo). Se conserva el orden de prueba (hasta 4
+  bloques coincidentes; si hay más, se compara como antes) y los bloques solo comprueban las condiciones
+  dinámicas (`blockReady`). `vu1_compiled_test`: 60 + 2 + 38.144 casos exactos.
+- **`long double` → `double`** en el resultado exacto de las FMAC (`calculateFmacExactResult` y los pares
+  compilados): en MSVC ya era `double`; con GCC era x87 de 80 bits. Mismo resultado en las pruebas; ganancia
+  dentro del ruido (8,75 → 9,01 en la misma ventana). El caso de desbordamiento de `vu1_fmac_test` sigue
+  pendiente: no lo causaba `long double`.
+- **Contador de FPS en el panel F1**: cuadros del juego (entradas a `GOW_PERF_FRAME_PC`, independiente de
+  `GOW_PERF_DIAG`), ms por cuadro, FPS de la ventana, historial de 60 s y, con `GOW_PERF_DIAG=1`, el reparto
+  EE/VU/GS/IOP del hilo del juego.
+- **`scripts/linux_perf_guard.sh`**: pasada con `GOW_PAD_TEST`, comprueba fuego en el menú y que no haya
+  personajes blancos en las capturas 6/8/10, y da la mediana de las ventanas de 5 s desde t ≥ 60 s (la media
+  de las últimas ventanas se inflaba con cargas a ~50 cuadros/s).
+
+| Ejecutable (Linux, mediana t ≥ 60 s) | `vid::Flip`/s | VU ms por cuadro |
+|---|---:|---:|
+| VU1 compilada con VF0/VI0 corregidos | 8,78 | 79 |
+| + despachador con caché y `double` | 13,38 | 46 |
+
+Capturas comprobadas a ojo (menú, menú de mejoras, Kratos, HUD, enemigos y efectos).
+
+### Linux: VBlank al reloj real, IOP en tandas y sincronización con KIexster (10 de octubre)
+
+- **Cámara lenta.** Un VBlank esperaba a la vez a su ciclo del EE y a su hora del host: a ~20 cuadros/s solo había
+  ~20 VBlank por segundo y el juego, que avanza su reloj por VBlank (paso en `0x29C64C`), iba al 38-43 % del
+  tiempo real. `GOW_VBLANK_REALTIME=1` (ahora por defecto en `run_gow.sh`): al acabar cada rodaja del EE se mira el
+  reloj y, si la hora del VBlank ya pasó, se adelantan los ciclos del EE (temporizadores, IOP y SPU2 incluidos) hasta
+  él; con más de 200 ms de retraso (cargas) se descartan los VBlank perdidos. Medido con `GOW_DELTA_DIAG=1`
+  (velocidad = tiempo de juego / tiempo real): 0,38-0,43 → 0,90-1,00, con 10-15 cuadros/s. El panel F1 muestra la
+  velocidad ("Game speed").
+- **`GOW_IOP_BATCH=1024`** (por defecto en `run_gow.sh`): el IOP avanza en tandas de 1024 ciclos del EE (como mucho
+  ~3,4 µs por detrás) en vez de en cada punto de control: IOP 9,2 → 1,7 ms por cuadro, 13,3 → 15,8 cuadros/s.
+- **Flags FMAC en línea** en el camino SSE de los pares compilados (sin llamar a `updateFmacFlags`): mediana de la
+  partida 15,8 → 22,7 cuadros/s, VU 46 → 30 ms por cuadro, capturas correctas. Conjunto de diferencias de
+  `vu1_fmac_test` (sin abortar) idéntico antes y después. Ese recuento muestra 8.115 de 100.800 casos distintos entre
+  intérprete y compilado en Linux (sobre todo el bit O persistente con productos que desbordan): pendiente.
+- **KIexster.** `tools/sync/sincronizar_kiexster.py` sincroniza con el remoto `kiexster` (historias distintas: allí
+  parches, aquí PS2Recomp en el árbol) a tres bandas por archivo; `.kiexster-sync` guarda el punto (`a42d77f`). La
+  primera fusión completa (hasta `947ebdd`, con `PS2X_VU1_HILO`/`PS2X_GS_FRENTE`) salió más lenta en esta máquina
+  (16,4 cuadros/s) y se revirtió; queda guardada fuera del repositorio para incorporarla por partes, midiendo cada una.

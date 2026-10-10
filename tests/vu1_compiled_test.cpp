@@ -20,6 +20,7 @@
 namespace {
 constexpr uint32_t nop = 0x2ffu, lowerNop = 0x8000033cu, e = 0x40000000u;
 constexpr uint32_t divStart = 128u, divPairs = 14u, divBytes = divPairs * 8u;
+constexpr uint32_t zeroStart = 0x1000u; // GOW-Port: VF0/VI0 tras una escritura del programa
 constexpr uint32_t upper(uint32_t op, uint32_t dest, uint32_t ft, uint32_t fs, uint32_t fd) {
     return op | (dest<<21) | (ft<<16) | (fs<<11) | (fd<<6);
 }
@@ -50,6 +51,14 @@ std::vector<uint8_t> program() {
         div[12]={lowerNop,nop|e};
         std::memcpy(code.data()+divStart+selector*divBytes,div.data(),sizeof(div));
     }
+    // GOW-Port: LQ escribe VF0 (el hardware lo ignora); el par siguiente debe leer VF0 = (0,0,0,1).
+    const std::array<std::array<uint32_t,2>,4> zero{{
+        {(0xfu<<21)|1u,nop},                 // LQ.xyzw vf00,1(vi00)
+        {lowerNop,upper(0x28u,15,0,0,4)},    // ADD.xyzw vf04,vf00,vf00
+        {lowerNop,nop|e},
+        {lowerNop,nop},
+    }};
+    std::memcpy(code.data()+zeroStart,zero.data(),sizeof(zero));
     return code;
 }
 struct Result {
@@ -114,6 +123,36 @@ Result runDiv(PS2Memory &mem,GS &gs,bool compiled,bool queues,uint32_t selector,
     if(resume) for(unsigned i=0;i<64u && vu.lastRunHitBudget();++i)
         vu.resume(mem.getVU1Code(),PS2_VU1_CODE_SIZE,mem.getVU1Data(),PS2_VU1_DATA_SIZE,gs,&mem,0,0,64u);
     return {vu.state(),{mem.getVU1Data(),mem.getVU1Data()+PS2_VU1_DATA_SIZE},vu.lastRunHitBudget()};
+}
+bool zeroRegisterCases() {
+    PS2Memory mem;
+    if(!mem.initialize()) return false;
+    GS gs; gs.init(mem.getGSVRAM(),4u*1024u*1024u,&mem.gs());
+    const auto code=program();
+    std::memcpy(mem.getVU1Code(),code.data(),code.size());
+    const auto runZero=[&](bool compiled,bool queues) {
+        std::memset(mem.getVU1Data(),0,PS2_VU1_DATA_SIZE);
+        const float loaded[4]={3.f,5.f,7.f,9.f};
+        std::memcpy(mem.getVU1Data()+16,loaded,sizeof(loaded));
+        VU1Interpreter vu;
+        vu.setDirectRegisterWrites(!queues);
+        vu.setCompiledProgramsEnabled(compiled);
+        vu.execute(mem.getVU1Code(),PS2_VU1_CODE_SIZE,mem.getVU1Data(),PS2_VU1_DATA_SIZE,gs,&mem,zeroStart,0,0,65536u);
+        return Result{vu.state(),{mem.getVU1Data(),mem.getVU1Data()+PS2_VU1_DATA_SIZE},vu.lastRunHitBudget()};
+    };
+    for(bool queues:{false,true}) {
+        const auto ref=runZero(false,queues);
+        const auto got=runZero(true,queues);
+        if(!same(ref,got) || got.state.vf[4][3]!=2.f || got.state.vf[0][3]!=1.f) {
+            std::fprintf(stderr,"VF0 distinta: colas=%d vf4=%g,%g,%g,%g/%g,%g,%g,%g vf0.w=%g/%g\n",queues,
+                ref.state.vf[4][0],ref.state.vf[4][1],ref.state.vf[4][2],ref.state.vf[4][3],
+                got.state.vf[4][0],got.state.vf[4][1],got.state.vf[4][2],got.state.vf[4][3],
+                ref.state.vf[0][3],got.state.vf[0][3]);
+            return false;
+        }
+    }
+    std::printf("VU1 VF0/VI0: 2 casos exactos (escritura a VF0 en un par compilado)\n");
+    return true;
 }
 bool divCases() {
     PS2Memory mem;
@@ -207,6 +246,7 @@ int main(int argc,char **argv) {
             ++cases;
         }
     std::printf("VU1 compilada: %u casos exactos (bloques, palabras modificadas, reservada, colas y presupuesto/reanudacion)\n",cases);
+    if(!zeroRegisterCases()) return 1;
     if(!divCases()) return 1;
     return 0;
 }

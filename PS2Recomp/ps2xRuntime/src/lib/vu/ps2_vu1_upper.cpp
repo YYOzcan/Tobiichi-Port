@@ -113,8 +113,9 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x0A:
     case 0x0B: // MADDbc
     {
+        // GOW-Port: sin FMA; la FMAC de la PS2 redondea el producto y luego la suma (igual que MSUB).
         const float bc = vt[op & 3];
-        _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(bc), getAcc()));
+        _mm_storeu_ps(result, _mm_add_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(bc))));
         applyFmacDest(vd, result, dest);
         return;
     }
@@ -179,7 +180,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         applyFmacDest(vd, result, dest);
         return;
     case 0x21: // MADDq
-        _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(getQ()), getAcc()));
+        _mm_storeu_ps(result, _mm_add_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(getQ()))));
         applyFmacDest(vd, result, dest);
         return;
     case 0x22: // ADDi
@@ -187,7 +188,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         applyFmacDest(vd, result, dest);
         return;
     case 0x23: // MADDi
-        _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(getI()), getAcc()));
+        _mm_storeu_ps(result, _mm_add_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(getI()))));
         applyFmacDest(vd, result, dest);
         return;
     case 0x24: // SUBq
@@ -211,7 +212,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         applyFmacDest(vd, result, dest);
         return;
     case 0x29: // MADD
-        _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, v_vt, getAcc()));
+        _mm_storeu_ps(result, _mm_add_ps(getAcc(), _mm_mul_ps(v_vs, v_vt)));
         applyFmacDest(vd, result, dest);
         return;
     case 0x2A: // MUL
@@ -286,7 +287,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x0B: // MADDAbc
         {
             const float bc = vt[specialOp & 3];
-            _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(bc), getAcc()));
+            _mm_storeu_ps(result, _mm_add_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(bc))));
             applyFmacDestAcc(result, dest);
             return;
         }
@@ -419,7 +420,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
             applyFmacDestAcc(result, dest);
             return;
         case 0x21: // MADDAq
-            _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(getQ()), getAcc()));
+            _mm_storeu_ps(result, _mm_add_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(getQ()))));
             applyFmacDestAcc(result, dest);
             return;
         case 0x22: // ADDAi
@@ -427,7 +428,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
             applyFmacDestAcc(result, dest);
             return;
         case 0x23: // MADDAi
-            _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, _mm_set1_ps(getI()), getAcc()));
+            _mm_storeu_ps(result, _mm_add_ps(getAcc(), _mm_mul_ps(v_vs, _mm_set1_ps(getI()))));
             applyFmacDestAcc(result, dest);
             return;
         case 0x24: // SUBAq
@@ -451,7 +452,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
             applyFmacDestAcc(result, dest);
             return;
         case 0x29: // MADDA
-            _mm_storeu_ps(result, _mm_fmadd_ps(v_vs, v_vt, getAcc()));
+            _mm_storeu_ps(result, _mm_add_ps(getAcc(), _mm_mul_ps(v_vs, v_vt)));
             applyFmacDestAcc(result, dest);
             return;
         case 0x2A: // MULA

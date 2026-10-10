@@ -366,9 +366,12 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
     const uint8_t fs = FS(upper);
     const uint8_t ft = FT(upper);
 
+    // GOW-Port: double, no long double. En MSVC long double es double (la plataforma con la que se
+    // validó contra PCSX2); con GCC son 80 bits x87: más lento y con doble redondeo al pasar a double.
+    // El producto de dos float es exacto en double.
     const auto operand = [this](float value)
     {
-        return static_cast<long double>(normalizeOperand(value));
+        return static_cast<double>(normalizeOperand(value));
     };
     const auto vs = [&](uint32_t lane)
     {
@@ -383,8 +386,8 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
         return operand(m_state.acc[lane]);
     };
 
-    const long double q = operand(m_state.q);
-    const long double i = operand(m_state.i);
+    const double q = operand(m_state.q);
+    const double i = operand(m_state.i);
 
     if (op < 0x3Cu)
     {
@@ -1885,6 +1888,9 @@ namespace
     std::atomic<VU1Interpreter::CompiledProgramFn> g_compiledProgram{nullptr};
 }
 
+// GOW-Port: ver VU1CompiledAccess::epoch (ps2_vu1_compiled.inl).
+std::atomic<uint64_t> g_vu1CompiledEpoch{0};
+
 void VU1Interpreter::registerCompiledProgram(CompiledProgramFn program)
 {
     std::fprintf(stderr, "[vu1c] registerCompiledProgram: %p\n", (void*)program);
@@ -1908,6 +1914,7 @@ VU1Interpreter::CompiledProgramFn VU1Interpreter::compiledProgramFor(uint8_t *vu
     if (generation != m_compiledGeneration)
     {
         m_compiledGeneration = generation;
+        g_vu1CompiledEpoch.fetch_add(1, std::memory_order_relaxed); // GOW-Port: resoluciones del despachador
         // Mantener al día la caché de decodificación (y m_statusUnread) aunque se use el código compilado.
         (void)getDecodedInstructionPairForPc(vuCode, codeSize, memory, 0u);
         // GOW_VU1_CAPTURA=<carpeta>: guarda cada micromemoria distinta (entrada de generar_vu1). Son datos del

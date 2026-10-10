@@ -20,6 +20,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <sstream>
@@ -214,7 +215,7 @@ int main(int argc, char **argv)
     };
 
     // Despacho par a par (sin flags muertos) para todas las palabras vistas.
-    std::map<uint32_t, std::vector<std::string>> pairCases;
+    std::map<uint32_t, std::vector<std::tuple<uint32_t, uint32_t, std::string>>> pairCases;
     std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seenPairs;
     for (const Code &code : codes)
         for (uint32_t pc = 0; pc + 8u <= code.bytes.size(); pc += 8u)
@@ -222,16 +223,11 @@ int main(int argc, char **argv)
             if (!code.valid[pc / 8u] || !seenPairs.insert({pc, code.lower(pc), code.upper(pc)}).second)
                 continue;
             const std::string name = pairFunction(code, pc, false);
-            std::ostringstream test;
-            test << "                if (lower == 0x" << std::hex << code.lower(pc) << "u && upper == 0x" << code.upper(pc)
-                 << "u && inRange(pc))\n" << std::dec
-                 << "                {\n                    ++g_stats.compiled;\n                    if (!" << name << "(vu, c))\n"
-                 << "                        return;\n                    continue;\n                }\n";
-            pairCases[pc].push_back(test.str());
+            pairCases[pc].emplace_back(code.lower(pc), code.upper(pc), name);
         }
 
     // Bloques.
-    std::map<uint32_t, std::vector<std::string>> blockCases;
+    std::map<uint32_t, std::vector<std::pair<std::string, std::vector<uint32_t>>>> blockCases;
     std::set<std::pair<uint32_t, std::vector<uint32_t>>> seenBlocks;
     size_t blockCount = 0, deadCount = 0, fmacCount = 0;
     for (const Code &code : codes)
@@ -322,12 +318,9 @@ int main(int argc, char **argv)
             const std::string name = "b" + hex4(head) + "_" + std::to_string(blockCases[head].size());
             const size_t part = blockCount % kParts;
             std::ostringstream body;
+            // Las palabras las compara el despachador una vez por versión de la micromemoria (ver run()).
             body << "    VU1C_FAST int " << name << "(VU1Interpreter &vu, C &c)\n    {\n"
-                 << "        static constexpr uint32_t words[" << words.size() << "] = {";
-            for (size_t w = 0; w < words.size(); ++w)
-                body << (w ? ", " : "") << "0x" << std::hex << words[w] << "u" << std::dec;
-            body << "};\n"
-                 << "        if (!VU1CompiledAccess::block(vu, c, " << head << "u, words, sizeof(words)))\n            return 0;\n"
+                 << "        if (!VU1CompiledAccess::blockReady(vu, c, " << head << "u, " << words.size() * 4u << "u))\n            return 0;\n"
                  << "        g_blockPairs += " << length << "u;\n";
             for (size_t i = 0; i < length; ++i)
             {
@@ -342,17 +335,14 @@ int main(int argc, char **argv)
             body << "        return 1;\n    }\n";
             parts[part] << body.str();
             declarations << "    int " << name << "(VU1Interpreter &vu, C &c);\n";
-            std::ostringstream test;
-            test << "                if (inRange(pc))\n                {\n                    const int r = " << name << "(vu, c);\n"
-                 << "                    if (r == 2)\n                        return;\n                    if (r == 1)\n                        continue;\n                }\n";
-            blockCases[head].push_back(test.str());
+            blockCases[head].emplace_back(name, words);
             ++blockCount;
         }
     }
 
     const std::string header =
         "// Generado por tools/vu1/generar_vu1.cpp a partir del microcódigo del juego. No publicar.\n"
-        "#include \"runtime/ps2_vu1.h\"\n#include \"ps2_vu1_compiled.inl\"\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n\n"
+        "#include \"runtime/ps2_vu1.h\"\n#include \"ps2_vu1_compiled.inl\"\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <iterator>\n\n"
         "// Mismo modo de coma flotante que el intérprete de VU (MSVC no expande en línea entre modos distintos).\n"
         "#if defined(_MSC_VER)\n#pragma float_control(precise, on, push)\n#pragma fp_contract(off)\n#endif\n\n"
         "using P = VU1CompiledAccess::P;\nusing C = VU1CompiledAccess::C;\n\n"
@@ -391,34 +381,95 @@ int main(int argc, char **argv)
         << "                hi = end && *end == '-' ? static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16)) : lo;\n            }\n"
         << "            blocks = std::getenv(\"GOW_VU1C_SIN_BLOQUES\") == nullptr;\n        }\n    } g_range;\n"
         << "    inline bool inRange(uint32_t pc) { return pc >= g_range.lo && pc <= g_range.hi; }\n}\n\n"
-        << "namespace vu1c_gen\n{\n" << declarations.str()
-        << "    void run(VU1Interpreter &vu, C &c)\n    {\n        for (;;)\n        {\n"
-        << "            const uint32_t pc = VU1CompiledAccess::pc(vu);\n"
-        << "            if (pc + 8u <= c.codeSize)\n            {\n"
-        << "                uint32_t lower, upper;\n"
-        << "                std::memcpy(&lower, c.vuCode + pc, 4);\n                std::memcpy(&upper, c.vuCode + pc + 4, 4);\n"
-        << "                switch (pc)\n                {\n";
+        << "namespace vu1c_gen\n{\n" << declarations.str() << "}\n\n";
+
+    // Candidatos por dirección, en el orden de antes: bloques (con sus palabras) y luego pares.
     std::set<uint32_t> allPcs;
     for (const auto &[pc, v] : pairCases)
         allPcs.insert(pc);
     for (const auto &[pc, v] : blockCases)
         allPcs.insert(pc);
+    out << "namespace\n{\n"
+        << "    using BlockFn = int (*)(VU1Interpreter &, C &);\n    using PairFn = bool (*)(VU1Interpreter &, C &);\n"
+        << "    struct BlockCand { BlockFn fn; const uint32_t *words; uint32_t bytes; };\n"
+        << "    struct PairCand { uint32_t lower, upper; PairFn fn; };\n"
+        << "    struct PcCands { const BlockCand *blocks; uint32_t blockCount; const PairCand *pairs; uint32_t pairCount; };\n";
     for (const uint32_t pc : allPcs)
     {
-        out << "                case 0x" << hex4(pc) << ":\n";
         if (const auto it = blockCases.find(pc); it != blockCases.end())
         {
-            out << "                if (g_range.blocks)\n                {\n";
-            for (const auto &t : it->second)
-                out << t;
-            out << "                }\n";
+            for (size_t b = 0; b < it->second.size(); ++b)
+            {
+                out << "    constexpr uint32_t w" << it->second[b].first << "[] = {";
+                const auto &w = it->second[b].second;
+                for (size_t i = 0; i < w.size(); ++i)
+                    out << (i ? ", " : "") << "0x" << std::hex << w[i] << "u" << std::dec;
+                out << "};\n";
+            }
+            out << "    constexpr BlockCand blocks" << hex4(pc) << "[] = {";
+            for (const auto &[name, w] : it->second)
+                out << "{&vu1c_gen::" << name << ", w" << name << ", " << w.size() * 4u << "u}, ";
+            out << "};\n";
         }
         if (const auto it = pairCases.find(pc); it != pairCases.end())
-            for (const auto &t : it->second)
-                out << t;
-        out << "                break;\n";
+        {
+            out << "    constexpr PairCand pairs" << hex4(pc) << "[] = {";
+            for (const auto &[lower, upper, name] : it->second)
+                out << "{0x" << std::hex << lower << "u, 0x" << upper << "u, " << std::dec << "&vu1c_gen::" << name << "}, ";
+            out << "};\n";
+        }
     }
-    out << "                default:\n                    break;\n                }\n            }\n"
+    out << "    PcCands makeCands(uint32_t pc)\n    {\n        switch (pc)\n        {\n";
+    for (const uint32_t pc : allPcs)
+    {
+        const bool b = blockCases.count(pc) != 0u, q = pairCases.count(pc) != 0u;
+        out << "        case 0x" << hex4(pc) << ": return {" << (b ? "blocks" + hex4(pc) : std::string("nullptr")) << ", "
+            << (b ? "std::size(blocks" + hex4(pc) + ")" : std::string("0")) << ", "
+            << (q ? "pairs" + hex4(pc) : std::string("nullptr")) << ", "
+            << (q ? "std::size(pairs" + hex4(pc) + ")" : std::string("0")) << "};\n";
+    }
+    out << "        default: return {nullptr, 0u, nullptr, 0u};\n        }\n    }\n"
+        // Resolución por versión de la micromemoria (VU1CompiledAccess::epoch): qué bloques tienen las mismas
+        // palabras que la micromemoria y qué par coincide. Antes se comparaban en cada entrada (memcmp de cada
+        // candidato); con cientos de micromemorias capturadas eso pesaba en los bucles calientes.
+        << "    constexpr uint32_t kMaxMatches = 4u;\n"
+        << "    struct Resolved\n    {\n        uint64_t epoch = ~0ull;\n        uint32_t blockCount = 0;\n"
+        << "        bool scan = false; // más de kMaxMatches bloques coinciden: comparar como antes\n"
+        << "        const BlockCand *blocks[kMaxMatches]{};\n        PairFn pair = nullptr;\n    };\n"
+        << "    Resolved g_resolved[16384u / 8u]; // micromemoria de VU1: 16 KB, un par cada 8 bytes\n"
+        << "    void resolve(Resolved &r, uint32_t pc, const C &c, uint64_t epoch)\n    {\n"
+        << "        r = Resolved{};\n        r.epoch = epoch;\n        const PcCands cands = makeCands(pc);\n"
+        << "        for (uint32_t i = 0; i < cands.blockCount; ++i)\n        {\n"
+        << "            const BlockCand &b = cands.blocks[i];\n"
+        << "            if (pc + b.bytes > c.codeSize || std::memcmp(c.vuCode + pc, b.words, b.bytes) != 0)\n                continue;\n"
+        << "            if (r.blockCount == kMaxMatches)\n            {\n                r.scan = true;\n                break;\n            }\n"
+        << "            r.blocks[r.blockCount++] = &b;\n        }\n"
+        << "        uint32_t lower, upper;\n        std::memcpy(&lower, c.vuCode + pc, 4);\n        std::memcpy(&upper, c.vuCode + pc + 4, 4);\n"
+        << "        for (uint32_t i = 0; i < cands.pairCount; ++i)\n"
+        << "            if (cands.pairs[i].lower == lower && cands.pairs[i].upper == upper)\n            {\n"
+        << "                r.pair = cands.pairs[i].fn;\n                break;\n            }\n    }\n}\n\n"
+        << "namespace vu1c_gen\n{\n"
+        << "    void run(VU1Interpreter &vu, C &c)\n    {\n        const uint64_t epoch = VU1CompiledAccess::epoch();\n        for (;;)\n        {\n"
+        << "            const uint32_t pc = VU1CompiledAccess::pc(vu);\n"
+        << "            if (pc + 8u <= c.codeSize && inRange(pc))\n            {\n"
+        << "                Resolved &r = g_resolved[pc / 8u];\n"
+        << "                if (r.epoch != epoch)\n                    resolve(r, pc, c, epoch);\n"
+        << "                if (g_range.blocks)\n                {\n"
+        << "                    int result = 0;\n"
+        << "                    if (!r.scan)\n                    {\n"
+        << "                        for (uint32_t i = 0; i < r.blockCount && result == 0; ++i)\n"
+        << "                            result = r.blocks[i]->fn(vu, c);\n                    }\n"
+        << "                    else\n                    {\n"
+        << "                        const PcCands cands = makeCands(pc);\n"
+        << "                        for (uint32_t i = 0; i < cands.blockCount && result == 0; ++i)\n"
+        << "                            if (pc + cands.blocks[i].bytes <= c.codeSize &&\n"
+        << "                                std::memcmp(c.vuCode + pc, cands.blocks[i].words, cands.blocks[i].bytes) == 0)\n"
+        << "                                result = cands.blocks[i].fn(vu, c);\n                    }\n"
+        << "                    if (result == 2)\n                        return;\n                    if (result == 1)\n                        continue;\n"
+        << "                }\n"
+        << "                if (r.pair)\n                {\n                    ++g_stats.compiled;\n"
+        << "                    if (!r.pair(vu, c))\n                        return;\n                    continue;\n                }\n"
+        << "            }\n"
         << "            ++g_stats.interpreted;\n"
         << "            if (!VU1CompiledAccess::interpret(vu, c))\n                return;\n        }\n    }\n}\n\n"
         << "static const bool g_registered = (VU1Interpreter::registerCompiledProgram(&vu1c_gen::run), true);\n"

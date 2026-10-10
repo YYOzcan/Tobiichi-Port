@@ -4,7 +4,9 @@
 #include "../../ps2xIOP/src/emulator/core/spu2.h"
 #include "../../ps2xIOP/tests/iop_compat_test_support.h"
 #include "ps2x/iop/iop_subsystem.h"
+#include "../../ps2xRuntime/src/lib/spu2_time_stretch.h"
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -54,6 +56,59 @@ namespace
             spu.write16(kBase + Spu2::RegMvolBase + core * Spu2::RegMvolStride, 0x3FFFu);
             spu.write16(kBase + Spu2::RegMvolBase + core * Spu2::RegMvolStride + 2u, 0x3FFFu);
         }
+    }
+
+    // GOW-Port: entrada senoidal a 'rate' tramas por trama de salida, entregada cada 'every' llamadas.
+    struct StretchRun
+    {
+        size_t longestSilence = 0;
+        double frequency = 0.0;
+        int maxStep = 0;
+        double tempo = 0.0;
+    };
+    StretchRun runStretch(double rate, int every)
+    {
+        ps2_audio::TimeStretch stretch;
+        std::vector<int16_t> in(65536u * 2u), out(1024u * 2u);
+        double phase = 0.0, owed = 0.0;
+        StretchRun result;
+        size_t silence = 0, crossings = 0, measured = 0;
+        int16_t previous = 0;
+        for (int call = 0; call < 3000; ++call)
+        {
+            owed += 1024.0 * rate;
+            if (call % every == 0)
+            {
+                const size_t frames = static_cast<size_t>(owed);
+                owed -= static_cast<double>(frames);
+                for (size_t i = 0; i < frames; ++i)
+                {
+                    const auto v = static_cast<int16_t>(8000.0 * std::sin(phase));
+                    in[i * 2u] = in[i * 2u + 1u] = v;
+                    phase += 2.0 * 3.14159265358979 * 440.0 / 48000.0;
+                }
+                stretch.push(in.data(), frames);
+            }
+            stretch.pull(out.data(), 1024u);
+            if (call < 300) // colchón y adaptación del tempo
+            {
+                previous = out[1023u * 2u];
+                continue;
+            }
+            for (size_t i = 0; i < 1024u; ++i)
+            {
+                const int16_t v = out[i * 2u];
+                silence = v == 0 ? silence + 1u : 0u;
+                result.longestSilence = std::max(result.longestSilence, silence);
+                crossings += (previous < 0) != (v < 0) ? 1u : 0u;
+                result.maxStep = std::max(result.maxStep, std::abs(v - previous));
+                previous = v;
+                ++measured;
+            }
+        }
+        result.frequency = static_cast<double>(crossings) / 2.0 / (static_cast<double>(measured) / 48000.0);
+        result.tempo = stretch.tempo();
+        return result;
     }
 }
 
@@ -212,6 +267,42 @@ void register_ps2_spu2_tests()
             t.IsTrue(spu.takeInterrupt(), "writing IRQA should raise the IRQ");
             t.IsTrue((spu.read16(kBase + 0x7C2u) & 0x4u) != 0u, "SPDIF_IRQINFO should flag core 0");
             t.IsFalse(spu.takeInterrupt(), "the IRQ should be consumed once");
+        });
+
+        tc.Run("time stretch keeps slow SPU2 output continuous and in tune", [](TestCase &t)
+        {
+            // GOW-Port: a 0,3x del tiempo real la salida directa tenía ~70 % de silencio entre ráfagas.
+            for (const auto &[rate, every] : {std::pair{1.0, 1}, std::pair{0.3, 1}, std::pair{0.3, 6}, std::pair{1.0, 8}})
+            {
+                const StretchRun run = runStretch(rate, every);
+                const std::string label = " (rate " + std::to_string(rate) + ", every " + std::to_string(every) + ")";
+                t.IsTrue(run.longestSilence <= 2u, "no silent gaps" + label);
+                t.IsTrue(std::abs(run.frequency - 440.0) < 2.0, "pitch preserved" + label);
+                t.IsTrue(run.maxStep <= 470, "no clicks at segment joins" + label); // 8000·2π·440/48000 ≈ 461
+            }
+            t.IsTrue(std::abs(runStretch(0.3, 1).tempo - 0.3) < 0.05, "tempo follows the arrival rate");
+        });
+
+        tc.Run("time stretch bounds latency and fades out when input stops", [](TestCase &t)
+        {
+            ps2_audio::TimeStretch stretch;
+            std::vector<int16_t> big(100000u * 2u, int16_t{1000}), out(1024u * 2u);
+            stretch.push(big.data(), 100000u);
+            stretch.pull(out.data(), 1024u);
+            t.IsTrue(stretch.inputFrames() <= ps2_audio::TimeStretch::kMaxTargetFrames, "excess input is dropped");
+
+            ps2_audio::TimeStretch starved;
+            std::vector<int16_t> tone(1024u * 2u, int16_t{4000});
+            for (int call = 0; call < 50; ++call)
+            {
+                starved.push(tone.data(), 1024u);
+                starved.pull(out.data(), 1024u);
+            }
+            size_t last = 1u;
+            for (int call = 0; call < 20; ++call)
+                last = starved.pull(out.data(), 1024u);
+            t.Equals(last, size_t{0}, "only silence once the input is gone");
+            t.Equals(out[0], int16_t{0}, "silent output");
         });
     });
 }
