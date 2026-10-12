@@ -230,7 +230,7 @@ void clutStore(uint version, uint index, uint value)
 )GLSL";
 
     const char *const kRaster = R"GLSL(
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = TILE_SIZE, local_size_y = TILE_SIZE) in;
 
 layout(std430, binding = 3) readonly buffer PrimBuffer { uint prims[]; };
 layout(std430, binding = 4) readonly buffer StateBuffer { uint states[]; };
@@ -857,9 +857,10 @@ void drawPrim(uint p, int x, int y)
 
 void main()
 {
-    uvec4 tile = tiles[gl_WorkGroupID.x];
-    int x = int(tile.x * 16u + gl_LocalInvocationID.x);
-    int y = int(tile.y * 16u + gl_LocalInvocationID.y);
+    // GOW-Port: TILE_SIZE (8 por defecto, PS2X_GS_TILE=16) y uRaster.y = primer tile de este trozo del dispatch.
+    uvec4 tile = tiles[gl_WorkGroupID.x + uRaster.y];
+    int x = int(tile.x * uint(TILE_SIZE) + gl_LocalInvocationID.x);
+    int y = int(tile.y * uint(TILE_SIZE) + gl_LocalInvocationID.y);
     uint end = tile.z + tile.w;
     for (uint i = tile.z; i < end; ++i)
     {

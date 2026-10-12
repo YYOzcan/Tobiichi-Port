@@ -72,8 +72,13 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && trackPath3Packet(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
+    // GOW-Port: reutilizar un búfer ya procesado (assign copia sin rellenar antes con ceros).
+    if (!m_spare.empty())
+    {
+        pkt.data = std::move(m_spare.back());
+        m_spare.pop_back();
+    }
+    pkt.data.assign(data, data + sizeBytes);
     m_queue.push_back(std::move(pkt));
 }
 
@@ -115,6 +120,12 @@ void GifArbiter::drain()
             auto &pkt = m_queue[takePath2 ? path2++ : path3++];
             if (!pkt.data.empty())
                 m_processFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+        }
+        // GOW-Port: guardar los búferes procesados para reutilizarlos (como mucho 64).
+        for (size_t i = 0u; i < count && m_spare.size() < 64u; ++i)
+        {
+            m_queue[i].data.clear();
+            m_spare.push_back(std::move(m_queue[i].data));
         }
         // GOW-Port: conservar los paquetes que el callback haya añadido; se procesan en otra tanda.
         m_queue.erase(m_queue.begin(), m_queue.begin() + count);

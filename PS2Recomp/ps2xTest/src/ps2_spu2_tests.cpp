@@ -283,6 +283,47 @@ void register_ps2_spu2_tests()
             t.IsTrue(std::abs(runStretch(0.3, 1).tempo - 0.3) < 0.05, "tempo follows the arrival rate");
         });
 
+        tc.Run("time stretch passes real-time bursty input through unchanged", [](TestCase &t)
+        {
+            // GOW-Port: el juego a tiempo real entrega el sonido a ráfagas (cada VBlank o dos). Antes el tempo oscilaba
+            // entre ~0,8 y ~1,3 y cada segmento repetía o saltaba trozos ("bucle"); ahora la salida debe ser la
+            // entrada sin cambios: muestras consecutivas de una rampa que crece de 7 en 7.
+            ps2_audio::TimeStretch stretch;
+            std::vector<int16_t> in(2048u * 2u), out(1024u * 2u);
+            int64_t next = 0;
+            size_t checked = 0, broken = 0;
+            int prev = 0;
+            bool havePrev = false;
+            for (int call = 0; call < 4000; ++call)
+            {
+                if (call % 2 == 0)
+                {
+                    for (size_t i = 0; i < 2048u; ++i, ++next)
+                        in[i * 2u] = in[i * 2u + 1u] = static_cast<int16_t>((next * 7) % 30000 - 15000);
+                    stretch.push(in.data(), 2048u);
+                }
+                stretch.pull(out.data(), 1024u);
+                if (call < 400)
+                    continue;
+                for (size_t i = 0; i < 1024u; ++i)
+                {
+                    const int v = out[i * 2u];
+                    if (havePrev)
+                    {
+                        ++checked;
+                        const int step = ((v - prev) % 30000 + 30000) % 30000;
+                        if (step != 7 && step != 7 + 0) // la rampa da la vuelta: (x+7) mod 30000
+                            ++broken;
+                    }
+                    prev = v;
+                    havePrev = true;
+                }
+            }
+            t.IsTrue(checked > 3000000u, "enough output checked");
+            t.Equals(broken, size_t{0}, "no repeated or skipped samples at tempo 1");
+            t.IsTrue(std::abs(stretch.tempo() - 1.0) < 1e-12, "tempo stays exactly 1");
+        });
+
         tc.Run("time stretch bounds latency and fades out when input stops", [](TestCase &t)
         {
             ps2_audio::TimeStretch stretch;

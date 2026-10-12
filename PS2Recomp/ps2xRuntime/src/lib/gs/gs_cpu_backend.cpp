@@ -2088,8 +2088,9 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
         selected = displayFrame;
         pixels.clear();
         usedPreferred = false;
+        // GOW-Port: normalizar DISPFB a bloques TEX0 antes de descartar una fuente sin TBW.
         if (allowPreferred && request.hasPreferredSource && request.preferredDestFbp == displayFrame.fbp &&
-            (request.preferredSource.fbw != 0u || request.preferredSource.fbp != displayFrame.fbp) &&
+            (request.preferredSource.fbw != 0u || request.preferredSource.fbp != displayFrame.fbp * 32u) &&
             CopyFrameToHostRgba(request.preferredSource, width, height, pixels, preserveAlpha, true, false, 0u, 0u))
         {
             selected = request.preferredSource;

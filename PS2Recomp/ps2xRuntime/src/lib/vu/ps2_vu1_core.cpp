@@ -103,6 +103,8 @@ void VU1Interpreter::resetScheduler()
     m_storePending = m_vfPending = m_viPending = m_accPending = 0u;
     m_flagHead = m_flagCount = 0u;
     m_xgkick.reset();
+    m_xgkickCycle = 0u;
+    m_xgkickEvent = ~0ull;
     m_vfReady = {};
     m_viReady = {};
     m_accReady = {};
@@ -187,19 +189,8 @@ void VU1Interpreter::recordViWriteForBranch(uint8_t reg, int32_t oldValue)
 
 void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
 {
-    if (__builtin_expect(dest == 0xFu, 1))
-    {
-        std::memcpy(dst, result, 16);
-        return;
-    }
-    if (dest & 0x8u)
-        dst[0] = result[0];
-    if (dest & 0x4u)
-        dst[1] = result[1];
-    if (dest & 0x2u)
-        dst[2] = result[2];
-    if (dest & 0x1u)
-        dst[3] = result[3];
+    // GOW-Port: un único store de 16 bytes (ver applyDestT en ps2_vu1_compiled.inl).
+    vu1StoreLanes(dst, result, dest);
 }
 
 void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
@@ -264,13 +255,17 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
 
     // Fast-path: if all active lanes are strictly normal finite floats (not zero, not denorm, not inf/nan),
     // then underflow, overflow and zero cannot occur. Flags are just sign, and result is unmodified.
+    // GOW-Port: también fuera el exponente 0xFE. Con redondeo hacia cero (fesetround en run(); en Linux también
+    // cambia el MXCSR) un producto o suma que desborda da el máximo finito (0x7F7FFFFF), no Inf, y quedaba en
+    // el camino rápido sin el flag O. Igual que el código compilado (exponente 1..0xFD); con un resultado
+    // legítimo de exponente 0xFE el camino exacto deja el mismo valor y solo el signo.
     bool needExact = false;
     if (dest & 0x8u)
     {
         uint32_t bits = 0u;
         std::memcpy(&bits, &result[0], sizeof(bits));
         const uint32_t exp = (bits >> 23) & 0xFFu;
-        if (__builtin_expect(exp != 0u && exp != 0xFFu, 1))
+        if (__builtin_expect(exp != 0u && exp < 0xFEu, 1))
             laneFlags[0] = (bits & 0x80000000u) ? 0x2u : 0u;
         else
             needExact = true;
@@ -280,7 +275,7 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
         uint32_t bits = 0u;
         std::memcpy(&bits, &result[1], sizeof(bits));
         const uint32_t exp = (bits >> 23) & 0xFFu;
-        if (__builtin_expect(exp != 0u && exp != 0xFFu, 1))
+        if (__builtin_expect(exp != 0u && exp < 0xFEu, 1))
             laneFlags[1] = (bits & 0x80000000u) ? 0x2u : 0u;
         else
             needExact = true;
@@ -290,7 +285,7 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
         uint32_t bits = 0u;
         std::memcpy(&bits, &result[2], sizeof(bits));
         const uint32_t exp = (bits >> 23) & 0xFFu;
-        if (__builtin_expect(exp != 0u && exp != 0xFFu, 1))
+        if (__builtin_expect(exp != 0u && exp < 0xFEu, 1))
             laneFlags[2] = (bits & 0x80000000u) ? 0x2u : 0u;
         else
             needExact = true;
@@ -300,7 +295,7 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
         uint32_t bits = 0u;
         std::memcpy(&bits, &result[3], sizeof(bits));
         const uint32_t exp = (bits >> 23) & 0xFFu;
-        if (__builtin_expect(exp != 0u && exp != 0xFFu, 1))
+        if (__builtin_expect(exp != 0u && exp < 0xFEu, 1))
             laneFlags[3] = (bits & 0x80000000u) ? 0x2u : 0u;
         else
             needExact = true;
@@ -899,7 +894,10 @@ void VU1Interpreter::commitReadyPipelines()
         return;
     // GOW-Port: caso frecuente (código FMAC denso con escrituras directas): solo hay flags pendientes.
     // Se confirman en orden y el siguiente ciclo es el de la cabeza de la cola, como en el caso general.
-    if ((m_storePending | m_vfPending | m_viPending | m_accPending) == 0u && !m_fdiv.valid &&
+    // GOW-Port: también con un FDIV pendiente (DIV/SQRT/RSQRT, uno por vértice en la perspectiva): antes iba
+    // por el camino general, que recorre todas las colas y recalcula el siguiente ciclo. Mismo orden (flags y
+    // después Q con D/I) y mismo siguiente ciclo que el camino general con las demás colas vacías.
+    if ((m_storePending | m_vfPending | m_viPending | m_accPending) == 0u &&
         !m_efu[0].valid && !m_efu[1].valid)
     {
         while (m_flagCount != 0u)
@@ -922,7 +920,15 @@ void VU1Interpreter::commitReadyPipelines()
                 m_state.clip = entry.clip;
             entry.valid = false;
         }
-        m_nextCommitCycle = ~0ull; // los flags se confirman al leerlos (commitReadyFlags)
+        if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
+        {
+            m_state.q = m_fdiv.value;
+            const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+            m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+            m_fdiv.valid = false;
+        }
+        // los flags se confirman al leerlos (commitReadyFlags)
+        m_nextCommitCycle = m_fdiv.valid ? m_fdiv.readyCycle : ~0ull;
         return;
     }
     while (m_flagCount != 0u)
@@ -954,7 +960,7 @@ void VU1Interpreter::commitReadyPipelines()
         m_state.q = m_fdiv.value;
         const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
         m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
-        m_fdiv = {};
+        m_fdiv.valid = false; // GOW-Port: queueQ escribe todos los campos
     }
 
     for (ScalarPipelineEntry &entry : m_efu)
@@ -962,10 +968,12 @@ void VU1Interpreter::commitReadyPipelines()
         if (entry.valid && entry.readyCycle <= m_cycle)
         {
             m_state.p = entry.value;
-            entry = {};
+            entry.valid = false; // GOW-Port: queueP escribe todos los campos
         }
     }
 
+    if (m_storePending != 0u && m_xgkick.active && m_cycle > m_xgkickCycle + 1u)
+        xgkickAdvanceTo(m_cycle - 1u); // GOW-Port: PATH1 copia antes de los stores que se confirman ahora
     for (uint32_t pending = m_storePending; pending != 0u; pending &= pending - 1u)
     {
         const uint32_t index = static_cast<uint32_t>(std::countr_zero(pending));
@@ -1059,14 +1067,93 @@ void VU1Interpreter::commitReadyPipelines()
     m_nextCommitCycle = next;
 }
 
+namespace
+{
+    // GOW-Port: progressXgkick corre en cada ciclo de un XGKICK; leer GOW_VIF_DIAG una vez fuera de la
+    // función evita la comprobación de inicialización de un static local en cada llamada.
+    const bool g_xgkickTrace = std::getenv("GOW_VIF_DIAG") != nullptr;
+}
+
+// Un ciclo de PATH1 (como antes, en cada ciclo): suma un crédito y copia los qwords que alcancen.
 void VU1Interpreter::progressXgkick()
 {
     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
         return;
-
     ++m_xgkick.cycleCredit;
+    xgkickCopy();
+}
+
+// GOW-Port: cuenta los ciclos de PATH1 hasta 'cycle' de una vez. La copia solo depende del número de ciclos y de
+// la memoria de datos, así que es igual que avanzar ciclo a ciclo siempre que se llame antes de que la VU escriba
+// en su memoria, antes de mirar si hay un envío activo y en cada evento (GIFtag o final, que pueden fallar o
+// enviar el paquete): en esos ciclos ocurre lo mismo que antes.
+void VU1Interpreter::xgkickAdvanceTo(uint64_t cycle)
+{
+    if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
+    {
+        m_xgkickEvent = ~0ull;
+        return;
+    }
+    if (cycle > m_xgkickCycle)
+    {
+        const uint64_t credit = m_xgkick.cycleCredit + (cycle - m_xgkickCycle);
+        m_xgkick.cycleCredit = static_cast<uint32_t>(std::min<uint64_t>(credit, 0x40000000u));
+        m_xgkickCycle = cycle;
+        xgkickCopy();
+    }
+    xgkickScheduleEvent();
+}
+
+// Próximo ciclo en que PATH1 copia una GIFtag (currentTagEnd == 0) o el último qword de la etiqueta actual
+// (después termina el paquete o la siguiente copia es una GIFtag). La copia j-ésima ocurre cuando el crédito
+// llega a 2: ciclo m_xgkickCycle + 2 * (j - copiados + 1) - crédito.
+void VU1Interpreter::xgkickScheduleEvent()
+{
+    if (!m_xgkick.active)
+    {
+        m_xgkickEvent = ~0ull;
+        return;
+    }
+    const uint64_t copied = m_xgkick.copiedBytes / 16u;
+    uint64_t target = m_xgkick.currentTagEnd == 0u ? copied : m_xgkick.currentTagEnd / 16u - 1u;
+    if (target < copied)
+        target = copied;
+    m_xgkickEvent = m_xgkickCycle + 2u * (target - copied + 1u) - std::min<uint64_t>(m_xgkick.cycleCredit, 2u * (target - copied + 1u));
+}
+
+void VU1Interpreter::xgkickCopy()
+{
+    if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
+        return;
+
     while (m_xgkick.active && m_xgkick.cycleCredit >= 2u)
     {
+        // GOW-Port: dentro del cuerpo de una etiqueta cada qword solo se copia (la etiqueta siguiente o el
+        // final llegan con el último): los que alcance el crédito se copian de una vez, en tramos contiguos.
+        // currentTagEnd es múltiplo de 16 y no pasa de kBufferSize (comprobado al leer la GIFtag).
+        if (m_xgkick.currentTagEnd != 0u && m_xgkick.currentTagEnd - m_xgkick.copiedBytes > 16u)
+        {
+            const uint32_t count = std::min<uint32_t>((m_xgkick.currentTagEnd - m_xgkick.copiedBytes) / 16u - 1u,
+                                                      m_xgkick.cycleCredit / 2u);
+            m_xgkick.cycleCredit -= 2u * count;
+            uint32_t bytes = count * 16u;
+            while (bytes != 0u)
+            {
+                const uint32_t position = m_xgkick.sourceAddress + m_xgkick.copiedBytes;
+                const uint32_t first = (m_activeVuDataSize & (m_activeVuDataSize - 1u)) == 0u
+                                           ? position & (m_activeVuDataSize - 1u)
+                                           : position % m_activeVuDataSize;
+                if (first + 16u > m_activeVuDataSize)
+                    break; // qword que da la vuelta: lo copia el camino de abajo (sin crédito ya gastado)
+                const uint32_t run = std::min<uint32_t>(bytes, (m_activeVuDataSize - first) & ~15u);
+                std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + first, run);
+                m_xgkick.copiedBytes += run;
+                bytes -= run;
+            }
+            m_xgkick.cycleCredit += 2u * (bytes / 16u); // devuelve el crédito de lo no copiado
+            if (m_xgkick.cycleCredit < 2u)
+                break;
+        }
         m_xgkick.cycleCredit -= 2u;
         if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
         {
@@ -1076,7 +1163,10 @@ void VU1Interpreter::progressXgkick()
         }
 
         const uint32_t qwordOffset = m_xgkick.copiedBytes;
-        const uint32_t first = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
+        const uint32_t position = m_xgkick.sourceAddress + m_xgkick.copiedBytes;
+        const uint32_t first = (m_activeVuDataSize & (m_activeVuDataSize - 1u)) == 0u
+                                   ? position & (m_activeVuDataSize - 1u)
+                                   : position % m_activeVuDataSize;
         if (first + 16u <= m_activeVuDataSize) // GOW-Port: un qword sin dar la vuelta, de una vez
             std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + first, 16u);
         else
@@ -1102,14 +1192,8 @@ void VU1Interpreter::progressXgkick()
                 tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
             else if (format == 1u)
                 tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
-            else if (format == 2u)
+            else // GOW-Port: IMAGE (2) y FLG=3, que el GS trata igual que IMAGE (el frontend ya lo hace)
                 tagBytes += static_cast<uint64_t>(nloop) * 16u;
-            else
-            {
-                reportReservedInstruction(false, 0xFFFFFFF8u);
-                m_xgkick.active = false;
-                return;
-            }
 
             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
             {
@@ -1160,6 +1244,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
     m_xgkick.issueCycle = m_cycle;
+    m_xgkickCycle = m_cycle; // GOW-Port: PATH1 por eventos
     // Opt-in packet snapshot, following Scotho/socom-unzipped's XGKICK workaround.
     // Capture before later VU instructions re-template the source buffer. Keep
     // the existing bounded parser and circular-memory handling in both modes.
@@ -1168,6 +1253,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
         m_xgkick.cycleCredit = 0x40000000u;
         progressXgkick();
     }
+    xgkickScheduleEvent();
 }
 
 void VU1Interpreter::advanceOneCycle()
@@ -1179,7 +1265,7 @@ void VU1Interpreter::advanceOneCycle()
     if (m_cycle >= m_nextCommitCycle)
         commitReadyPipelines();
     if (m_xgkick.active)
-        progressXgkick();
+        xgkickAdvanceTo(m_cycle); // GOW-Port: un ciclo, o los que falten tras código compilado
 }
 
 void VU1Interpreter::advanceTo(uint64_t targetCycle)
@@ -1212,8 +1298,22 @@ void VU1Interpreter::advanceTo(uint64_t targetCycle)
         return;
     }
 
+    // GOW-Port (KIexster, vu1-advance-events): en una espera no se ejecuta nada; solo cuentan los ciclos en que
+    // algo cambia: un resultado listo (m_nextCommitCycle) o un evento de PATH1 (GIFtag o fin del paquete). Se
+    // salta de uno a otro con el mismo orden que ciclo a ciclo (primero el commit y después PATH1); entre eventos
+    // PATH1 solo acumula crédito, que xgkickAdvanceTo cuenta de una vez.
     while (m_cycle < targetCycle)
-        advanceOneCycle();
+    {
+        uint64_t next = std::min(targetCycle, std::max(m_nextCommitCycle, m_cycle + 1u));
+        if (m_xgkick.active)
+            next = std::min(next, std::max(m_xgkickEvent, m_cycle + 1u));
+        m_cycle = next;
+        m_state.cycles = m_cycle;
+        if (m_cycle >= m_nextCommitCycle)
+            commitReadyPipelines();
+        if (m_xgkick.active && m_cycle >= m_xgkickEvent)
+            xgkickAdvanceTo(m_cycle);
+    }
 }
 
 bool VU1Interpreter::pipelinesPending() const
@@ -1230,9 +1330,35 @@ bool VU1Interpreter::pipelinesPending() const
 
 void VU1Interpreter::flushPipelines()
 {
+    xgkickAdvanceTo(m_cycle); // GOW-Port: PATH1 al día antes de vaciar
     commitReadyFlags();
     while (pipelinesPending())
     {
+        // GOW-Port: al terminar un programa suele quedar solo PATH1 (XGKICK). Ciclo a ciclo, cada ciclo suma
+        // un crédito y cada dos se copia un qword, sin nada más que hacer (las demás colas están vacías y no
+        // se pueden llenar). Se hace de una vez: n iteraciones de progressXgkick con crédito inicial c0
+        // terminan en el ciclo 2n - c0, que es lo que se suma.
+        if (m_xgkick.active && m_activeVuData && m_activeVuDataSize != 0u && !m_fdiv.valid && m_flagCount == 0u &&
+            (m_storePending | m_vfPending | m_viPending | m_accPending) == 0u && !m_efu[0].valid && !m_efu[1].valid)
+        {
+            constexpr uint32_t kCredit = 0x40000000u;
+            const uint32_t startCredit = m_xgkick.cycleCredit;
+            m_xgkick.cycleCredit = kCredit;
+            progressXgkick();
+            if (!m_xgkick.active)
+            {
+                const uint64_t iterations = (static_cast<uint64_t>(kCredit) + 1u - m_xgkick.cycleCredit) / 2u;
+                m_cycle += 2u * iterations - startCredit;
+                m_state.cycles = m_cycle;
+                m_xgkickCycle = m_cycle; // GOW-Port: el envío ha terminado en este ciclo
+                m_xgkickEvent = ~0ull;
+                if (m_cycle >= m_nextCommitCycle)
+                    commitReadyPipelines();
+                commitReadyFlags();
+                continue;
+            }
+            m_xgkick.cycleCredit = startCredit; // no ocurre: el crédito alcanza para cualquier paquete
+        }
         advanceOneCycle();
         commitReadyFlags();
     }
@@ -1729,8 +1855,9 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
                                              const PS2Memory *memory, uint64_t generation)
 {
     const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
-    for (uint32_t i = 0; i < pairCount; ++i)
-        m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+    // GOW-Port: decodificar los 2048 pares en cada cambio de microcódigo costaba ~1 % del hilo de VU1 aunque
+    // el código compilado no use la caché. Ahora cada par se decodifica la primera vez que se pide.
+    m_decodedValid.fill(0u);
 
     m_cachedVuCode = vuCode;
     m_cachedMemory = memory;
@@ -1739,18 +1866,28 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
     m_decodedCodeCacheValid = true;
     // FSAND (0x16), FSEQ (0x14) y FSOR (0x17) son las únicas lecturas del estado en VU1.
     m_statusUnread = m_directRegisterWrites;
+    // Mismas condiciones que con los pares decodificados: bit I = bit 31 de la palabra superior.
+    const auto lowerOp = [vuCode](uint32_t i, bool &iBit)
+    {
+        uint32_t lower = 0u, upper = 0u;
+        std::memcpy(&lower, vuCode + i * 8u, sizeof(lower));
+        std::memcpy(&upper, vuCode + i * 8u + 4u, sizeof(upper));
+        iBit = (upper & 0x80000000u) != 0u;
+        return lower >> 25;
+    };
     for (uint32_t i = 0; i < pairCount && m_statusUnread; ++i)
     {
-        const DecodedInstructionPair &pair = m_decodedCodeCache[i];
-        const uint32_t op = pair.lower >> 25;
-        if (!pair.iBit && (op == 0x14u || op == 0x16u || op == 0x17u))
+        bool iBit = false;
+        const uint32_t op = lowerOp(i, iBit);
+        if (!iBit && (op == 0x14u || op == 0x16u || op == 0x17u))
             m_statusUnread = false;
     }
     m_statusQuiet = m_statusUnread;
     for (uint32_t i = 0; i < pairCount && m_statusQuiet; ++i)
     {
-        const DecodedInstructionPair &pair = m_decodedCodeCache[i];
-        if (!pair.iBit && (pair.lower >> 25) == 0x15u) // FSSET
+        bool iBit = false;
+        const uint32_t op = lowerOp(i, iBit);
+        if (!iBit && op == 0x15u) // FSSET
             m_statusQuiet = false;
     }
 }
@@ -1779,6 +1916,13 @@ const VU1Interpreter::DecodedInstructionPair &VU1Interpreter::getDecodedInstruct
     const uint32_t pairIndex = pc / 8u;
     if (pairIndex >= kMaxDecodedPairs)
         return m_decodedScratch = decodeInstructionPair(vuCode, pc);
+    uint64_t &valid = m_decodedValid[pairIndex / 64u];
+    const uint64_t bit = 1ull << (pairIndex % 64u);
+    if ((valid & bit) == 0u)
+    {
+        m_decodedCodeCache[pairIndex] = decodeInstructionPair(vuCode, pc);
+        valid |= bit;
+    }
     return m_decodedCodeCache[pairIndex];
 }
 
@@ -1811,10 +1955,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.branchPending = false;
     m_state.branchTarget = 0;
     m_state.branchDelay = 0;
-    m_state.vf[0][0] = 0.0f;
-    m_state.vf[0][1] = 0.0f;
-    m_state.vf[0][2] = 0.0f;
-    m_state.vf[0][3] = 1.0f;
+    vu1StoreVf0(m_state.vf[0]);
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -1861,6 +2002,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_lastRunHitBudget = !programEnded && !m_stopRequested && m_cycle >= context.budgetEnd; // GOW-Port
+    xgkickAdvanceTo(m_cycle); // GOW-Port: PATH1 al día tras la ejecución (si se cortó por presupuesto)
     commitReadyFlags(); // GOW-Port: el estado visible tras la ejecución
     m_state.cycles = m_cycle;
     if (useVuRounding && previousRoundingMode != -1)

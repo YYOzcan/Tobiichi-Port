@@ -6,20 +6,25 @@ primer puerto. El segundo puerto permanece desconectado; todavía no hay vibraci
 
 ## Teclado
 
-Cuando no hay un gamepad conectado al backend:
+Cuando no hay un gamepad conectado al backend (disposición por defecto, `TOBIICHI_DMC5_CONTROLS` distinto de 0):
 
-| Control de PS2 | Tecla |
-|---|---|
-| Stick izquierdo | WASD |
-| Stick derecho | IJKL |
-| Cruceta | Flechas (WASD también activa la cruceta del backend) |
-| X | X o Espacio |
-| Círculo | C |
-| Cuadrado | Z o numérico 0 |
-| Triángulo | V o numérico 1 |
-| L1 / R1 | Q / E |
-| L2 / R2 | Shift izquierdo / derecho |
-| Start / Select | Enter / Tab |
+| Tecla | Control de PS2 | En el juego |
+|---|---|---|
+| WASD | Stick izquierdo | Moverse |
+| Ctrl + WASD | Stick derecho (el izquierdo queda centrado) | Esquivar |
+| Clic izquierdo | Cuadrado | Ataque ligero |
+| Clic derecho | Triángulo | Ataque fuerte |
+| F | Círculo | Agarre |
+| Espacio | X | Salto |
+| Shift | L1 | Bloqueo / parada |
+| Q | R2 | Magia |
+| E | R1 | Habilidad / acción |
+| V | L3 + R3 | Furia de los dioses |
+| Flechas | Cruceta | Selección |
+| Enter / Tab | Start / Select | |
+
+IJKL sigue moviendo el stick derecho. Con `TOBIICHI_DMC5_CONTROLS=0` se usa la disposición anterior
+(WASD también en la cruceta, X/C/Z/V para los botones, Q/E = L1/R1, Shift izquierdo/derecho = L2/R2).
 
 El backend usa el gamepad de índice 0 cuando está disponible. Sus botones, sticks y gatillos se
 adaptan al paquete libpad2. Las presiones se simulan como 0 o 255 según el botón esté suelto o pulsado.

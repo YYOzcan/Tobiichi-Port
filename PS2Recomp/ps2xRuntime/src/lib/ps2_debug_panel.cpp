@@ -35,6 +35,7 @@
 // GOW-Port: ps2_runtime.cpp. Cuadros del juego (entradas a GOW_PERF_FRAME_PC).
 extern std::atomic<uint64_t> g_gowGuestFrames;
 extern std::atomic<float> g_gowGameSpeed; // GOW-Port: 1 = tiempo real
+extern std::atomic<uint64_t> g_gowVu1BusyNs; // GOW-Port: ps2_memory.cpp, hilo de VU1 (PS2X_VU1_HILO)
 bool gowGuestFrameCounterEnabled();
 
 namespace
@@ -52,6 +53,8 @@ namespace
         static size_t next = 0, filled = 0;
         static std::array<uint64_t, ps2_perf::bucketCount> lastNanos{};
         static std::array<float, ps2_perf::bucketCount> share{};
+        static uint64_t lastVu1Ns = 0;
+        static float vu1Load = 0.0f, vu1FrameMs = 0.0f;
 
         const double now = GetTime();
         const uint64_t frames = g_gowGuestFrames.load(std::memory_order_relaxed);
@@ -60,12 +63,20 @@ namespace
             // Primera vez o el panel estuvo cerrado: empezar de nuevo sin una muestra engañosa.
             lastTime = now;
             lastFrames = frames;
+            lastVu1Ns = g_gowVu1BusyNs.load(std::memory_order_relaxed);
             for (size_t i = 0; i < ps2_perf::bucketCount; ++i)
                 lastNanos[i] = ps2_perf::nanos[i].load(std::memory_order_relaxed);
         }
         else if (now - lastTime >= kInterval)
         {
             fps = static_cast<float>(static_cast<double>(frames - lastFrames) / (now - lastTime));
+            {
+                const uint64_t vu1Ns = g_gowVu1BusyNs.load(std::memory_order_relaxed);
+                const double busyMs = static_cast<double>(vu1Ns - lastVu1Ns) * 1e-6;
+                vu1Load = static_cast<float>(busyMs / ((now - lastTime) * 1000.0) * 100.0);
+                vu1FrameMs = frames != lastFrames ? static_cast<float>(busyMs / static_cast<double>(frames - lastFrames)) : 0.0f;
+                lastVu1Ns = vu1Ns;
+            }
             history[next] = fps;
             next = (next + 1u) % history.size();
             filled = std::min(filled + 1u, history.size());
@@ -99,6 +110,9 @@ namespace
         const float speed = g_gowGameSpeed.load(std::memory_order_relaxed);
         ImGui::TextColored(speed >= 0.95f ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) : ImVec4(1.0f, 0.6f, 0.3f, 1.0f),
                            "Game speed: %.0f%% of real time%s", speed * 100.0f, speed < 0.95f ? " (slow motion)" : "");
+        if (g_gowVu1BusyNs.load(std::memory_order_relaxed) != 0u)
+            ImGui::TextColored(vu1FrameMs <= 16.7f ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) : ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                               "VU1 thread: %.0f%% busy, %.1f ms/frame (60 FPS needs < 16.7 ms)", vu1Load, vu1FrameMs);
         if (ps2_perf::enabled())
             ImGui::Text("Game thread: EE %.0f%%  VU %.0f%%  GS %.0f%%  IOP %.0f%%",
                         share[0], share[1], share[2], share[3]);

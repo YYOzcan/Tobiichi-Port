@@ -213,6 +213,9 @@ int main(int argc, char *argv[])
                 static_cast<PS2DebugPanel *>(userData)->shutdown();
             },
             &debugPanel);
+        // GOW-Port: TOBIICHI_PANEL=0 (lanzador) arranca con el panel de depuración oculto; F1 lo muestra.
+        if (const char *panel = std::getenv("TOBIICHI_PANEL"); panel && panel[0] == '0')
+            debugPanel.setVisible(false);
 #endif
         if (!runtime.initialize(windowTitle.c_str()))
         {

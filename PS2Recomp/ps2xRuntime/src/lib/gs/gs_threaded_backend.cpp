@@ -8,6 +8,7 @@
 #include "ThreadNaming.h"
 
 #include <atomic>
+#include <mutex>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -56,9 +57,28 @@ namespace
     }
 }
 
+// GOW-Port: presentación por buzón (PS2X_GS_PRESENT_BUZON=1; sin contexto GL compartido, como en Linux).
+// Antes, en cada VSync el hilo principal hacía Flush + Sync + Present con RunOnWorker: esperaba a que el hilo
+// del GS vaciara toda su cola, y con el juego a 50-60 cuadros/s la cola no se vaciaba nunca (ventana a 6-10
+// cuadros/s). Ahora Present se encola en orden con el resto de comandos; el hilo del GS deja el cuadro en el
+// buzón y el hilo principal muestra el último que haya, sin esperar. Un solo backend con hilo por proceso.
+namespace
+{
+    std::atomic<bool> g_presentMailbox{false};
+    std::mutex g_mailboxMutex;
+    PresentationFrame g_mailboxFrame;
+}
+
+bool gowGsPresentMailboxActive()
+{
+    return g_presentMailbox.load(std::memory_order_relaxed);
+}
+
 GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
     : m_inner(std::move(inner))
 {
+    if (const char *mailbox = std::getenv("PS2X_GS_PRESENT_BUZON"); mailbox && mailbox[0] == '1' && !GSSharedPresent::Active())
+        g_presentMailbox.store(true, std::memory_order_relaxed);
     const char *compact = std::getenv("PS2X_GS_COMPACT_QUEUE");
     m_compactQueue = !compact || *compact != '0';
     if (const char *limit = std::getenv("PS2X_GS_QUEUE_CHUNKS"))
@@ -89,7 +109,16 @@ std::unique_ptr<GSRasterBackend> GSThreadedBackend::MakeDefault()
     const char *gpu = std::getenv("PS2X_GS_GPU");
     const bool useGpu = (gpu && *gpu) ? *gpu != '0' : s_gpuByDefault.load();
     if (useGpu)
+    {
+        // GOW-Port: PS2X_GS_ASYNC_PRESENT=1 lee el cuadro presentado con un PBO y una fence en vez de
+        // glGetBufferSubData: el hilo del GS ya no espera a que la GPU termine en cada presentación (en Linux no
+        // hay presentación compartida; en partida el hilo del GS pasaba ~82 % del tiempo en el driver). Se
+        // muestra el último cuadro ya leído (un cuadro de retraso como mucho).
+        const char *async = std::getenv("PS2X_GS_ASYNC_PRESENT");
+        if (async && async[0] == '1')
+            GSGpuBackend::SetAsyncPresentDefault(true);
         return std::make_unique<GSThreadedBackend>(std::make_unique<GSGpuBackend>());
+    }
     if (!enabled)
         return std::make_unique<GSCpuBackend>();
     return std::make_unique<GSThreadedBackend>(std::make_unique<GSCpuBackend>());
@@ -270,7 +299,17 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
                 m_inner->Submit(draw);
             break;
         case Op::Present:
-            m_inner->Present(readAt<GSPresentationRequest>(payload));
+            if (gowGsPresentMailboxActive())
+            {
+                PresentationFrame frame = m_inner->Present(readAt<GSPresentationRequest>(payload));
+                if (frame)
+                {
+                    std::lock_guard<std::mutex> lock(g_mailboxMutex);
+                    g_mailboxFrame = std::move(frame);
+                }
+            }
+            else
+                m_inner->Present(readAt<GSPresentationRequest>(payload));
             break;
         case Op::Call:
             (*readAt<const std::function<void()> *>(payload))();
@@ -356,6 +395,11 @@ void GSThreadedBackend::Sync(GSSyncReason reason)
     }
     if (reason == GSSyncReason::Presentation && GSSharedPresent::Active())
         return;
+    if (reason == GSSyncReason::Presentation && gowGsPresentMailboxActive())
+    {
+        Enqueue(Op::Sync, &reason, sizeof(reason)); // en orden antes del Present encolado, sin esperar
+        return;
+    }
     // GOW-Port: FINISH solo se publica cuando terminaron los comandos anteriores.
     RunOnWorker([&] { m_inner->Sync(reason); });
 }
@@ -368,6 +412,16 @@ PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &reques
         std::lock_guard<std::mutex> lock(m_producerMutex);
         PublishLocked();
         return {};
+    }
+    if (gowGsPresentMailboxActive())
+    {
+        Enqueue(Op::Present, &request, sizeof(request));
+        {
+            std::lock_guard<std::mutex> lock(m_producerMutex);
+            PublishLocked();
+        }
+        std::lock_guard<std::mutex> lock(g_mailboxMutex);
+        return g_mailboxFrame; // copia: el último cuadro sigue disponible para el siguiente VSync
     }
     PresentationFrame frame;
     RunOnWorker([&] { frame = m_inner->Present(request); });

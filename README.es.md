@@ -1,175 +1,146 @@
 <div align="center">
 
-# God of War — PS2 Static Recompilation
+# God of War — Tobiichi Port
 
-[English](README.md) · **Español** · [Português (Brasil)](README.pt-BR.md)
+[English](README.md) · [Türkçe](README.tr.md) · **Español**
 
-**Port nativo para PC de *God of War* (PS2, NTSC-U `SCUS-97399`) mediante recompilación estática de MIPS R5900 a C++.**
+**Port nativo para PC de *God of War* (PS2, NTSC-U `SCUS-97399`), hecho recompilando estáticamente código MIPS R5900 a C++, con su propio lanzador.**
 
-![Plataforma](https://img.shields.io/badge/plataforma-Windows%20x64-0078D6?logo=windows&logoColor=white)
+![Plataforma](https://img.shields.io/badge/plataforma-Linux%20%7C%20Windows%20x64-0078D6?logo=linux&logoColor=white)
 ![Lenguaje](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
-![Build](https://img.shields.io/badge/build-CMake%20%2B%20Ninja-064F8C?logo=cmake&logoColor=white)
+![Lanzador](https://img.shields.io/badge/lanzador-Qt%206-41CD52?logo=qt&logoColor=white)
 ![Basado en](https://img.shields.io/badge/basado%20en-PS2Recomp-8A2BE2)
-![Estado](https://img.shields.io/badge/estado-experimental-orange)
-[![Pruebas](https://github.com/KIexster/god-of-war-recomp/actions/workflows/pruebas.yml/badge.svg)](https://github.com/KIexster/god-of-war-recomp/actions/workflows/pruebas.yml)
+![Estado](https://img.shields.io/badge/estado-jugable%20%C2%B7%20experimental-orange)
 
 </div>
 
 ---
 
 > [!IMPORTANT]
-> Este repositorio **no contiene ningún archivo del juego** (ISO, ejecutable, módulos IRX ni datos `.PAK`)
-> ni el código C++ generado a partir de él. Necesitas **tu propia copia legal** de God of War para PS2.
+> Este repositorio **no contiene ningún archivo del juego** (ISO, ejecutable, módulos IRX ni datos `.PAK`) ni el
+> código C++ generado a partir de ellos. Necesitas **tu propia copia legal** de God of War para PS2.
 
 ## Índice
 
 - [Qué es](#qué-es)
+- [Lo más destacado](#lo-más-destacado)
 - [Estado actual](#estado-actual)
+- [Inicio rápido](#inicio-rápido)
+- [God Of War: Tobiichi Launcher](#god-of-war-tobiichi-launcher)
 - [Estructura del repositorio](#estructura-del-repositorio)
-- [Requisitos](#requisitos)
-- [Compilar y ejecutar](#compilar-y-ejecutar)
 - [Cómo funciona](#cómo-funciona)
 - [Documentación](#documentación)
 - [Créditos y licencia](#créditos-y-licencia)
 
 ## Qué es
 
-En lugar de emular la PlayStation 2 instrucción por instrucción, este proyecto **traduce el ejecutable
-original del juego (`SCUS_973.99`) a código C++** con [PS2Recomp](https://github.com/ran-j/PS2Recomp),
-y lo compila como un programa nativo de Windows enlazado contra un runtime que reimplementa el hardware
-y el sistema operativo de la PS2 (kernel del EE, GS, DMA, CD/DVD…). El procesador de E/S (IOP) ejecuta
-los **módulos IRX originales** del juego (driver de sonido, cargador de datos…) en el intérprete R3000A de
-PS2Recomp.
+En lugar de emular la PlayStation 2 instrucción a instrucción, este proyecto **traduce el ejecutable original del
+juego (`SCUS_973.99`) a C++** con [PS2Recomp](https://github.com/ran-j/PS2Recomp) y lo compila como un programa
+nativo de PC, enlazado con un runtime que reimplementa el hardware y el sistema operativo de la PS2 (núcleo del EE,
+GS, VU1, DMA, SPU2, CD/DVD…). El procesador de E/S (IOP) ejecuta los **módulos IRX originales** del juego (driver de
+sonido, lector de datos…) en un intérprete R3000A.
 
-Este repositorio contiene todo lo específico de God of War:
+El objetivo es un port con sensación nativa: velocidad de juego en tiempo real, presentación fluida, gráficos y
+sonido correctos.
 
-| Componente | Descripción |
+## Lo más destacado
+
+| | |
 |---|---|
-| **Mapa de funciones** | 6 414 funciones identificadas en el ELF (`config/funcmap.csv`) |
-| **Configuración del recompilador** | Stubs, puntos de entrada (incluidos métodos virtuales a los que solo se llega por vtable) y parches de instrucciones (`config/recomp.template.toml`) |
-| **Overrides del juego** | Reemplazos y diagnósticos de funciones del juego (`src/gow_overrides.cpp`) |
-| **Parche del runtime** | Correcciones al emulador del IOP y al runtime del EE de PS2Recomp que necesita este juego (`patches/`) |
-| **Scripts de compilación** | Pipeline completo y reproducible en Windows (`scripts/`) |
-| **Herramientas** | Extractor de la capa 1 de DVD-9 (`tools/`) |
+| **Lanzador** | Tarjeta gráfica, resolución, panorámica, escalado FSR, límite de FPS y rutas de archivos en un solo sitio |
+| **Panorámica** | Cámara Hor+ real (16:9, 16:10, 21:9), basada en el parche de PCSX2; desactivada = idéntica bit a bit al original |
+| **Escalado** | AMD FSR 1.0 (EASU + RCAS) y FXAA en la capa de presentación |
+| **Ventana fluida** | La ventana presenta hasta 120+ FPS con independencia de la lógica del juego a 60 Hz |
+| **Audio** | Estirado temporal con zona muerta y reloj del IOP ligado al tiempo del EE: el tempo se queda en 1,00, sin bucles |
+| **VU1 recompilada** | El microcódigo VU1 del juego se compila a código nativo, bit a bit igual que el intérprete (~23 % más rápido que antes) |
+| **Velocidad real** | El VBlank sigue al reloj real: el juego pierde cuadros en lugar de ir a cámara lenta |
 
 ## Estado actual
 
-<a href="docs/estado/detalle.es.md"><img src="docs/estado/mapa.es.svg" alt="Mapa de estado del port: funciones de las librerías del SDK de Sony y componentes del hardware de la PS2, coloreados por estado" width="100%"></a>
+<a href="docs/estado/detalle.es.md"><img src="docs/estado/mapa.es.svg" alt="Mapa de estado del port: funciones de las bibliotecas del SDK de Sony y componentes de hardware de la PS2, coloreados por estado" width="100%"></a>
 
-Desglose por librería y por componente: [`docs/estado/detalle.es.md`](docs/estado/detalle.es.md). Se regenera a partir de `docs/estado/datos.toml` con `tools/estado/generar.py` (y automáticamente al subir a `main`).
+Desglose por biblioteca y componente: [`docs/estado/detalle.es.md`](docs/estado/detalle.es.md).
 
 | Hito | Estado |
 |---|:---:|
-| Extracción de ambas capas del DVD-9 | ✅ |
-| Recompilación de `SCUS_973.99` a C++ (6 418 archivos) | ✅ |
-| Compilación del ejecutable nativo (MSVC, x64) | ✅ |
-| Arranque: inicialización de raylib/OpenGL, heap y threads | ✅ |
-| IRX originales del juego en el emulador del IOP (`989snd`, `smpd`, `libsd`…) | ✅ |
-| Carga de datos desde la ISO original (`smpd` → `R_PERM.WAD`, configuración) | ✅ |
-| Bucle principal del juego (`sys::GameLoop`) | ✅ |
-| Salida de vídeo: pantalla legal y logo del título | ✅ |
-| Barco, Kratos, enemigos y HUD con formas correctas; faltan otros controles de renderizado | 🔧 en progreso |
-| Mando/teclado por HLE de libpad2; menú y selección de dificultad | ✅ |
-| Partida alcanzada; rendimiento todavía de ~2–3 fps | 🔧 en progreso |
-| Vídeo FMV: intro decodificada y presentada sin omitirla; faltan otros vídeos | 🔧 en progreso |
-| Audio: bancos y sonido continuo emulado verificados; salida entrecortada a la velocidad actual | 🔧 en progreso |
-| Memory card: listar, cargar, guardar y recargar verificados en una copia PCSX2; falta formateo | 🔧 en progreso |
+| Recompilar `SCUS_973.99` a C++ (6 418 archivos) y compilar de forma nativa | ✅ |
+| Módulos IRX originales en el emulador del IOP; lectura desde la ISO original | ✅ |
+| Menús, selección de dificultad, juego, mando y teclado/ratón | ✅ |
+| Imagen (OpenGL; rasterizador por hardware con `fragment_shader_interlock` o de cómputo) | ✅ |
+| Audio a tempo de tiempo real | ✅ |
+| Panorámica (Hor+) y escalado FSR | ✅ |
+| FMV: la intro se decodifica y se muestra; el resto sin verificar | 🔧 |
+| Tarjeta de memoria: guardar/cargar verificado; formatear sin verificar | 🔧 |
+| Rendimiento: 60 FPS en escenas ligeras y medias, **~30 FPS en las más pesadas** | 🔧 |
 
-El juego arranca, carga sus datos desde la ISO y llega al menú y a la partida con teclado o mando.
-Tras corregir las cadenas DMA del scratchpad, las capturas muestran el barco, Kratos, enemigos y HUD
-con formas correctas. La intro FMV también se decodifica sin `GOW_SKIP_FMV`. Se han verificado cargar,
-guardar y recargar una partida en una copia de tarjeta PCSX2 de 8 MB con ECC; faltan formateo y reapertura
-en PCSX2. El port sigue siendo experimental: la partida va a ~2–3 fps, el audio se oye entrecortado y
-quedan diferencias CPU/OpenGL y cobertura gráfica por comprobar. Ver [renderizado](docs/COMPARACION_PCSX2.md),
-[FMV y audio](docs/FMV_Y_AUDIO.md), [memory card](docs/MEMORY_CARD.md) y
-[`docs/ESTADO.md`](docs/ESTADO.md) para los controles y sus límites.
+### Sobre los cuadros por segundo
+
+La lógica del juego está ligada al VBlank de 60 Hz de la PS2, así que **el juego en sí no puede pasar de 60 FPS**;
+subir el VBlank solo hace que se juegue más rápido. La ventana sí puede presentar a 120 Hz o más, lo que muestra cada
+cuadro nuevo antes y reduce la latencia. En las escenas más pesadas el hilo de VU1 necesita ~20 ms por cuadro (para 60
+FPS hacen falta ≤ ~15 ms) y el límite es la CPU; una GPU dedicada importa para el rasterizador del GS (4–7 ms por
+cuadro en una RTX 4050 frente a 20–26 ms en una Radeon 680M).
+
+**No disponible:** resolución interna 2×–4×. El GS se emula a su 640×448 nativo sobre su VRAM entrelazada;
+sobremuestrearlo es un proyecto grande. Usa FSR para ganar nitidez.
+
+## Inicio rápido
+
+Necesitas tu propio `SCUS_973.99`, los módulos del disco (`*.IRX`) a su lado y la ISO original (llamada
+`God of War.iso`, en la carpeta superior a la del ELF, o indica su ruta con `GOW_ISO`). Lista completa:
+[`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md).
+
+### Linux
+
+```bash
+cd PS2Recomp
+cmake --build build --target ps2EntryRunner -j$(nproc)    # compila el ejecutor del juego
+cd .. && cmake -S launcher -B launcher/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C launcher/build                                    # compila el lanzador
+launcher/build/tobiichi-launcher                           # ábrelo, revisa "Archivos" y pulsa JUGAR
+```
+
+Sin el lanzador: `./run_gow.sh`. Usa la GPU por defecto del sistema; `TOBIICHI_GPU=nvidia ./run_gow.sh` fuerza la
+NVIDIA dedicada (PRIME offload).
+
+### Windows
+
+```bat
+scripts\1_instalar_herramientas.cmd   :: solo la primera vez (Git y Build Tools con winget)
+scripts\2_compilar.cmd                :: 20–40 min la primera vez
+scripts\3_ejecutar.cmd
+```
+
+## God Of War: Tobiichi Launcher
+
+`launcher/` (Qt 6 Quick, en **turco / inglés / español**) guarda tus ajustes y arranca `ps2EntryRunner` con las
+variables `TOBIICHI_*` correspondientes. Detalle: [`docs/LANZADOR.md`](docs/LANZADOR.md).
+
+| Pestaña | Qué se puede ajustar |
+|---|---|
+| **Gráficos** | Tarjeta gráfica, pantalla completa/ventana y resolución, relación de aspecto (4:3, 16:9, 16:10, 21:9 Hor+), estirar, escalado FSR / bilineal / píxel, nitidez, FXAA |
+| **Rendimiento** | Límite de FPS (30 … sin límite), VSync, contador de FPS en pantalla |
+| **Archivos** | Ejecutable del juego (verificado por CRC), ISO, ejecutor del port, carpeta de la tarjeta de memoria, detección automática |
+| **Controles** | Esquema de teclado, comportamiento de ESC, tabla de teclas |
+| **Otros** | Idioma, omitir vídeos, arranque rápido, accesos directos, registro de la última partida, restablecer, imagen de portada opcional |
+
+`tobiichi-launcher --jugar` arranca el juego directamente con los ajustes guardados (la acción "Jugar ya" de la
+entrada del menú). En el juego: **F11** alterna la pantalla completa y **F1** abre el panel de desarrollo.
 
 ## Estructura del repositorio
 
 ```
 .
-├── .github/workflows/            # CI: pruebas (pruebas.yml) y mapa de estado (estado.yml)
-├── AGENTS.md                     # Convenciones del proyecto para colaboradores y agentes
-├── config/
-│   ├── funcmap.csv               # Mapa de funciones (nombre, inicio, fin, tamaño)
-│   └── recomp.template.toml      # Configuración de PS2Recomp (@ELF@, @MAP@, @OUT@)
-├── docs/                         # Documentación técnica
-│   └── estado/                   # Datos del mapa de estado y SVG/tablas generados
-├── game/                         # Aquí va TU SCUS_973.99 (ignorado por git)
-├── patches/
-│   └── ps2recomp-*.patch         # Cambios sobre PS2Recomp @ c5a9d02, aplicados en orden
-├── scripts/
-│   ├── 1_instalar_herramientas.cmd
-│   ├── 2_compilar.cmd            # Pipeline completo de compilación
-│   ├── 2_recompilar_rapido.cmd   # Recompila solo src/gow_overrides.cpp (~1 min)
-│   ├── 3_ejecutar.cmd            # Ejecuta 60 s y guarda logs
-│   ├── 3_ejecutar_manual.cmd     # Ejecuta sin límite de tiempo
-│   ├── probar_menu.ps1           # Prueba del menú con capturas del GS
-│   ├── probar_pad2.cmd           # Compila y ejecuta la prueba de paquetes de libpad2
-│   ├── monitor.cmd               # Monitoriza CPU/RAM durante la compilación
-│   └── *.ps1                     # Lógica de los scripts
-├── src/
-│   ├── gow_overrides.cpp         # Overrides específicos del juego
-│   └── gow_pad2_packet.h         # Formato del paquete de libpad2 (probado)
-├── tests/                        # Pruebas independientes del juego y fallos conocidos de la suite
-└── tools/
-    ├── ci/                       # Ayudas de la CI (orden de parches, config, pruebas)
-    ├── extraer_capa2.ps1         # Extrae la capa 1 de una ISO DVD-9 de PS2
-    └── estado/generar.py         # Generador del mapa de estado
-```
-
-## Requisitos
-
-- Windows 10/11 x64
-- [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/downloads/) con la carga de trabajo **C++** (incluye CMake y Ninja)
-- [Git](https://git-scm.com/)
-- ~10 GB libres y 16 GB de RAM recomendados (la compilación usa todos los núcleos)
-- Una copia propia de **God of War (NTSC-U, SCUS-97399)**
-
-`scripts\1_instalar_herramientas.cmd` instala Git y las Build Tools con `winget`.
-
-## Compilar y ejecutar
-
-**1. Obtén los archivos del juego.** Copia el ejecutable de tu disco/ISO a `game\SCUS_973.99`
-(o define la variable de entorno `GOW_ELF` con su ruta).
-
-Junto al ELF deben estar también los **módulos `.IRX`** del disco (`SMPD_IOP.IRX`, `989NOMID.IRX`,
-`LIBSD.IRX`…): el emulador del IOP ejecuta los originales y `scripts\ejecutar.ps1` los copia a `IOP_MOD\`
-la primera vez. Para leer los datos del juego hace falta la **ISO original**: llámala `God of War.iso` y
-ponla en la carpeta superior a la del ELF, o indica su ruta con la variable de entorno `GOW_ISO`.
-
-Si además quieres los datos de la segunda capa del DVD:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\extraer_capa2.ps1 -Iso "D:\God of War.iso" -Salida "D:\GOW ISO extraida"
-```
-
-**2. Instala las herramientas** (solo la primera vez):
-
-```bat
-scripts\1_instalar_herramientas.cmd
-```
-
-**3. Compila** (20–40 min la primera vez):
-
-```bat
-scripts\2_compilar.cmd
-```
-
-El script clona PS2Recomp en `<unidad>:\gowport` (ruta corta para esquivar el límite de 260 caracteres;
-configurable con `GOW_WORK`), fija el commit `c5a9d02`, aplica los parches de `patches/`, genera el C++ y compila
-`ps2EntryRunner.exe`. El registro queda en `logs\2_compilar.log`.
-
-Las compilaciones Release desactivan por defecto las trazas de funciones y RPC del IOP. Para
-investigar, usa `scripts\2_compilar.cmd -Trazas`. Para medir las llamadas a `vid::Flip` del juego
-por separado del refresco de la ventana, ejecuta `powershell -File scripts\probar_rendimiento.ps1`;
-consulta [las notas del perfil](docs/ESTADO.md#medicion-de-rendimiento-2026-10-05).
-
-**4. Ejecuta:**
-
-```bat
-scripts\3_ejecutar.cmd          :: 60 segundos, salida en logs\
-scripts\3_ejecutar_manual.cmd   :: sin límite
+├── config/                       # Mapa de funciones y configuración del recompilador (incl. parche panorámico)
+├── docs/                         # Documentación técnica y mapa de estado
+├── launcher/                     # God Of War: Tobiichi Launcher (Qt 6)
+├── patches/                      # Cambios sobre PS2Recomp, aplicados en orden
+├── scripts/                      # Scripts de compilación, prueba y ejecución
+├── src/                          # Reemplazos específicos del juego
+├── tests/                        # Pruebas independientes del juego
+├── tools/                        # Generador de VU1, mapa de estado, diagnóstico
+├── PS2Recomp/                    # Runtime y recompilador (árbol de trabajo)
+└── run_gow.sh                    # Script de arranque en Linux sin el lanzador
 ```
 
 ## Cómo funciona
@@ -180,31 +151,31 @@ flowchart LR
     M[funcmap.csv] --> B
     C[recomp.template.toml] --> B
     B --> D[~6 400 archivos C++]
-    D --> E[MSVC + Ninja]
+    D --> E[CMake + Ninja]
     O[gow_overrides.cpp] --> E
-    P["PS2Recomp runtime<br/>+ patches/*.patch"] --> E
-    E --> F[ps2EntryRunner.exe]
-    I[Módulos IRX originales] --> G[Emulador del IOP<br/>R3000A]
-    ISO[God of War.iso] --> G
-    F <--> G
+    P[Runtime de PS2Recomp + parches] --> E
+    V[Microcódigo VU1 compilado a C++] --> E
+    E --> F[ps2EntryRunner]
+    I[Módulos IRX originales] --> G[Emulador del IOP R3000A]
+    G --> F
+    L[Lanzador] -->|variables TOBIICHI_*| F
 ```
-
-Más detalles en [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md).
 
 ## Documentación
 
-- [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md) — pipeline, overrides, parches del runtime e integración continua
-- [`docs/CONTROLES.md`](docs/CONTROLES.md) — controles y pruebas del mando y del menú
-- [`docs/RENDERIZADO.md`](docs/RENDERIZADO.md) — renderers CPU/CPU con hilo/OpenGL opcionales y comparaciones
-- [`AGENTS.md`](AGENTS.md) — convenciones del proyecto para colaboradores y agentes
-- [`docs/ESTADO.md`](docs/ESTADO.md) — estado actual, registro de la investigación, problemas conocidos y próximos pasos
+- [`docs/ESTADO.md`](docs/ESTADO.md) — registro de la investigación: qué se probó y con qué resultado.
+- [`docs/LANZADOR.md`](docs/LANZADOR.md) — lanzador, capa de presentación y panorámica.
+- [`docs/RENDIMIENTO.md`](docs/RENDIMIENTO.md), [`docs/RENDERIZADO.md`](docs/RENDERIZADO.md), [`docs/CONTROLES.md`](docs/CONTROLES.md), [`docs/FMV_Y_AUDIO.md`](docs/FMV_Y_AUDIO.md), [`docs/MEMORY_CARD.md`](docs/MEMORY_CARD.md), [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md).
+
+Convenciones para colaborar: [`AGENTS.md`](AGENTS.md).
 
 ## Créditos y licencia
 
 - [**PS2Recomp**](https://github.com/ran-j/PS2Recomp) de ran-j y colaboradores — recompilador y runtime (GPL-3.0).
-- [**Fork del runtime de SotC**](https://github.com/LightVelox/PS2Recomp/tree/ac9efa070638ad3b3accd284de6f898d5ab271d1) de Taylor N. Albarnaz / LightVelox — backend GS OpenGL y cola de comandos, y arreglos del EE (FPU, ramas de 64 bits, LQ/SQ, saltos finales, VU0 en modo macro y cadenas DMA largas) (GPL-3.0, `ac9efa0`).
-- *God of War* © Sony Interactive Entertainment / Santa Monica Studio. Este proyecto no está afiliado
-  ni respaldado por Sony. No se distribuye ningún contenido del juego.
+- [**Fork del runtime de SotC**](https://github.com/LightVelox/PS2Recomp/tree/ac9efa070638ad3b3accd284de6f898d5ab271d1) de Taylor N. Albarnaz / LightVelox — backend GS OpenGL, cola de comandos y arreglos del EE (GPL-3.0).
+- [**god-of-war-recomp de KIexster**](https://github.com/KIexster/god-of-war-recomp) — la tubería de recompilación de God of War y los parches de VU1/VIF sobre los que se construye este port.
+- Panorámica: basada en el parche "Widescreen 16:9" de PCSX2 para SCUS-97399, de nemesis2000 y CRASHARKI.
+- Lanzador: fuente [Cinzel](https://github.com/NDISCOVER/Cinzel) (SIL OFL 1.1, `launcher/recursos/fuentes/OFL.txt`); escalado adaptado de AMD FidelityFX Super Resolution 1.0 (MIT).
+- *God of War* © Sony Interactive Entertainment / Santa Monica Studio. Este proyecto no está afiliado ni respaldado por Sony. No se distribuye ningún contenido del juego.
 
-El código de este repositorio se publica bajo la licencia **GPL-3.0**, en coherencia con PS2Recomp.
-Ver [`LICENSE`](LICENSE).
+El código de este repositorio se publica bajo la licencia **GPL-3.0**, en coherencia con PS2Recomp. Ver [`LICENSE`](LICENSE).

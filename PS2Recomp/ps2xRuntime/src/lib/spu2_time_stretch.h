@@ -40,6 +40,7 @@ namespace ps2_audio
             m_pos = 0.0;
             m_tail.assign(kOverlap * 2u, 0.0f);
             m_haveTail = false;
+            m_natural = 0;
             m_out.clear();
             m_outRead = 0;
             m_rate = 1.0;
@@ -92,7 +93,21 @@ namespace ps2_audio
 
             const double fill = static_cast<double>(inputFrames() + pendingOutput());
             const double error = (fill - m_target) / m_target;
-            m_tempo = std::clamp(m_rate * (1.0 + 0.5 * error), kMinTempo, kMaxTempo);
+            // GOW-Port: zona muerta. Con el juego a tiempo real la entrada llega a ráfagas (cada VBlank o dos) y la
+            // tasa por llamada oscila: el tempo saltaba entre ~0,82 y ~1,28 cada 20 ms y cada segmento de 40 ms
+            // repetía o saltaba hasta un 25 % (el sonido "en bucle"/entrecortado). Si el colchón está en su margen y
+            // la llegada ronda el tiempo real, tempo exactamente 1: el segmento siguiente empieza donde acaba la
+            // cola del anterior y la búsqueda elige ese desplazamiento (salida idéntica a la entrada). Fuera del
+            // margen, o con la emulación claramente lenta, el estirado de siempre.
+            // Cerca del tiempo real y sin riesgo de vaciado, la corrección del colchón es suave (±5 %): la emulación
+            // va ~1-2 % rápida y el colchón sube despacio; antes, al pasar el margen, el tempo saltaba a ~1,7.
+            const bool realTime = std::abs(m_rate - 1.0) < 0.25;
+            if (realTime && fill > 0.5 * m_target && fill < 2.5 * m_target)
+                m_tempo = 1.0;
+            else if (realTime && fill > 0.25 * m_target)
+                m_tempo = std::clamp(1.0 + 0.05 * error, 0.95, 1.05);
+            else
+                m_tempo = std::clamp(m_rate * (1.0 + 0.5 * error), kMinTempo, kMaxTempo);
 
             size_t produced = 0;
             while (produced < frames)
@@ -117,6 +132,7 @@ namespace ps2_audio
         }
 
         [[nodiscard]] double tempo() const { return m_tempo; }
+        [[nodiscard]] unsigned starves() const { return m_starves; } // GOW-Port: GOW_AUDIO_DIAG
         [[nodiscard]] size_t target() const { return static_cast<size_t>(m_target); }
         [[nodiscard]] size_t inputFrames() const
         {
@@ -178,8 +194,13 @@ namespace ps2_audio
                 starve();
                 return false;
             }
-            const long offset = m_haveTail ? bestOffset(base, lo, hi) : 0;
+            // GOW-Port: con tempo 1 la continuación natural del segmento anterior (sin búsqueda): copia exacta.
+            const long natural = static_cast<long>(m_natural) - static_cast<long>(base);
+            const long offset = !m_haveTail ? 0
+                              : (m_tempo == 1.0 && natural >= lo && natural < hi) ? natural
+                                                                                  : bestOffset(base, lo, hi);
             const size_t start = static_cast<size_t>(static_cast<long>(base) + offset);
+            m_natural = start + (kSequence - kOverlap);
 
             m_out.resize((kSequence - kOverlap) * 2u);
             for (size_t i = 0; i < kOverlap; ++i)
@@ -217,7 +238,10 @@ namespace ps2_audio
             }
             m_haveTail = false;
             if (m_primed)
+            {
+                ++m_starves;
                 m_target = std::min(m_target * 1.5, static_cast<double>(kMaxTargetFrames));
+            }
             m_primed = false;
         }
 
@@ -230,12 +254,14 @@ namespace ps2_audio
             const size_t drop = pos - keep;
             m_in.erase(m_in.begin(), m_in.begin() + static_cast<std::ptrdiff_t>(drop * 2u));
             m_pos -= static_cast<double>(drop);
+            m_natural = m_natural > drop ? m_natural - drop : 0u;
         }
 
         std::vector<float> m_in;  // entrada estéreo intercalada
         double m_pos = 0.0;       // trama de lectura en m_in (fraccionaria)
         std::vector<float> m_tail; // últimas kOverlap tramas del segmento anterior
         bool m_haveTail = false;
+        size_t m_natural = 0; // GOW-Port: trama de entrada que continúa el último segmento
         std::vector<float> m_out; // salida lista, estéreo intercalada
         size_t m_outRead = 0;
         double m_rate = 1.0;
@@ -243,6 +269,7 @@ namespace ps2_audio
         bool m_primed = false;
         size_t m_pushed = 0;
         double m_target = static_cast<double>(kTargetFrames);
+        unsigned m_starves = 0;
     };
 }
 

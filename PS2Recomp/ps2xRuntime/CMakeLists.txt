@@ -475,6 +475,36 @@ if(NOT MSVC)
         PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
+# GOW-Port: PGO de VU1 (solo Clang). PS2X_VU1_PGO_PROFILE es un .profdata local (llvm-profdata merge) de una
+# reproducción de cuadros del juego con -fprofile-instr-generate; sale del microcódigo del juego: no se publica.
+# Medido en la reproducción de un cuadro de partida: 27,5 → 25 ms con imagen y huellas de VU1 idénticas.
+# GOW-Port: lo mismo con GCC. PS2X_VU1_GCC_PGO_DIR es una carpeta local de -fprofile-dir con los .gcda de una
+# reproducción con -fprofile-generate, colocados con la ruta absoluta de cada objeto de esta compilación (GCC busca
+# <carpeta>/<ruta del objeto sin .o>.gcda). Reproducción de un cuadro: 18,6 → 16,0 ms, huellas e imagen idénticas.
+set(PS2X_VU1_GCC_PGO_DIR "" CACHE PATH "Carpeta -fprofile-dir con perfiles .gcda de VU1 (vacío: sin PGO)")
+if(PS2X_VU1_GCC_PGO_DIR AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_property(SOURCE
+        src/lib/vu/ps2_vu1_core.cpp
+        src/lib/vu/ps2_vu1_upper.cpp
+        src/lib/vu/ps2_vu1_lower.cpp
+        ${VU1_COMPILED_SRCS}
+        APPEND PROPERTY COMPILE_OPTIONS
+        -fprofile-use -fprofile-partial-training "-fprofile-dir=${PS2X_VU1_GCC_PGO_DIR}" -Wno-missing-profile
+        -Wno-error=coverage-mismatch) # si el código cambió, esa función se compila sin PGO
+    message(STATUS "VU1 con PGO (GCC): ${PS2X_VU1_GCC_PGO_DIR}")
+endif()
+set(PS2X_VU1_PGO_PROFILE "" CACHE FILEPATH "Perfil de llvm-profdata para el código de VU1 (vacío: sin PGO)")
+if(PS2X_VU1_PGO_PROFILE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set_property(SOURCE
+        src/lib/vu/ps2_vu1_core.cpp
+        src/lib/vu/ps2_vu1_upper.cpp
+        src/lib/vu/ps2_vu1_lower.cpp
+        ${VU1_COMPILED_SRCS}
+        APPEND PROPERTY COMPILE_OPTIONS
+        "-fprofile-instr-use=${PS2X_VU1_PGO_PROFILE}" -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+    message(STATUS "VU1 con PGO: ${PS2X_VU1_PGO_PROFILE}")
+endif()
+
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 

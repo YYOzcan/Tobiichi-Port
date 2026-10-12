@@ -128,6 +128,76 @@ namespace
         void SnapshotVram(std::vector<uint8_t> &out) const override { out = r.uploaded; }
         GSTransferSnapshot GetTransferSnapshot() const override { return {}; }
     };
+    // GOW-Port: valores crudos iguales no son direcciones iguales entre FRAME y TEX0.
+    void preferredSourceDrawAddressUnits(TestCase &t)
+    {
+        struct Example { uint32_t page, block; bool preferred; };
+        for (const Example example : {Example{32u, 32u, true}, Example{32u, 1024u, false},
+                                      Example{32u, 1057u, true}, Example{0u, 0u, false}})
+        {
+            Recording recording;
+            std::vector<uint8_t> vram(GSSwizzle::kMemorySize, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.setRasterBackend(std::make_unique<Recorder>(recording));
+            gs.writeRegister(GS_REG_FRAME_2, example.page | (10ull << 16));
+            gs.writeRegister(GS_REG_SCISSOR_2, (639ull << 16) | (447ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_2, 0u);
+            gs.writeRegister(GS_REG_ALPHA_2, 0x6000000064ull);
+            gs.writeRegister(GS_REG_TEX0_2, example.block | (10ull << 14) |
+                             (10ull << 26) | (9ull << 30) | (1ull << 34));
+            gs.writeRegister(GS_REG_PRIM, uint64_t(GS_PRIM_SPRITE) |
+                             (1ull << 4) | (1ull << 6) | (1ull << 8) | (1ull << 9));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            gs.writeRegister(GS_REG_UV, 0u);
+            gs.writeRegister(GS_REG_XYZ2, 0u);
+            gs.writeRegister(GS_REG_UV, (640ull * 16) | ((448ull * 16) << 16));
+            gs.writeRegister(GS_REG_XYZ2, (640ull * 16) | ((448ull * 16) << 16));
+            const auto label = "FRAME=" + std::to_string(example.page) + " TEX0=" + std::to_string(example.block);
+            t.Equals(recording.draws.size(), size_t(1u), label + ": se envía el sprite completo");
+            GSFrameReg source{};
+            uint32_t destination = 0u;
+            const bool preferred = gs.getPreferredDisplaySource(source, destination);
+            t.Equals(preferred, example.preferred, label + ": selección por dirección física");
+            if (preferred)
+            {
+                t.Equals(destination, example.page, label + ": destino sigue en páginas");
+                t.Equals(source.fbp, example.block, label + ": fuente conserva el bloque");
+            }
+        }
+    }
+
+    // GOW-Port: distinguir la fuente sin TBW del CRTC por dirección y por un píxel conocido.
+    void preferredSourcePresentAddressUnits(TestCase &t)
+    {
+        std::vector<uint8_t> vram(GSSwizzle::kMemorySize, 0u);
+        GSCpuBackend cpu;
+        cpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+        cpu.WriteVram(GS_PSM_CT32, 32u, 10u, 0u, 0u, 0x80112233u);
+        cpu.WriteVram(GS_PSM_CT32, 1024u, 10u, 0u, 0u, 0x80665544u);
+        GSPresentationRequest request{};
+        request.pmode = 1u;
+        request.dispfb1 = 32ull | (10ull << 9);
+        request.display1 = (63ull << 32) | (63ull << 44);
+        request.hasPreferredSource = true;
+        request.preferredDestFbp = 32u;
+        struct Example { uint32_t block, width; bool preferred; uint8_t red; };
+        for (const Example example : {Example{32u, 0u, true, 0x33u},
+                                      Example{1024u, 0u, false, 0x44u},
+                                      Example{1024u, 10u, true, 0x44u}})
+        {
+            request.preferredSource = {example.block, example.width, GS_PSM_CT32, 0u};
+            const auto frame = cpu.Present(request);
+            const auto label = "TEX0=" + std::to_string(example.block) + " TBW=" + std::to_string(example.width);
+            t.IsTrue(bool(frame), label + ": hay imagen");
+            t.Equals(frame.usedPreferred, example.preferred, label + ": selección normalizada");
+            t.Equals(frame.displayFbp, 32u, label + ": CRTC conserva páginas");
+            t.Equals(frame.sourceFbp, example.preferred ? example.block : 32u, label + ": metadato de la fuente real");
+            if (!frame.pixels.empty())
+                t.Equals(frame.pixels[0], example.red, label + ": píxel de la dirección seleccionada");
+        }
+    }
+
     // GOW-Port: un pixel de 24 bits puede atravesar el limite de un quadword IMAGE.
     void transfer24Fragments(TestCase &t, GSRasterBackend &backend)
     {
@@ -518,6 +588,18 @@ namespace
             t.IsTrue(first.pixels!=next.pixels,"La presentación cambia con la fuente");
         }
         req.preferredSource.psm=GS_PSM_CT32;
+        // GOW-Port: números crudos iguales apuntan a direcciones diferentes; comprobar GPU real.
+        // GOW-Port: sin forceReadback (Linux no tiene presentación compartida: siempre lee de la GPU).
+        req.preferredSource={32,0,GS_PSM_CT32,0};
+        for(auto *backend : {static_cast<GSRasterBackend *>(&cpu),static_cast<GSRasterBackend *>(&threaded)})
+            backend->WriteVram(GS_PSM_CT32,32,10,0,0,0x80112233u);
+        const auto differentBase=comparePresentation("TBW cero conserva la fuente en otro bloque");
+        t.IsTrue(differentBase.usedPreferred,"32 páginas y 32 bloques son direcciones distintas");
+        if(!differentBase.pixels.empty())t.Equals(differentBase.pixels[0],uint8_t(0x33),"GPU lee el píxel de TEX0");
+        req.preferredSource={1024,0,GS_PSM_CT32,0};
+        const auto sameBase=comparePresentation("TBW cero y dirección igual conserva el origen CRTC");
+        t.IsFalse(sameBase.usedPreferred,"32 páginas y 1024 bloques son la misma dirección");
+        req.preferredSource={1057,2,GS_PSM_CT32,0};
         req.preferredDestFbp=31; comparePresentation("Destino distinto mantiene CRTC");
         req.preferredDestFbp=32; req.hasPreferredSource=false;
         comparePresentation("Sin fuente preferida mantiene CRTC");
@@ -564,6 +646,8 @@ namespace
 void register_ps2_gs_backend_tests()
 {
     MiniTest::Case("GOW GS backends", [](TestCase &t) {
+        t.Run("display copy compares FRAME pages with TEX0 blocks", preferredSourceDrawAddressUnits);
+        t.Run("presentation source without TBW compares physical addresses", preferredSourcePresentAddressUnits);
         t.Run("CPU drawing is independent of caller SSE rounding",[](TestCase &t) {cpuRoundingIndependent(t,false);});
         t.Run("Threaded CPU drawing is independent of producer SSE rounding",[](TestCase &t) {cpuRoundingIndependent(t,true);});
 

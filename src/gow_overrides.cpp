@@ -100,10 +100,15 @@ namespace
             !runtime->padBackend().readState(0, 0, state, sizeof(state))) { padReturn(ctx, 0xffffffffu); return; }
         if (!IsGamepadAvailable(0))
         {
-            state[6] = IsKeyDown(KEY_A) ? 0 : IsKeyDown(KEY_D) ? 255 : 128;
-            state[7] = IsKeyDown(KEY_W) ? 0 : IsKeyDown(KEY_S) ? 255 : 128;
-            state[4] = IsKeyDown(KEY_J) ? 0 : IsKeyDown(KEY_L) ? 255 : 128;
-            state[5] = IsKeyDown(KEY_I) ? 0 : IsKeyDown(KEY_K) ? 255 : 128;
+            // WASD = stick izquierdo; con Ctrl, WASD pasa al stick derecho (esquiva) y el izquierdo queda
+            // centrado. IJKL sigue moviendo el stick derecho.
+            const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+            const uint8_t x = IsKeyDown(KEY_A) ? 0 : IsKeyDown(KEY_D) ? 255 : 128;
+            const uint8_t y = IsKeyDown(KEY_W) ? 0 : IsKeyDown(KEY_S) ? 255 : 128;
+            state[6] = ctrl ? 128 : x;
+            state[7] = ctrl ? 128 : y;
+            state[4] = ctrl ? x : IsKeyDown(KEY_J) ? 0 : IsKeyDown(KEY_L) ? 255 : 128;
+            state[5] = ctrl ? y : IsKeyDown(KEY_I) ? 0 : IsKeyDown(KEY_K) ? 255 : 128;
         }
         // Opt-in smoke test: advance title/new-game prompts without host UI input.
         // Capture the GS's own presented pixels; normal play never injects input.

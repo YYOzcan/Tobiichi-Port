@@ -2485,3 +2485,256 @@ Capturas comprobadas a ojo (menú, menú de mejoras, Kratos, HUD, enemigos y efe
   parches, aquí PS2Recomp en el árbol) a tres bandas por archivo; `.kiexster-sync` guarda el punto (`a42d77f`). La
   primera fusión completa (hasta `947ebdd`, con `PS2X_VU1_HILO`/`PS2X_GS_FRENTE`) salió más lenta en esta máquina
   (16,4 cuadros/s) y se revirtió; queda guardada fuera del repositorio para incorporarla por partes, midiendo cada una.
+
+### Reproducción de VU1, parches de KIexster uno a uno, PGO y controles de teclado (10 de octubre)
+
+- **Banco de VU1.** `GOW_RENDER_DIAG=1` vuelca un cuadro de partida; `tools/render/extraer_cadena_vif.py --volcado ...
+  --inicio 0x450C00` prepara la cadena (1502 etiquetas, 1,1 MB) y `repetir_cadena_vif` la repite sin ventana, fijado a
+  un núcleo (`taskset`), con las variables de cola del GS de `run_gow.sh`. Huellas de VU1 (`GOW_REPETIR_HUELLAS`, 766
+  lanzamientos) e imagen como control de igualdad bit a bit. El perfil de esta reproducción sin la escritura final
+  del PPM (que vacía la cola del GS en cada píxel) es casi todo bloques de VU1 compilados.
+- **Parches de KIexster aplicados uno a uno** (`tools/sync/sincronizar_kiexster.py --parche`), en su orden, con
+  paridad (`vu1_compiled_test`: 60 + 2 + 38.144 casos) y banco tras cada uno: lazy-flags 34,2 → 34,0 ms;
+  fast-flags 34,1 (neutro: ya estaban los flags en línea); zero-factor 33,9; direct-store 31,4; cold-scalar 30,8;
+  simd-zero 29,5; xgkick-flush neutro; vif1-ee-timers-fast + vif1-unpack-formats 29,9 → 28,8 (con VIF1/memoria del
+  árbol); chained-steps 28,3 (con el cambio equivalente en nuestro generador). dma-iop-timers-cache solo se mide en
+  partida. block-check-cache no hace falta: nuestro despachador ya no compara palabras. Huellas e imagen idénticas a
+  las del inicio de la sesión en todos los pasos.
+- **PGO de VU1.** Clang compila VU1 algo más rápido (27,5 frente a 29,1 ms) pero el EE recompilado con Clang fue 15
+  veces más lento en partida (3,8 cuadros/s): descartado. PGO de GCC (perfil de la reproducción con
+  `-fprofile-generate`, `.gcda` colocados con la ruta de cada objeto de `build/`, opción `PS2X_VU1_GCC_PGO_DIR`):
+  18,6 → 16,0 ms en la misma tanda, igual que Clang+PGO, huellas idénticas. En partida (`scripts/linux_perf_guard.sh`,
+  ahora solo ventanas en estado 11): 21,1 cuadros/s de mediana con velocidad de juego 1,0, capturas correctas.
+- **Teclado y ratón** (`ps2_pad.cpp`, `gowPad2Read`): ver `docs/CONTROLES.md`.
+- **VIF1/VU1 en hilo propio** (`ps2recomp-vu1-thread`, `ps2recomp-gs-front-thread`, `PS2X_VU1_HILO=1`,
+  `PS2X_GS_FRENTE=1`, desactivados por defecto) incorporados para medir en partida.
+
+### Linux: VU1 con tiempos estáticos por bloque y parche fast-pairs de KIexster (10 de octubre)
+
+- **Tiempos estáticos (etapa 1 del recompilador de VU1).** `tools/vu1/generar_vu1.cpp` calcula para cada par
+  de un bloque el ciclo de emisión relativo a la entrada (mismas reglas que `readyCycleT`: latencias de
+  VF/VI/ACC y FDIV escritas dentro del bloque). Lo que el bloque lee de fuera se comprueba al entrar; lo que
+  lee el primer par se espera con `advanceTo` igual que el modelo dinámico. Si una guarda falla, o el bloque
+  usa EFU/XGKICK/WAITP, se usa la versión dinámica (`<bloque>_d`, fría). Los ciclos "listo" se escriben al
+  salir (solo el último valor de cada hueco; `flushS` para salidas a mitad de bloque). 1336 de 1360 bloques
+  con tiempos estáticos; la versión dinámica es ~5 % del hilo de VU1 en la reproducción.
+- **Parche `ps2recomp-vu1-fast-pairs` de KIexster (95e7a30)** integrado a mano (3 trozos no aplicaban):
+  escrituras de VF de 16 bytes con blend, MAC/estado por tabla, `recordViWriteForBranch` en línea y sin
+  `m_state.cycles` por par (`run()` lo fija al terminar). En GCC es neutro (su -15 % venía sobre todo del
+  despachador que MSVC no optimizaba); se mantiene por coincidir con su `main`.
+- Medido en la reproducción de un cuadro de partida (núcleo fijo, mediana de 5): 18,4 → 16,1 ms sin PGO;
+  con PGO regenerado 16,3 → 14,8 ms. Huellas de VU1 (`8c71fe9fb9754a73`), imagen (`189611644956d250`),
+  `vu1_compiled_test` (60 + 2 + 38144) y el recuento FMAC (8115 diferencias previas, ninguna nueva)
+  idénticos.
+- Probado y descartado: `commitReadyFlags` en línea en `pushFmacFlags` (más lento).
+
+### Linux: etapa 2 de VU1 (guardas) y ronda 2 de KIexster (11 de octubre)
+
+- **Guardas mínimas.** `generar_vu1` barre el decodificador con todos los códigos de operación y obtiene la
+  latencia máxima con la que algo deja listo un VF (4), un VI (4) o el FDIV (13). Un "listo" se fija como
+  emisión + latencia con la emisión anterior a la entrada del bloque, así que una guarda con límite >= L - 1 no
+  puede fallar y no se emite; tampoco las de VF0 (nunca se marca). 26 326 → 8 261 comparaciones. Los cuatro
+  componentes de un VF con el mismo límite o el mismo "listo" final se comprueban / escriben con una operación
+  de 32 bytes (`vfReady4After`, `setVfReady4`). Reproducción: 16,3 → 15,5 ms (solo guardas), huellas e imagen
+  idénticas.
+- **Cotas medidas** (incorrectas a propósito, solo para decidir): sin normalizar operandos de FMAC
+  15,6 → 14,4 ms; sin cola de flags el resultado no sirve (los saltos por flags cambian el recorrido).
+- **KIexster 353ac83** integrado: `vu1-lazy-decode` (sustituye a la decodificación incremental), PATH1 por
+  eventos (`vu1-path1-events`, también en `stepS`), FLG=3 como IMAGE en XGKICK y `gif-arbiter-buffers`.
+  Su despacho por "última variante" no se toma: el despachador de Linux ya resuelve el bloque de cada dirección
+  una vez por versión de la micromemoria.
+- Resultado en el juego (`scripts/linux_perf_guard.sh`, 150 s, mismas condiciones; binario anterior frente al
+  nuevo con PGO regenerado): VU1 30 → 20 ms por cuadro, EE 39 → 29 ms, flip mediano 23,6 → 30,8 cuadros/s;
+  capturas 6/8/10 sin personajes blancos. La reproducción (PATH1 inmediato, una sola carga de microcódigo)
+  solo mostraba 16,3 → 15,2 ms: la decodificación perezosa y PATH1 por eventos pesan más en partida.
+  Pendiente: compilar `ps2x_tests` con la prueba nueva de FLG=3.
+
+### Linux: perfil en partida, despachador compacto y normalize4 sin blendv (11 de octubre)
+
+- **Perfil en partida** (GOW_PAD_TEST + muestreo, 30 cuadros/s): hilo de VU1 66 % ocupado (~22 ms por cuadro),
+  EE 48 % (~16 ms), frente GS 13 %. Para 60 cuadros/s ambos deben bajar de 16,7 ms. En el EE, ~18 % de su tiempo
+  ocupado es `accountCycles` (el IOP/SPU2 y los temporizadores puestos al día tras cada espera) y otro ~23 % el
+  IOP/SPU2: candidato a un hilo propio.
+- **Despachador:** entrada de resolución de 32 bytes (dos por línea de caché) con el primer bloque y el par a
+  mano; los demás bloques que coinciden van aparte. Reproducción 15,3 → 15,1 ms.
+- **PATH1:** dentro del cuerpo de una GIFtag los qwords que alcanza el crédito se copian de una vez (tramos
+  contiguos; el último de la etiqueta sigue por el camino de siempre). Huellas iguales con XGKICK inmediato y
+  ciclo a ciclo (`7b38ffbbc80e3eb4`). Neutro en la reproducción; en partida `xgkickCopy` era ~2,6 % del hilo.
+- **normalize4 sin blendv:** con a = |bits|, `min(a, 0x7F7FFFFF) & (a > 0x007FFFFF)` y el signo: 6 operaciones
+  simples. Comprobado igual en los 2^32 patrones. 15,15 → 14,9 ms.
+- **Probado y retirado:** saltar la normalización de operandos que una FMAC del mismo bloque dejó normalizados
+  (parámetro Known de `upperT`). La ruta escalar puede dejar un subnormal en un caso extremo (cancelación en
+  MADD sin FTZ), así que hace falta una comprobación en tiempo de ejecución, y esa comprobación se come la
+  ganancia (15,2 → 15,3 ms con ella; 14,8 sin ella, que no sería exacto). Queda la prueba nueva de
+  `tests/vu1_compiled_test.cpp` (FMAC escalar con producto que desborda y lectura en el mismo bloque).
+- **ITOF/FTOI/ABS con SSE** (`upperT`): los cuatro carriles a la vez. El escalado es por potencias de dos
+  (exacto salvo desbordar), `cvt` usa el redondeo del MXCSR como `static_cast` y `cvttps` da INT_MIN fuera de
+  rango; el lado positivo se corrige a INT_MAX. Comprobado contra `vu1c::floatToInt` y el ITOF escalar en
+  160 M casos (límites y aleatorios) con redondeo al más cercano y hacia cero: 0 diferencias. Reproducción
+  15,05 → 14,43 ms, huellas e imagen idénticas.
+
+### Linux: ronda 3 de KIexster y el flag O con redondeo hacia cero (11 de octubre, tarde)
+
+- **KIexster a279888 (ronda 3 de VU1)** integrado en parte: `vu1-static-stores` (VF0/VI0 solo si el par puede
+  escribirlos; también en `stepS`; la lista `lowerInline` coincide con la cadena de `lowerT`, comprobado caso a
+  caso), `vu1-lower-specials`, `vu1-advance-events` (en el `advanceTo` de Linux, solo la rama con PATH1 activo) y
+  `vif1-unpack-mask-sse`, más su programa de 936 casos en `tests/vu1_compiled_test.cpp` (en 0x1000; las pruebas
+  de VF0 y de FMAC escalar pasan a 0x1200 y 0x1300). No se toman `vu1-simd-specials` ni `vu1-xgkick-bulk`
+  (Linux ya tenía su equivalente) ni su despacho por "último bloque" (el de Linux resuelve por versión).
+  `gs-source-address` integrado. `ee-cop0-count` no: cambia la traducción del EE (`cop0_translator`) y haría
+  falta regenerar el código del juego.
+- **Flag O en Linux:** `run()` pone redondeo hacia cero con `fesetround`; en Linux eso también cambia el MXCSR, y
+  un producto o suma que desborda da el máximo finito (exponente 0xFE), no Inf. El camino rápido del intérprete
+  (`normalizeFmacResult`) solo excluía el exponente 0xFF y perdía el flag O; el código compilado ya excluía 0xFE.
+  Con `exp < 0xFE` en el intérprete, las diferencias FMAC intérprete/compilado bajan de 8115 a 80 y la prueba de
+  especiales (que tenía un MUL que desborda) pasa. Las 80 restantes son OPMSUB/MADD/MSUB con operandos Inf/máximo
+  cuyo producto desborda: el intérprete satura la suma exacta y el compilado no; quedan anotadas.
+  `productSumFlagsFast` excluye también ep > 0xFD como el camino SSE.
+- Reproducción: 14,4 → 13,9 ms con la ronda 3; huellas iguales en los dos modos de XGKICK.
+- Las herramientas de medida (reproducción, huellas, pruebas, generador, perfiles) están ahora en
+  `logs/herramientas/` (no se publica; `logs/` está en `.gitignore`).
+
+### Linux: 30 cuadros/s por ciclos del EE, GPU llena y ventana a 6 cuadros/s (11 de octubre, noche)
+
+- **Ventana a 6-10 cuadros/s con el juego a 50-60:** `latchHostPresentationFrame` hacía Flush + Sync + Present con
+  `RunOnWorker` en cada VSync y esperaba a que el hilo del GS vaciara su cola. Nuevo buzón de presentación
+  (`PS2X_GS_PRESENT_BUZON=1`, por defecto en `run_gow.sh`; sin contexto GL compartido): Present y Sync se encolan
+  en orden, el hilo del GS deja el cuadro en el buzón y el hilo principal muestra el último sin esperar.
+- **`GOW_FRAME_DIAG=1`:** por cuadro del juego, ciclos emulados, VBlanks, espera de ritmo y ciclos de alcance.
+  En partida: ~10 M ciclos y 2 VBlanks por cuadro (VBlank = 4,92 M) con el EE esperando al reloj ~540 ms/s: el
+  juego iba a 30 por la cuenta de ciclos (32 por vuelta de bucle, 8 por llamada), no por el host.
+- **`GOW_EE_CICLOS` (por ciento, 50 en `run_gow.sh`):** escala los ciclos que cobra el código del juego (el "EE
+  cycle rate" de PCSX2). Con el VBlank al reloj real la velocidad del juego queda en 1,00 (`GOW_DELTA_DIAG`).
+  Medido al 50 %: 30 → 38-43 cuadros/s en partida, 1,4-1,6 VBlanks por cuadro.
+- **La GPU (Radeon 680M) queda al 100 %:** el rasterizado por hardware necesita
+  `GL_ARB_fragment_shader_interlock`, que radeonsi no ofrece, así que en AMD/Mesa todo va por el rasterizador de
+  cómputo: 10-13 ms de GPU por cuadro (`PS2X_GS_GPU_PROF`), 60-200 dispatches y tiles con hasta ~1800 primitivas.
+  Con la GPU llena el hilo del GS iba decenas de ms por delante (esperas del anillo de 30-90 ms) y el intercambio
+  de la ventana esperaba detrás.
+- Cambios (sin medir todavía):
+  - Tiles de 8x8 en el rasterizador de cómputo (`PS2X_GS_TILE=16` vuelve a 16x16): cada pixel recorre solo las
+    primitivas que tocan su tile de 8x8 y los tiles muy cargados se reparten en cuatro. Mismo orden por pixel. El
+    dispatch se parte en trozos de 65535 grupos (`uRaster.y` = primer tile).
+  - Como mucho 2 presentaciones de trabajo pendiente en la GPU (`PS2X_GS_GPU_CUADROS`, 0 desactiva): el hilo del
+    GS espera la valla de hace dos presentaciones (100 ms como mucho).
+
+### Linux: RTX 4050, sonido "en bucle" y límite de ventana a 120 (12 de octubre, madrugada)
+
+- **GPU dedicada:** con el portátil en modo híbrido `run_gow.sh` usa la NVIDIA (PRIME offload) si `nvidia-smi`
+  responde (`TOBIICHI_GPU=integrada` para la AMD). La NVIDIA tiene `GL_ARB_fragment_shader_interlock`. En partida el
+  rasterizado cuesta 4-7 ms de GPU por cuadro del juego (en la 680M 20-26 ms): la GPU deja de limitar.
+  - Corrección (12 de octubre, mañana): la NVIDIA ya no es la opción por defecto. `run_gow.sh` usa la GPU del
+    sistema (la integrada AMD, rasterizador de cómputo puro) y `TOBIICHI_GPU=nvidia` activa el PRIME offload.
+- **Sonido "en bucle":** con `GOW_AUDIO_DIAG=1` (nuevo; tramas llegadas/sacadas, tempo, colchón, vaciados por
+  segundo) se vio que el estirado no se vaciaba nunca pero su tempo oscilaba entre ~0,82 y ~1,28 cada 20 ms: la
+  entrada llega a ráfagas y cada segmento de 40 ms repetía o saltaba hasta un 25 %. Dos causas y sus arreglos:
+  - `TimeStretch::pull`: zona muerta. Cerca del tiempo real y con el colchón en 0,5-2,5 veces el objetivo, tempo
+    exactamente 1 y el segmento siguiente es la continuación natural (sin búsqueda): la salida es la entrada.
+    Fuera del margen, corrección suave (±5 %); el estirado fuerte solo si la emulación va lenta o falta poco
+    para vaciarse. Prueba nueva en `ps2_spu2_tests.cpp` (rampa a ráfagas: sin muestras repetidas ni saltadas;
+    falla con el código anterior).
+  - Reloj del IOP ~2 % por delante del EE: `runCycles` avanzaba "posición actual + ciclos" y lo que el IOP corre
+    durante una RPC del EE (`runReadyThreads`, `waitOutsideThread`) y el exceso de cada tramo de CPU nunca se
+    descontaba (el SPU2 daba ~49.100 muestras/s). `IopEmulator::runEeCycles` lleva ahora la cuenta de ciclos
+    concedidos por el EE y devuelve el adelanto (deuda máxima 1/30 s; `GOW_IOP_RITMO=0` lo desactiva).
+  - Además el salto ocioso del IOP se limita a 32 muestras del SPU2 (`GOW_SPU2_PASO`) para que su IRQ (rellenado
+    del búfer de streaming del driver de sonido) no llegue con hasta un VBlank de retraso.
+  - Resultado en partida: llegada 48.097 muestras/s, tempo exactamente 1,00 en 145 de 146 segundos, sin vaciados.
+- **Ventana a 120 cuadros/s** (`TOBIICHI_VENTANA_FPS`, 120 por defecto): la pantalla del portátil es de 144 Hz.
+- **Compilación:** el `.ninja_deps` se había corrompido (dos compilaciones a la vez) y cada cambio recompilaba los
+  937 objetos (~17 min); tras `ninja -t recompact` y una compilación completa, un cambio de un archivo tarda ~9 s.
+- Suite `ps2x_tests`: 562 pasan; fallan las 3 de siempre (UV/STQ de triángulos en CPU, división/raíz del FPU con
+  MXCSR hacia cero). Se quitó `forceReadback` de una prueba de `gs-source-address` (no existe en Linux).
+- **Dónde está el límite de cuadros (NVIDIA):** en partida el EE termina su trabajo y espera (sondeando) a que
+  VU1/GS acaben el cuadro; con `GOW_EE_CICLOS` al 50 % los ciclos por cuadro siguen en ~9,8 M (2 VBlanks), así que
+  no es trabajo del EE sino la espera. El hilo de VU1 (VIF1 + VU1) tarda ~16-27 ms por cuadro según la escena:
+  por debajo de 16,7 ms el juego pasa de 30 a 60.
+- **VIF1 UNPACK:** sin división por vector para la posición en el ciclo (CL/WL contados a mano, en el camino rápido
+  y en el de máscara SSE) y lectura de 16 bytes de una vez en el de máscara cuando cabe en el paquete (antes un
+  `memcpy` de tamaño variable por vector, una llamada a libc). En partida VIF1 pasó de ~12 % a ~3 % del hilo de VU1.
+  Reproducción 13,9 → 13,4 ms.
+- **Pares "libres de PC" en los bloques estáticos:** un par intermedio con las dos instrucciones en línea no escribe
+  `m_state.pc` (el último par del bloque nunca lo es; si el bloque se para antes, la salida lo escribe) ni mira
+  `programEnded`, y el borrado de la copia de VI para saltos se decide al generar (idea de KIexster). 13,4 → 12,8 ms.
+- **`commitReadyPipelines`:** el camino rápido (solo flags) cubre también un FDIV pendiente (uno por vértice en la
+  perspectiva), con el mismo orden y el mismo siguiente ciclo que el camino general. 12,8 → 12,6 ms.
+- Huellas (`8c71fe9fb9754a73` / `7b38ffbbc80e3eb4`), imagen, pruebas de VU1 compilada (incluidos los 936 especiales)
+  y recuento FMAC (80) iguales en cada paso. PGO regenerado.
+- **Saltos IBxx:** `readBranchVi` (en `ps2_vu1_core.cpp`, una llamada por salto de bucle) en línea dentro de `lowerT`, y
+  la máscara de la micromemoria como constante de VU1 (el código compilado solo corre en VU1). 12,6 → 12,3 ms.
+- **Probado y descartado esta noche:** bucles de un bloque sobre sí mismo sin pasar por `run()` (199 bloques, exactos,
+  sin ganancia medible: la llamada indirecta se predice bien); MAC/estado/CLIP en variables locales en
+  `commitReadyFlags` (algo más lento). Cota: quitando del todo las llamadas frías de cada par (commit, PATH1, ruta
+  escalar; resultado incorrecto) la reproducción baja solo un 12 %: no compensa reestructurar los bloques con
+  salidas a la versión dinámica.
+- **Resultado en partida** (`logs/herramientas/prueba_partida.sh`, NVIDIA, perfil de energía "balanced"): mediana
+  de cuadros del juego 30 → ~55; gran parte de la partida a 54-60; las escenas más pesadas siguen a 30 (VU1 ~26 ms
+  por cuadro allí). Ventana a 120, velocidad del juego 1,00-1,03, sonido sin estirar.
+- **Dónde se va el tiempo en una escena pesada (30 cuadros/s):** el hilo de VU1 está ocupado ~76 % (~25 ms por
+  cuadro; 78 % de eso es código compilado) y el resto espera datos del EE: `GOW_VU1_SYNC_DIAG=1` da 0 esperas del
+  EE por VU1, así que no hay serialización EE↔VU1. Contadores de hardware (`logs/herramientas/contadores`, con
+  `perf_event_open`, sin la herramienta perf): IPC ~3,1 y 0,5 % de saltos fallados; el coste lo pone el número de
+  instrucciones (~90 por par en un bloque FMAC). 60 cuadros/s ahí piden ~1,5 veces más velocidad de VU1.
+- **FMAC (camino rápido), todo bit a bit igual:**
+  - MADD/MSUB: primera criba barata (rango del resultado y del producto, factor cero); la de factor ±1 y
+    cancelación exacta solo se calcula si algún carril no pasa.
+  - Rangos de exponente sobre `|bits|` con una suma y una comparación con signo; factor cero con `cmpeq_ps`.
+  - Con flags muertos y estado sin leer, los bits pegajosos S/Z salen de un `movemask` cada uno.
+  - `m_currentUpperInstruction` solo se escribe en la ruta escalar (es la única que lo lee).
+  - Sin `normalize4` sobre ACC, Q e I: en VU1 solo los escriben resultados ya normalizados (FMAC, `queueQ`, LOI).
+    El recuento FMAC con valores aleatorios en ACC/Q/I da más diferencias (valores imposibles en hardware); con
+    `FMAC_ACC_NORMAL=1` (ACC/Q/I normalizados) sigue en 80, igual que antes del cambio.
+  - CLIP: las seis comparaciones con dos `cmpgt` y una tabla, y `queueClip`/`pushFlagEntry` en línea; los
+    lectores de flags (FCAND, FMEQ, FMAND, FCGET) no llaman a `commitReadyFlags` si la cabeza de la cola no está
+    lista.
+  - DIV: `normalizeResult` y `queueQ` en línea (dos llamadas por DIV).
+  - Sin escribir `m_currentUpperInstruction` en NOP ni en los especiales.
+  - Reproducción 12,35 → ~10,9 ms; instrucciones −8,8 %, ciclos −10,5 %. En la noche entera, 13,9 → ~10,9 ms.
+- **Probado sin ganancia:** fijar los hilos (VU1, EE, frente del GS, GS) a núcleos físicos distintos con `taskset`
+  (el planificador casi nunca junta VU1 con otro hilo ocupado en el mismo núcleo: 2 de 75 muestras).
+- **Probado sin ganancia:** `-O2` en el código de VU1 (texto −3 %, +1 % de ciclos, más fallos de L1i); escribir el
+  estado pegajoso y la copia de VI para saltos solo si cambian (+4 % de ciclos con las mismas instrucciones). Las
+  diferencias de ±4 % entre compilaciones sin PGO pueden ser de colocación del código: para cambios pequeños, mirar
+  instrucciones y ciclos (`contadores`) además del tiempo.
+- **Cola de flags (para decidir el siguiente paso):** en la reproducción, de 14,7 M pares el 53 % son FMAC del
+  camino rápido, el 30 % con flags muertos y estado sin leer (solo bits pegajosos), el 21 % encola flags de FMAC y el
+  2,4 % de CLIP: ~0,24 entradas por par, ~27 instrucciones cada una (encolar y confirmar), ~7 % del tiempo de VU1.
+  Una cola de flags estática en los bloques ganaría como mucho ~5 %. No sirve quitar la cola para medir una cota:
+  los flags (CLIP/FCAND) deciden saltos del microprograma y el trabajo cambia.
+- **Estado al final de la noche:** binario instalado = PGO de esta versión (copia en
+  `~/.cache/tobiichi-sync/ps2EntryRunner.final_10120432`). En partida: imagen correcta, sonido a tempo 1,00, velocidad
+  1,00, ventana 120; 60 cuadros/s en escenas ligeras y medias, 30-34 en las más pesadas (VU1 ~19-21 ms por cuadro;
+  para 60 hacen falta ≤ ~15 ms).
+
+### Lanzador "God Of War: Tobiichi Launcher" y pantalla panorámica (12 de octubre, mañana)
+
+- **GPU por defecto:** `run_gow.sh` ya no elige la NVIDIA sola (ver la corrección de arriba).
+- **Lanzador** (`launcher/`, Qt 6 Quick, turco/inglés/español): tarjeta gráfica, modo de pantalla y resolución,
+  aspecto (panorámica Hor+), escalado (FSR 1.0 / bilineal / píxel, FXAA, nitidez), límite de FPS, VSync,
+  contador, rutas del juego con comprobación (CRC del ELF, ISO o archivos extraídos, ejecutor), controles y
+  opciones. Arranca `ps2EntryRunner` con las variables `TOBIICHI_*`; detalle en [`LANZADOR.md`](LANZADOR.md).
+- **Runtime (sin las variables nuevas todo queda igual):**
+  - pantalla completa con el modo de vídeo actual (`ToggleBorderlessWindowed` dejaba la ventana en 922x1074 con
+    KWin/XWayland);
+  - proporción configurable y escalado AMD FSR 1.0 (EASU + RCAS) / FXAA en el hilo principal;
+  - contador de FPS en la imagen;
+  - título, icono y Escape configurables;
+  - panel F1 oculto con `TOBIICHI_PANEL=0`;
+  - capturas de la ventana para pruebas (`TOBIICHI_CAPTURAS`).
+- **Panorámica:** parche "Widescreen 16:9" de PCSX2 (nemesis2000 y CRASHARKI) aplicado al recompilar
+  (`config/recomp.template.toml`: `sub_00169238` y 0x21E4F0, con F y el indicador de vídeo leídos de 0x7F00/0x7F04).
+  El runtime escribe esas palabras en cada VBlank (`gowPanoramicoVBlank`). Sin `TOBIICHI_PANORAMICO`, F × aspecto =
+  1,0 exacto (0,75 × 4/3 y 0,5625 × 16/9 dan `0x3F800000`), así que la proyección es la del original bit a bit.
+  - El template reproduce exactamente `generated2` (6418 archivos, 0 diferencias). Copia de los tres archivos
+    anteriores en `~/.cache/tobiichi-sync/generated2_antes_panoramico/`.
+- **Verificado** (Radeon 680M, 1920x1200), `logs/perf_lanzador2`, 150 s con las variables del lanzador:
+  - guarda de imagen OK;
+  - velocidad 1,00;
+  - ventana 105-120;
+  - juego 60 en menús y 30 en partida (la integrada al 90-100 %);
+  - sonido a tempo 1,00;
+  - capturas 1920x1200 en 16:10 con personajes en proporción (Hor+) y HUD estirado.
+
+  El lanzador de punta a punta (`--jugar`) encontró los archivos y arrancó el juego a pantalla completa.
+- **No hecho:** resolución interna 2×-4×. El GS se emula a su resolución sobre la VRAM entrelazada; haría falta
+  una VRAM supermuestreada (como paraLLEl-GS), y el rasterizado costaría ~4× a 2×.

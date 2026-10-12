@@ -151,12 +151,60 @@ def arbol_ps2recomp(commit: str) -> str:
     return git("rev-parse", "HEAD", cwd=repo).stdout.strip()
 
 
+def arbol_prefijo(commit: str, n: int) -> str:
+    """Árbol de PS2Recomp con los n primeros parches de `commit` (en el orden de compilar.ps1)."""
+    repo = CACHE / "PS2Recomp"
+    if not (repo / ".git").exists():
+        arbol_ps2recomp(commit)
+    etiqueta = f"kiexster-{commit[:12]}-p{n}"
+    if git("rev-parse", "-q", "--verify", f"refs/tags/{etiqueta}", cwd=repo, check=False).returncode == 0:
+        return git("rev-parse", f"{etiqueta}^{{commit}}", cwd=repo).stdout.strip()
+    git("checkout", "-qf", commit_fijado(commit), cwd=repo)
+    git("clean", "-fdqx", cwd=repo)
+    with tempfile.TemporaryDirectory() as tmp:
+        for ruta in lista_parches(commit)[:n]:
+            q = Path(tmp) / Path(ruta).name
+            q.write_bytes(show(commit, ruta))
+            r = git("apply", "--ignore-whitespace", str(q), cwd=repo, check=False)
+            if r.returncode != 0:
+                raise SystemExit(f"{ruta} no se aplica: {r.stderr.strip()}")
+    git("add", "-A", cwd=repo)
+    git("-c", "user.name=sync", "-c", "user.email=sync@localhost", "commit", "-qm", etiqueta, "--allow-empty", cwd=repo)
+    git("tag", "-f", etiqueta, cwd=repo)
+    return git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+
+
+def aplicar_parche(nombre: str, rama: str, simular: bool) -> int:
+    """Fusiona solo el efecto de un parche de kiexster (su diferencia en el árbol de PS2Recomp)."""
+    nuevo = git("rev-parse", f"{REMOTO}/{rama}").stdout.strip()
+    lista = lista_parches(nuevo)
+    indices = [i for i, r in enumerate(lista) if Path(r).name in (nombre, f"ps2recomp-{nombre}.patch")]
+    if not indices:
+        raise SystemExit(f"{nombre}: no está en scripts/compilar.ps1 de {REMOTO}/{rama}")
+    i = indices[0]
+    antes, despues = arbol_prefijo(nuevo, i), arbol_prefijo(nuevo, i + 1)
+    repo = CACHE / "PS2Recomp"
+    informe = {k: [] for k in ("actualizados", "fusionados", "nuevos", "borrados", "conflictos")}
+    for linea in git("diff", "--name-only", "--no-renames", antes, despues, cwd=repo).stdout.splitlines():
+        fusionar(RAIZ / "PS2Recomp" / linea, show(antes, linea, repo), show(despues, linea, repo),
+                 simular, informe, "PS2Recomp/" + linea)
+    print(f"{lista[i]} (#{i}):")
+    for k, v in informe.items():
+        if v:
+            print(f"{k}: " + ", ".join(v))
+    return 1 if informe["conflictos"] else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rama", default="main")
     ap.add_argument("--simular", action="store_true", help="solo informa; no cambia ningún archivo")
     ap.add_argument("--marcar", action="store_true", help="registra kiexster/<rama> como sincronizado")
+    ap.add_argument("--parche", help="fusiona solo ese parche de kiexster (p. ej. vu1-simd-zero); no toca .kiexster-sync")
     a = ap.parse_args()
+    if a.parche:
+        git("fetch", "-q", REMOTO)
+        return aplicar_parche(a.parche, a.rama, a.simular)
 
     if git("remote", "get-url", REMOTO, check=False).returncode != 0:
         git("remote", "add", REMOTO, URL)

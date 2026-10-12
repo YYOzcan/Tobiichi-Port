@@ -40,11 +40,18 @@ for n in (6, 8, 10):
     white = frac(p, lambda r, g, b: r > 215 and g > 215 and b > 215)
     print(f"captura {n} white={white:.3f}")
     ok &= white < 0.02
-# Ventanas de 5 s desde t >= 60 s (partida). Mediana: las cargas/escenas sin VU dan picos de ~50 cuadros/s.
+# Ventanas de 5 s en partida desde t >= 30 s. Mediana: las cargas/escenas sin VU dan picos de ~50 cuadros/s.
 def field(line, key):
     return float(re.search(key + r'=([0-9.]+)', line).group(1))
-rows = [l for l in open(os.path.join(out, 'err.log'), errors='replace')
-        if l.startswith('[gow-perf]') and field(l, 't') >= 60.0]
+# Solo ventanas en partida (estado 11 del último informe de GOW_PAD_TEST): con el juego a tiempo real la prueba
+# puede abrir menús (estado 13, menú de mejoras) que van a 60 cuadros/s y no dicen nada de la partida.
+rows, state = [], None
+for l in open(os.path.join(out, 'err.log'), errors='replace'):
+    m = re.search(r'\[gow-pad2:test\] state=(\d+)', l)
+    if m:
+        state = int(m.group(1))
+    elif l.startswith('[gow-perf]') and field(l, 't') >= 30.0 and state == 11:
+        rows.append(l)
 def median(key):
     vals = sorted(field(l, key) for l in rows)
     return vals[len(vals) // 2] if vals else 0.0

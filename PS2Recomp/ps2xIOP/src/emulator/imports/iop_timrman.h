@@ -60,8 +60,15 @@ namespace ps2x::iop::detail
         static void schedule(Timer &timer, uint64_t currentCycle) noexcept;
         static void stop(Timer &timer, uint64_t currentCycle) noexcept;
 
+        // GOW-Port: el primer compareCycle/overflowCycle de los temporizadores. serviceDue corre en cada
+        // porción del IOP (millones de veces por segundo) y casi nunca hay nada vencido. Se recalcula tras
+        // cualquier cambio (importaciones, servicio, reset).
+        [[nodiscard]] uint64_t earliestEventCycle() const noexcept;
+
         std::array<Timer, 6> m_timers{};
         uint32_t m_holdMode = 0u;
         bool m_servicing = false;
+        mutable uint64_t m_earliestEvent = 0u;
+        mutable bool m_earliestValid = false;
     };
 }

@@ -29,6 +29,9 @@
 #include <unordered_map>
 #include <sstream>
 #include <cstdlib>
+#include <cmath>
+#include <cstdio>
+#include "rlgl.h" // GOW-Port: rlGetShaderIdDefault (sombreadores de presentación)
 
 #if !defined(PLATFORM_VITA)
 namespace
@@ -42,6 +45,7 @@ namespace
     // GOW-Port: estirado temporal (spu2_time_stretch.h): si la emulación va más lenta que el tiempo real, el
     // sonido se alarga sin cambiar el tono en vez de cortarse. GOW_AUDIO_STRETCH=0 vuelve a la salida directa.
     ps2_audio::TimeStretch g_spu2Stretch;
+    std::atomic<uint64_t> g_spu2DiagArrived{0}; // GOW-Port: GOW_AUDIO_DIAG
     const bool g_spu2StretchEnabled = [] {
         const char *setting = std::getenv("GOW_AUDIO_STRETCH");
         return !(setting && setting[0] == '0');
@@ -58,9 +62,41 @@ namespace
                 int16_t chunk[2048u * 2u];
                 size_t drained = 0u;
                 while ((drained = source->drainAudio(chunk, 2048u)) != 0u)
+                {
                     g_spu2Stretch.push(chunk, drained);
+                    g_spu2DiagArrived.fetch_add(drained, std::memory_order_relaxed);
+                }
             }
             g_spu2Stretch.pull(out, frames);
+            // GOW-Port: GOW_AUDIO_DIAG=1: cada segundo, tramas llegadas/sacadas, tempo, colchón y vaciados.
+            static const bool diag = [] { const char *v = std::getenv("GOW_AUDIO_DIAG"); return v && v[0] == '1'; }();
+            if (diag)
+            {
+                static uint64_t pulled = 0;
+                static double tempoMin = 10.0, tempoMax = 0.0, tempoSum = 0.0;
+                static unsigned calls = 0, lastStarves = 0;
+                static auto window = std::chrono::steady_clock::now();
+                pulled += frames;
+                const double t = g_spu2Stretch.tempo();
+                tempoMin = std::min(tempoMin, t);
+                tempoMax = std::max(tempoMax, t);
+                tempoSum += t;
+                ++calls;
+                const auto now = std::chrono::steady_clock::now();
+                const double wall = std::chrono::duration<double>(now - window).count();
+                if (wall >= 1.0)
+                {
+                    std::fprintf(stderr, "[gow-audio] salida=%.0f/s llegada=%.0f/s tempo=%.2f..%.2f (media %.2f) colchon=%zu objetivo=%zu vaciados=%u\n",
+                                 pulled / wall, g_spu2DiagArrived.exchange(0) / wall, tempoMin, tempoMax, tempoSum / calls,
+                                 g_spu2Stretch.inputFrames(), g_spu2Stretch.target(), g_spu2Stretch.starves() - lastStarves);
+                    lastStarves = g_spu2Stretch.starves();
+                    pulled = 0;
+                    tempoMin = 10.0;
+                    tempoMax = tempoSum = 0.0;
+                    calls = 0;
+                    window = now;
+                }
+            }
             return;
         }
         size_t produced = 0u;
@@ -167,6 +203,535 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
 static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
 #endif
+
+float gowAspectoPanoramico(); // GOW-Port: Kernel/EeScheduler.cpp (0 = sin TOBIICHI_PANORAMICO)
+
+// GOW-Port: ventana y presentación configurables (God of War: Tobiichi Launcher). Sin estas variables todo
+// queda como antes.
+//   TOBIICHI_ANCHO / TOBIICHI_ALTO: tamaño inicial de la ventana. TOBIICHI_PANTALLA=completa: pantalla completa
+//     sin bordes (F11 alterna). TOBIICHI_VSYNC=1: sincronía vertical. TOBIICHI_TITULO, TOBIICHI_ICONO (PNG).
+//     TOBIICHI_ESC_SALIR=0: Escape no cierra la ventana (es el círculo del mando con el teclado clásico).
+//   TOBIICHI_ASPECTO: "auto" (4:3; el aspecto de TOBIICHI_PANORAMICO; 16:9 con el modo panorámico del propio
+//     juego), "4:3", "16:9"... o "estirar". Sin la variable, la proporción de píxeles del GS (640x448).
+//   TOBIICHI_FILTRO: "fsr" (AMD FidelityFX Super Resolution 1.0: EASU + RCAS), "bilineal" o "pixel" (vecino más
+//     cercano, el de antes). TOBIICHI_NITIDEZ: RCAS en pasos (0 = máxima, 2 = suave; 0,25 por defecto).
+//   TOBIICHI_FXAA=1: suavizado de bordes a la resolución del juego antes de escalar.
+//   TOBIICHI_FPS_GOSTER=1: cuadros por segundo del juego (GOW_PERF_FRAME_PC) y de la ventana en una esquina.
+namespace
+{
+namespace presentacion
+{
+    bool envFlag(const char *name, bool fallback)
+    {
+        const char *value = std::getenv(name);
+        if (!value || !*value)
+            return fallback;
+        return value[0] == '1';
+    }
+
+    long envLong(const char *name, long fallback, long low, long high)
+    {
+        const char *value = std::getenv(name);
+        if (!value || !*value)
+            return fallback;
+        return std::clamp(std::strtol(value, nullptr, 10), low, high);
+    }
+
+    struct Ventana
+    {
+        int width = HOST_WINDOW_WIDTH;
+        int height = HOST_WINDOW_HEIGHT;
+        bool fullscreen = false;
+        bool vsync = false;
+        bool escExits = true;
+    };
+
+    Ventana ventana()
+    {
+        Ventana v;
+        v.width = static_cast<int>(envLong("TOBIICHI_ANCHO", v.width, 320, 7680));
+        v.height = static_cast<int>(envLong("TOBIICHI_ALTO", v.height, 224, 4320));
+        const char *mode = std::getenv("TOBIICHI_PANTALLA");
+        v.fullscreen = mode && std::strcmp(mode, "completa") == 0;
+        v.vsync = envFlag("TOBIICHI_VSYNC", false);
+        v.escExits = envFlag("TOBIICHI_ESC_SALIR", true);
+        return v;
+    }
+
+    enum class Filtro { Pixel, Bilineal, Fsr };
+
+    struct Config
+    {
+        Filtro filtro = Filtro::Pixel;
+        bool fxaa = false;
+        bool fps = false;
+        float sharpness = 1.0f; // exp2(-pasos), como FsrRcasCon
+        bool legacyAspect = true;
+        bool stretch = false;
+        float fixedAspect = 0.0f; // 0 = auto
+    };
+
+    float parseAspect(const char *value)
+    {
+        float width = 0.0f, height = 0.0f;
+        if (std::sscanf(value, "%f:%f", &width, &height) == 2 && width > 0.0f && height > 0.0f)
+            return width / height;
+        const float aspect = std::strtof(value, nullptr);
+        return aspect >= 0.5f && aspect <= 4.0f ? aspect : 0.0f;
+    }
+
+    const Config &config()
+    {
+        static const Config c = []
+        {
+            Config out;
+            if (const char *filter = std::getenv("TOBIICHI_FILTRO"))
+            {
+                if (std::strcmp(filter, "fsr") == 0)
+                    out.filtro = Filtro::Fsr;
+                else if (std::strcmp(filter, "bilineal") == 0)
+                    out.filtro = Filtro::Bilineal;
+            }
+            out.fxaa = envFlag("TOBIICHI_FXAA", false);
+            out.fps = envFlag("TOBIICHI_FPS_GOSTER", false);
+            if (const char *stops = std::getenv("TOBIICHI_NITIDEZ"); stops && *stops)
+                out.sharpness = std::exp2(-std::clamp(std::strtof(stops, nullptr), 0.0f, 2.0f));
+            else
+                out.sharpness = std::exp2(-0.25f);
+            if (const char *aspect = std::getenv("TOBIICHI_ASPECTO"); aspect && *aspect)
+            {
+                out.legacyAspect = false;
+                if (std::strcmp(aspect, "estirar") == 0)
+                    out.stretch = true;
+                else if (std::strcmp(aspect, "auto") != 0)
+                    out.fixedAspect = parseAspect(aspect);
+            }
+            return out;
+        }();
+        return c;
+    }
+
+#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
+    // Cabecera común: sombreador de vértices por defecto de raylib (fragTexCoord). "fuente" = zona válida de la
+    // textura de entrada en texeles (la del cuadro mide 640x512 y el GS suele llenar 640x448).
+    constexpr const char *kHeader = R"(#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+uniform sampler2D texture0;
+uniform vec2 fuente;
+out vec4 finalColor;
+vec3 tap(ivec2 p) { return texelFetch(texture0, clamp(p, ivec2(0), ivec2(fuente) - 1), 0).rgb; }
+vec3 muestra(vec2 uv)
+{
+    vec2 tam = vec2(textureSize(texture0, 0));
+    return texture(texture0, clamp(uv, 0.5 / tam, (fuente - 0.5) / tam)).rgb;
+}
+)";
+
+    constexpr const char *kCopia = R"(
+void main() { finalColor = vec4(muestra(fragTexCoord), 1.0); }
+)";
+
+    // FXAA (Timothy Lottes, versión compacta "FXAA PC simple"), a la resolución del juego.
+    constexpr const char *kFxaa = R"(
+void main()
+{
+    vec2 inv = 1.0 / vec2(textureSize(texture0, 0));
+    vec2 uv = fragTexCoord;
+    vec3 rgbNW = muestra(uv + vec2(-1.0, -1.0) * inv);
+    vec3 rgbNE = muestra(uv + vec2(1.0, -1.0) * inv);
+    vec3 rgbSW = muestra(uv + vec2(-1.0, 1.0) * inv);
+    vec3 rgbSE = muestra(uv + vec2(1.0, 1.0) * inv);
+    vec3 rgbM = muestra(uv);
+    const vec3 luma = vec3(0.299, 0.587, 0.114);
+    float lumaNW = dot(rgbNW, luma), lumaNE = dot(rgbNE, luma), lumaSW = dot(rgbSW, luma), lumaSE = dot(rgbSE, luma);
+    float lumaM = dot(rgbM, luma);
+    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+    vec2 dir = vec2(-((lumaNW + lumaNE) - (lumaSW + lumaSE)), (lumaNW + lumaSW) - (lumaNE + lumaSE));
+    float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 / 8.0), 1.0 / 128.0);
+    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+    dir = clamp(dir * rcpDirMin, vec2(-8.0), vec2(8.0)) * inv;
+    vec3 rgbA = 0.5 * (muestra(uv + dir * (1.0 / 3.0 - 0.5)) + muestra(uv + dir * (2.0 / 3.0 - 0.5)));
+    vec3 rgbB = rgbA * 0.5 + 0.25 * (muestra(uv - dir * 0.5) + muestra(uv + dir * 0.5));
+    float lumaB = dot(rgbB, luma);
+    finalColor = vec4((lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB, 1.0);
+}
+)";
+
+    // AMD FidelityFX Super Resolution 1.0, EASU (ffx_fsr1.h, licencia MIT), con texelFetch en lugar de gather.
+    // Doce texeles alrededor de la posición en la entrada:
+    //    b c
+    //  e f g h
+    //  i j k l
+    //    n o
+    constexpr const char *kEasu = R"(
+float luma(vec3 c) { return c.b * 0.5 + (c.r * 0.5 + c.g); }
+void easuSet(inout vec2 dir, inout float len, float w, float lA, float lB, float lC, float lD, float lE)
+{
+    float dc = lD - lC, cb = lC - lB;
+    float lenX = 1.0 / max(max(abs(dc), abs(cb)), 1.0 / 65536.0);
+    float dirX = lD - lB;
+    dir.x += dirX * w;
+    lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
+    lenX *= lenX;
+    len += lenX * w;
+    float ec = lE - lC, ca = lC - lA;
+    float lenY = 1.0 / max(max(abs(ec), abs(ca)), 1.0 / 65536.0);
+    float dirY = lE - lA;
+    dir.y += dirY * w;
+    lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
+    lenY *= lenY;
+    len += lenY * w;
+}
+void easuTap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c)
+{
+    vec2 v = vec2(off.x * dir.x + off.y * dir.y, off.x * (-dir.y) + off.y * dir.x) * len;
+    float d2 = min(v.x * v.x + v.y * v.y, clp);
+    float wB = 2.0 / 5.0 * d2 - 1.0;
+    float wA = lob * d2 - 1.0;
+    wB *= wB;
+    wA *= wA;
+    wB = 25.0 / 16.0 * wB - (25.0 / 16.0 - 1.0);
+    float w = wB * wA;
+    aC += c * w;
+    aW += w;
+}
+void main()
+{
+    vec2 pp = fragTexCoord * vec2(textureSize(texture0, 0)) - 0.5;
+    vec2 fp = floor(pp);
+    pp -= fp;
+    ivec2 p = ivec2(fp);
+    vec3 b = tap(p + ivec2(0, -1)), c = tap(p + ivec2(1, -1));
+    vec3 e = tap(p + ivec2(-1, 0)), f = tap(p), g = tap(p + ivec2(1, 0)), h = tap(p + ivec2(2, 0));
+    vec3 i = tap(p + ivec2(-1, 1)), j = tap(p + ivec2(0, 1)), k = tap(p + ivec2(1, 1)), l = tap(p + ivec2(2, 1));
+    vec3 n = tap(p + ivec2(0, 2)), o = tap(p + ivec2(1, 2));
+    float bL = luma(b), cL = luma(c), eL = luma(e), fL = luma(f), gL = luma(g), hL = luma(h);
+    float iL = luma(i), jL = luma(j), kL = luma(k), lL = luma(l), nL = luma(n), oL = luma(o);
+    vec2 dir = vec2(0.0);
+    float len = 0.0;
+    easuSet(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);
+    easuSet(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);
+    easuSet(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL);
+    easuSet(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);
+    vec2 dir2 = dir * dir;
+    float dirR = dir2.x + dir2.y;
+    bool zro = dirR < 1.0 / 32768.0;
+    dirR = zro ? 1.0 : inversesqrt(dirR);
+    dir.x = zro ? 1.0 : dir.x;
+    dir *= dirR;
+    len = len * 0.5;
+    len *= len;
+    float stretch = (dir.x * dir.x + dir.y * dir.y) / max(abs(dir.x), abs(dir.y));
+    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+    float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+    float clp = 1.0 / lob;
+    vec3 min4 = min(min(f, g), min(j, k));
+    vec3 max4 = max(max(f, g), max(j, k));
+    vec3 aC = vec3(0.0);
+    float aW = 0.0;
+    easuTap(aC, aW, vec2(0.0, -1.0) - pp, dir, len2, lob, clp, b);
+    easuTap(aC, aW, vec2(1.0, -1.0) - pp, dir, len2, lob, clp, c);
+    easuTap(aC, aW, vec2(-1.0, 1.0) - pp, dir, len2, lob, clp, i);
+    easuTap(aC, aW, vec2(0.0, 1.0) - pp, dir, len2, lob, clp, j);
+    easuTap(aC, aW, vec2(0.0, 0.0) - pp, dir, len2, lob, clp, f);
+    easuTap(aC, aW, vec2(-1.0, 0.0) - pp, dir, len2, lob, clp, e);
+    easuTap(aC, aW, vec2(1.0, 1.0) - pp, dir, len2, lob, clp, k);
+    easuTap(aC, aW, vec2(2.0, 1.0) - pp, dir, len2, lob, clp, l);
+    easuTap(aC, aW, vec2(2.0, 0.0) - pp, dir, len2, lob, clp, h);
+    easuTap(aC, aW, vec2(1.0, 0.0) - pp, dir, len2, lob, clp, g);
+    easuTap(aC, aW, vec2(1.0, 2.0) - pp, dir, len2, lob, clp, o);
+    easuTap(aC, aW, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, n);
+    finalColor = vec4(min(max4, max(min4, aC / aW)), 1.0);
+}
+)";
+
+    // FSR 1.0, RCAS (afilado adaptativo al contraste), 1:1 sobre la salida de EASU.
+    constexpr const char *kRcas = R"(
+uniform float nitidez;
+void main()
+{
+    ivec2 p = ivec2(fragTexCoord * vec2(textureSize(texture0, 0)));
+    vec3 b = tap(p + ivec2(0, -1)), d = tap(p + ivec2(-1, 0)), e = tap(p), f = tap(p + ivec2(1, 0)), h = tap(p + ivec2(0, 1));
+    vec3 mn4 = min(min(b, d), min(f, h));
+    vec3 mx4 = max(max(b, d), max(f, h));
+    vec3 hitMin = mn4 / max(4.0 * mx4, vec3(1.0 / 65536.0));
+    vec3 hitMax = (1.0 - mx4) / min(4.0 * mn4 - 4.0, vec3(-1.0 / 65536.0));
+    vec3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * nitidez;
+    finalColor = vec4((lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0), 1.0);
+}
+)";
+
+    class Presentador
+    {
+    public:
+        void init()
+        {
+            const Config &c = config();
+            if (c.filtro == Filtro::Pixel && !c.fxaa)
+                return;
+            const auto load = [](const char *body)
+            {
+                const std::string source = std::string(kHeader) + body;
+                Shader shader = LoadShaderFromMemory(nullptr, source.c_str());
+                if (!IsShaderValid(shader) || shader.id == rlGetShaderIdDefault())
+                    shader = Shader{};
+                return shader;
+            };
+            m_copy = load(kCopia);
+            if (c.fxaa)
+                m_fxaa = load(kFxaa);
+            if (c.filtro == Filtro::Fsr)
+            {
+                m_easu = load(kEasu);
+                m_rcas = load(kRcas);
+            }
+            m_ready = m_copy.id != 0u && (!c.fxaa || m_fxaa.id != 0u) &&
+                      (c.filtro != Filtro::Fsr || (m_easu.id != 0u && m_rcas.id != 0u));
+            if (!m_ready)
+                std::cerr << "[presentacion] sombreadores no disponibles: se usa el escalado de antes" << std::endl;
+        }
+
+        // Pasos fuera de la pantalla (FXAA y EASU), antes de BeginDrawing.
+        void prepare(Texture2D &frame, uint32_t srcWidth, uint32_t srcHeight, bool newFrame, const Rectangle &dst)
+        {
+            m_active = m_ready;
+            if (!m_active)
+                return;
+            const Config &c = config();
+            const int width = static_cast<int>(dst.width), height = static_cast<int>(dst.height);
+            const bool sizeChanged = width != m_dstWidth || height != m_dstHeight ||
+                                     srcWidth != m_srcWidth || srcHeight != m_srcHeight;
+            if (!newFrame && !sizeChanged && m_prepared)
+                return;
+            m_srcWidth = srcWidth;
+            m_srcHeight = srcHeight;
+            m_dstWidth = width;
+            m_dstHeight = height;
+            if (m_frameFilter != 1)
+            {
+                SetTextureFilter(frame, TEXTURE_FILTER_BILINEAR);
+                m_frameFilter = 1;
+            }
+            m_input = frame;
+            m_inputSrc = Rectangle{0.0f, 0.0f, static_cast<float>(srcWidth), static_cast<float>(srcHeight)};
+            m_inputValid = Vector2{static_cast<float>(srcWidth), static_cast<float>(srcHeight)};
+            if (c.fxaa)
+            {
+                ensureTarget(m_fxaaTarget, static_cast<int>(srcWidth), static_cast<int>(srcHeight));
+                runPass(m_fxaaTarget, m_fxaa, m_input, m_inputSrc, m_inputValid);
+                m_input = m_fxaaTarget.texture;
+                SetTextureFilter(m_input, c.filtro == Filtro::Pixel ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+                m_inputSrc = Rectangle{0.0f, 0.0f, static_cast<float>(srcWidth), -static_cast<float>(srcHeight)};
+            }
+            if (c.filtro == Filtro::Fsr && width > 0 && height > 0)
+            {
+                ensureTarget(m_easuTarget, width, height);
+                runPass(m_easuTarget, m_easu, m_input, m_inputSrc, m_inputValid);
+            }
+            m_prepared = true;
+        }
+
+        // Último paso, ya dentro de BeginDrawing. Devuelve false si hay que usar el dibujo de antes.
+        bool draw(const Rectangle &dst)
+        {
+            if (!m_active)
+                return false;
+            const Config &c = config();
+            if (c.filtro == Filtro::Fsr)
+            {
+                const Vector2 size{static_cast<float>(m_easuTarget.texture.width), static_cast<float>(m_easuTarget.texture.height)};
+                BeginShaderMode(m_rcas);
+                setVec2(m_rcas, "fuente", size);
+                const int loc = GetShaderLocation(m_rcas, "nitidez");
+                SetShaderValue(m_rcas, loc, &c.sharpness, SHADER_UNIFORM_FLOAT);
+                DrawTexturePro(m_easuTarget.texture, Rectangle{0.0f, 0.0f, size.x, -size.y}, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+                EndShaderMode();
+                return true;
+            }
+            if (c.filtro == Filtro::Pixel)
+            {
+                // Solo con FXAA: la entrada ya es el resultado del suavizado, sin filtrar al ampliar.
+                DrawTexturePro(m_input, m_inputSrc, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+                return true;
+            }
+            BeginShaderMode(m_copy);
+            setVec2(m_copy, "fuente", m_inputValid);
+            DrawTexturePro(m_input, m_inputSrc, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            EndShaderMode();
+            return true;
+        }
+
+        void unload()
+        {
+            for (Shader *shader : {&m_copy, &m_fxaa, &m_easu, &m_rcas})
+                if (shader->id != 0u)
+                    UnloadShader(*shader);
+            for (RenderTexture2D *target : {&m_fxaaTarget, &m_easuTarget})
+                if (target->id != 0u)
+                    UnloadRenderTexture(*target);
+        }
+
+    private:
+        static void setVec2(Shader &shader, const char *name, const Vector2 &value)
+        {
+            SetShaderValue(shader, GetShaderLocation(shader, name), &value, SHADER_UNIFORM_VEC2);
+        }
+
+        static void ensureTarget(RenderTexture2D &target, int width, int height)
+        {
+            if (target.id != 0u && target.texture.width == width && target.texture.height == height)
+                return;
+            if (target.id != 0u)
+                UnloadRenderTexture(target);
+            target = LoadRenderTexture(std::max(width, 1), std::max(height, 1));
+        }
+
+        static void runPass(RenderTexture2D &target, Shader &shader, Texture2D &input, const Rectangle &src, const Vector2 &valid)
+        {
+            BeginTextureMode(target);
+            ClearBackground(BLACK);
+            BeginShaderMode(shader);
+            setVec2(shader, "fuente", valid);
+            DrawTexturePro(input, src,
+                           Rectangle{0.0f, 0.0f, static_cast<float>(target.texture.width), static_cast<float>(target.texture.height)},
+                           Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            EndShaderMode();
+            EndTextureMode();
+        }
+
+        Shader m_copy{}, m_fxaa{}, m_easu{}, m_rcas{};
+        RenderTexture2D m_fxaaTarget{}, m_easuTarget{};
+        Texture2D m_input{};
+        Rectangle m_inputSrc{};
+        Vector2 m_inputValid{};
+        uint32_t m_srcWidth = 0u, m_srcHeight = 0u;
+        int m_dstWidth = 0, m_dstHeight = 0;
+        int m_frameFilter = 0;
+        bool m_ready = false, m_active = false, m_prepared = false;
+    };
+#endif
+
+    // Rectángulo de destino en la ventana (píxeles enteros para que RCAS quede 1:1).
+    Rectangle destino(float srcWidth, float srcHeight, const uint8_t *rdram)
+    {
+        const Config &c = config();
+        const float screenWidth = static_cast<float>(GetScreenWidth());
+        const float screenHeight = static_cast<float>(GetScreenHeight());
+        if (c.stretch)
+            return Rectangle{0.0f, 0.0f, screenWidth, screenHeight};
+        float aspect = srcWidth / srcHeight;
+        if (!c.legacyAspect)
+        {
+            aspect = c.fixedAspect;
+            if (aspect <= 0.0f)
+            {
+                const float panoramico = gowAspectoPanoramico();
+                if (panoramico > 0.0f)
+                    aspect = panoramico;
+                else
+                    aspect = rdram && (rdram[0x29CC90u] & 1u) != 0u ? 16.0f / 9.0f : 4.0f / 3.0f;
+            }
+        }
+        float width = screenWidth, height = screenWidth / aspect;
+        if (height > screenHeight)
+        {
+            height = screenHeight;
+            width = screenHeight * aspect;
+        }
+        width = std::max(1.0f, std::round(width));
+        height = std::max(1.0f, std::round(height));
+        return Rectangle{std::floor((screenWidth - width) * 0.5f), std::floor((screenHeight - height) * 0.5f), width, height};
+    }
+
+    // Contador en la esquina superior izquierda de la imagen.
+    void drawFps(const Rectangle &dst)
+    {
+        static double lastTime = 0.0;
+        static uint64_t lastFrames = 0;
+        static int gameFps = 0;
+        const double now = GetTime();
+        const uint64_t frames = g_gowGuestFrames.load(std::memory_order_relaxed);
+        if (lastTime == 0.0)
+        {
+            lastTime = now;
+            lastFrames = frames;
+        }
+        else if (now - lastTime >= 0.5)
+        {
+            gameFps = static_cast<int>(std::lround(static_cast<double>(frames - lastFrames) / (now - lastTime)));
+            lastTime = now;
+            lastFrames = frames;
+        }
+        const int fontSize = std::max(16, static_cast<int>(dst.height / 40.0f));
+        const char *text = TextFormat("%d FPS  |  %d Hz", gameFps, GetFPS());
+        const int textWidth = MeasureText(text, fontSize);
+        const int x = static_cast<int>(dst.x) + fontSize / 2, y = static_cast<int>(dst.y) + fontSize / 2;
+        DrawRectangle(x - fontSize / 3, y - fontSize / 4, textWidth + fontSize * 2 / 3, fontSize + fontSize / 2, Color{0, 0, 0, 150});
+        DrawText(text, x, y, fontSize, gameFps >= 55 ? Color{120, 230, 120, 255} : gameFps >= 28 ? Color{240, 210, 90, 255} : Color{240, 100, 90, 255});
+    }
+
+    // Pruebas: TOBIICHI_CAPTURAS=40,70 guarda la ventana (ventana_40.png...) en la carpeta de trabajo a esos
+    // segundos desde que se abre.
+    void capturas()
+    {
+        static std::vector<int> pendientes = []
+        {
+            std::vector<int> out;
+            if (const char *value = std::getenv("TOBIICHI_CAPTURAS"))
+            {
+                std::stringstream lista(value);
+                std::string item;
+                while (std::getline(lista, item, ','))
+                    if (!item.empty())
+                        out.push_back(std::atoi(item.c_str()));
+            }
+            std::sort(out.begin(), out.end());
+            return out;
+        }();
+        if (pendientes.empty() || GetTime() < pendientes.front())
+            return;
+        const int seconds = pendientes.front();
+        pendientes.erase(pendientes.begin());
+        rlDrawRenderBatchActive();
+        TakeScreenshot(TextFormat("ventana_%d.png", seconds));
+    }
+
+    void applyCursor()
+    {
+        if (IsWindowFullscreen())
+            HideCursor();
+        else
+            ShowCursor();
+    }
+
+    // Pantalla completa con el modo de vídeo actual del monitor (no cambia la resolución). En X11/XWayland el
+    // gestor de ventanas la trata como pantalla completa de verdad; ToggleBorderlessWindowed solo quita el marco
+    // y KWin dejaba la ventana en 922x1074 en una pantalla de 1920x1200.
+    void alternarPantallaCompleta()
+    {
+        static int previousWidth = 0, previousHeight = 0;
+        if (!IsWindowFullscreen())
+        {
+            previousWidth = GetScreenWidth();
+            previousHeight = GetScreenHeight();
+            const int monitor = GetCurrentMonitor();
+            SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
+            ToggleFullscreen();
+        }
+        else
+        {
+            ToggleFullscreen();
+            if (previousWidth > 0 && previousHeight > 0)
+                SetWindowSize(previousWidth, previousHeight);
+        }
+        applyCursor();
+    }
+}
+}
+
 struct ElfHeader
 {
     uint32_t magic;
@@ -494,8 +1059,9 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight, bool &outNewFrame)
 {
+    outNewFrame = false; // GOW-Port: la presentación (FXAA/FSR) solo se rehace con un cuadro nuevo
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
@@ -538,6 +1104,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
+        outNewFrame = true;
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         s_lastWidth = outWidth;
@@ -593,6 +1160,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     }
 
     UpdateTexture(tex, s_uploadBuffer.data());
+    outNewFrame = true;
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
@@ -662,6 +1230,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        m_memory.syncVu1Worker(); // GOW-Port: el hilo de VU1 usa el GS, que se destruye antes que la memoria
 #if !defined(PLATFORM_VITA)
         stopSpu2Audio(); // GOW-Port: antes de destruir el IOP que produce las muestras
 #endif
@@ -824,11 +1393,26 @@ bool PS2Runtime::syncCoreSubsystems()
     // GOW-Port: cada flujo conserva su cursor GIF, incluso cuando otro PATH lo interrumpe.
     m_gifArbiter.reset();
     m_gifArbiter.setProcessPathPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size, path); });
+                                    {
+                                        // GOW-Port: desde el hilo de VU1, a su hilo del GS si está activado.
+                                        if (!m_memory.enqueueGsFront(path, data, size))
+                                            m_gs.processGIFPacket(data, size, path);
+                                    });
+    m_memory.setGsFrontProcess([this](GifPathId path, const uint8_t *data, uint32_t size)
+                               { m_gs.processGIFPacket(data, size, path); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    // GOW-Port: con VIF1/VU1 en su hilo, despertar al EE cuando termina cada envío (Dmac no hace nada más).
+    m_memory.setVu1WorkerNotify([this]
+                                  {
+                                      if (m_eeScheduler)
+                                          m_eeScheduler->postEvent(EeEvent{EeEventType::Dmac});
+                                  });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     // GOW-Port: desde el hilo de VU1 no se consulta el planificador del EE.
+                                     R5900Context *cpuContext = m_eeScheduler && !m_memory.onVu1WorkerThread()
+                                                                    ? m_eeScheduler->currentContext()
+                                                                    : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
@@ -846,7 +1430,10 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     // GOW-Port: desde el hilo de VU1 no se consulta el planificador del EE.
+                                     R5900Context *cpuContext = m_eeScheduler && !m_memory.onVu1WorkerThread()
+                                                                    ? m_eeScheduler->currentContext()
+                                                                    : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
@@ -889,13 +1476,37 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        // GOW-Port: tamaño, pantalla completa, sincronía vertical, título e icono (lanzador).
+        const presentacion::Ventana ventana = presentacion::ventana();
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE | (ventana.vsync ? FLAG_VSYNC_HINT : 0u));
+        const char *customTitle = std::getenv("TOBIICHI_TITULO");
+        InitWindow(ventana.width, ventana.height, customTitle && *customTitle ? customTitle : title);
+        SetWindowMinSize(320, 224);
+        if (const char *icon = std::getenv("TOBIICHI_ICONO"); icon && *icon)
+        {
+            Image image = LoadImage(icon);
+            if (image.data)
+            {
+                SetWindowIcon(image);
+                UnloadImage(image);
+            }
+        }
+        if (ventana.fullscreen)
+            presentacion::alternarPantallaCompleta();
+        if (!ventana.escExits)
+            SetExitKey(KEY_NULL);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         startSpu2Audio(m_iopSubsystem.get()); // GOW-Port
 #endif
-        SetTargetFPS(60);
+        // GOW-Port: límite de la ventana (TOBIICHI_VENTANA_FPS, 120 por defecto; antes 60; 0 = sin límite). El juego
+        // sigue limitado por sus VBlanks; la ventana muestra el último cuadro listo (buzón) con menos espera en
+        // pantallas de 120/144 Hz.
+        {
+            const char *value = std::getenv("TOBIICHI_VENTANA_FPS");
+            const long fps = value ? std::strtol(value, nullptr, 10) : 120;
+            SetTargetFPS(fps == 0 ? 0 : static_cast<int>(std::clamp<long>(fps, 30, 360)));
+        }
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -2577,6 +3188,10 @@ void PS2Runtime::run()
     UnloadImage(blank);
 
     std::atomic<bool> gameThreadFinished{false};
+#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
+    presentacion::Presentador presentador; // GOW-Port
+    presentador.init();
+#endif
 
     std::thread gameThread([&]()
                            {
@@ -2654,31 +3269,40 @@ void PS2Runtime::run()
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+        bool newFrame = false;
         {
             ps2_perf::Scope perf(ps2_perf::Bucket::Upload);
-            UploadFrame(frameTex, this, presentWidth, presentHeight);
+            UploadFrame(frameTex, this, presentWidth, presentHeight, newFrame);
         }
+
+        // GOW-Port: F11 alterna la pantalla completa.
+        if (IsKeyPressed(KEY_F11))
+            presentacion::alternarPantallaCompleta();
+        if (IsWindowResized())
+            std::cerr << "[presentacion] ventana " << GetScreenWidth() << "x" << GetScreenHeight()
+                      << (IsWindowFullscreen() ? " (pantalla completa)" : "") << std::endl;
+        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+        // GOW-Port: proporción (TOBIICHI_ASPECTO / panorámico) y escalado (TOBIICHI_FILTRO, TOBIICHI_FXAA).
+        const Rectangle dstRect = presentacion::destino(srcWidth, srcHeight, m_memory.getRDRAM());
+#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
+        presentador.prepare(frameTex, presentWidth, presentHeight, newFrame, dstRect);
+#endif
 
         BeginDrawing();
         ClearBackground(BLACK);
-        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
-        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        const Rectangle dstRect{
-            (screenWidth - dstWidth) * 0.5f,
-            (screenHeight - dstHeight) * 0.5f,
-            dstWidth,
-            dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
+        if (!presentador.draw(dstRect))
+#endif
+            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        if (presentacion::config().fps)
+            presentacion::drawFps(dstRect);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
+        presentacion::capturas(); // GOW-Port
         {
             ps2_perf::Scope perf(ps2_perf::Bucket::HostWait);
             EndDrawing();
@@ -2705,6 +3329,9 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
+    presentador.unload();
+#endif
     UnloadTexture(frameTex);
     CloseWindow();
 

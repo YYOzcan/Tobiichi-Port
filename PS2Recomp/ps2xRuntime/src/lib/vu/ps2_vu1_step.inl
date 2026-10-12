@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#if defined(_MSC_VER) || defined(__SSE4_1__)
+#include <immintrin.h>
+#endif
 
 // GOW-Port: la aritmética de VU no depende de /fp:fast. El runtime se compila con /fp:fast, que deja al
 // compilador fusionar a*b+c en FMA según dónde esté el código: el intérprete y el microcódigo compilado
@@ -27,6 +30,48 @@
 static constexpr uint8_t vu1StepLane(uint32_t component)
 {
     return static_cast<uint8_t>(1u << (3u - component));
+}
+
+// GOW-Port: escrituras de registros VF/ACC con un único store de 16 bytes. Si un registro se escribe con
+// varios stores de 4 bytes y el par siguiente lo lee con un load de 16 bytes (lo normal en las FMAC con SSE),
+// el reenvío store->load falla y el load espera a que los stores lleguen a la caché. Los carriles se mezclan
+// bit a bit (sin operaciones de coma flotante): el resultado es idéntico.
+VU1_STEP_INLINE void vu1StoreVf0(float *vf0)
+{
+#if defined(_MSC_VER) || defined(__SSE4_1__)
+    _mm_storeu_ps(vf0, _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f));
+#else
+    vf0[0] = 0.0f;
+    vf0[1] = 0.0f;
+    vf0[2] = 0.0f;
+    vf0[3] = 1.0f;
+#endif
+}
+
+// dest: máscara de VU (bit 3 = x ... bit 0 = w).
+VU1_STEP_INLINE void vu1StoreLanes(float *dst, const float *src, uint32_t dest)
+{
+#if defined(_MSC_VER) || defined(__SSE4_1__)
+    alignas(16) static constexpr int32_t kMasks[16][4] = {
+        {0, 0, 0, 0}, {0, 0, 0, -1}, {0, 0, -1, 0}, {0, 0, -1, -1},
+        {0, -1, 0, 0}, {0, -1, 0, -1}, {0, -1, -1, 0}, {0, -1, -1, -1},
+        {-1, 0, 0, 0}, {-1, 0, 0, -1}, {-1, 0, -1, 0}, {-1, 0, -1, -1},
+        {-1, -1, 0, 0}, {-1, -1, 0, -1}, {-1, -1, -1, 0}, {-1, -1, -1, -1}};
+    dest &= 0xFu;
+    if (dest == 0u)
+        return;
+    const __m128 mask = _mm_load_ps(reinterpret_cast<const float *>(kMasks[dest]));
+    _mm_storeu_ps(dst, _mm_blendv_ps(_mm_loadu_ps(dst), _mm_loadu_ps(src), mask));
+#else
+    if (dest & 0x8u)
+        dst[0] = src[0];
+    if (dest & 0x4u)
+        dst[1] = src[1];
+    if (dest & 0x2u)
+        dst[2] = src[2];
+    if (dest & 0x1u)
+        dst[3] = src[3];
+#endif
 }
 
 VU1_STEP_INLINE uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
@@ -111,6 +156,8 @@ VU1_STEP_INLINE void VU1Interpreter::markPairWrites(const DecodedInstructionPair
 
 VU1_STEP_INLINE bool VU1Interpreter::stepPair(const DecodedInstructionPair &decoded, StepContext &context)
 {
+    if (m_xgkick.active)
+        xgkickAdvanceTo(m_cycle); // GOW-Port: PATH1 al día tras código compilado (por eventos)
     uint64_t readyCycle = calculatePairReadyCycle(decoded);
     while (readyCycle > m_cycle)
     {
@@ -242,10 +289,9 @@ VU1_STEP_INLINE bool VU1Interpreter::stepPair(const DecodedInstructionPair &deco
     if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
         recordViWriteForBranch(writtenVi, oldVi);
 
-    m_state.vf[0][0] = 0.0f;
-    m_state.vf[0][1] = 0.0f;
-    m_state.vf[0][2] = 0.0f;
-    m_state.vf[0][3] = 1.0f;
+    // GOW-Port: VF0 con un solo store de 16 bytes: la lectura de 16 bytes de VF0 en el par siguiente
+    // (vf00w = 1.0 es muy frecuente) no puede reenviarse desde cuatro stores de 4 bytes.
+    vu1StoreVf0(m_state.vf[0]);
     m_state.vi[0] = 0;
 
     uint32_t nextPc = m_state.pc + 8u;

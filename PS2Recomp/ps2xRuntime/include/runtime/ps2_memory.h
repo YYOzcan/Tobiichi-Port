@@ -10,6 +10,7 @@
 #include <atomic>
 #include <iostream>
 #include <mutex>
+#include <memory>
 
 #include "gs/ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
@@ -344,6 +345,18 @@ public:
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
     void processPendingTransfers();
+    // GOW-Port: VIF1/VU1 en un hilo propio (PS2X_VU1_HILO=1). Espera a que ese hilo termine lo encolado; no
+    // hace nada si está desactivado o si la llama el propio hilo.
+    void syncVu1Worker() const;
+    bool onVu1WorkerThread() const;
+    // GOW-Port: lo llama el hilo de VU1 al terminar cada envío (para despertar al planificador del EE, que puede
+    // estar esperando a la interrupción de un FINISH/SIGNAL que ese envío acaba de producir).
+    void setVu1WorkerNotify(std::function<void()> notify);
+    // GOW-Port: con PS2X_GS_FRENTE=1 (y el hilo de VU1), los paquetes GIF que produce ese hilo los procesa otro
+    // hilo, en orden. Devuelve false si no toca (otro hilo o desactivado): entonces el llamador los procesa.
+    using GsFrontFn = std::function<void(GifPathId, const uint8_t *, uint32_t)>;
+    void setGsFrontProcess(GsFrontFn fn);
+    bool enqueueGsFront(GifPathId path, const uint8_t *data, uint32_t sizeBytes);
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
     int pollDmaRegisters();
@@ -399,6 +412,10 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
+    bool vu1WorkerEnabled();
+    void enqueueVu1Work(std::vector<uint8_t> &&data);
+    void vu1WorkerLoop();
+    void gsFrontLoop();
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
 
@@ -452,6 +469,8 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    std::function<void()> m_vu1WorkerNotify; // GOW-Port: ver setVu1WorkerNotify
+    GsFrontFn m_gsFrontProcess;               // GOW-Port: ver setGsFrontProcess
     // GOW-Port: GIF_STAT en m_ioRegisters (los elementos de unordered_map no se mueven; solo clear() lo
     // invalida). advanceEeTimers lo usa ~1,5 millones de veces por segundo.
     uint32_t *m_gifStatSlot = nullptr;

@@ -66,8 +66,17 @@ namespace
     }
     constexpr uint32_t kPrimWords = 40u;
     constexpr uint32_t kStateWords = 32u;
-    constexpr uint32_t kTileSize = 16u;
-    constexpr uint32_t kTileGrid = 128u;
+    // GOW-Port: tiles de 8x8 por defecto (PS2X_GS_TILE=16 vuelve a 16x16). Con 16x16 los 256 pixeles de un tile
+    // recorren cada primitiva que lo toca aunque cubra pocos: con los triángulos pequeños de los personajes eso es
+    // la mayor parte del trabajo del rasterizador por cómputo, y un tile con muchas primitivas (hasta ~1800) es una
+    // cadena en serie que marca la duración del dispatch. El orden por pixel no cambia: mismo resultado.
+    uint32_t tileSizeSetting()
+    {
+        const char *value = std::getenv("PS2X_GS_TILE");
+        return value && std::strtoul(value, nullptr, 10) == 16u ? 16u : 8u;
+    }
+    const uint32_t kTileSize = tileSizeSetting();
+    const uint32_t kTileGrid = 2048u / kTileSize;
     constexpr uint32_t kClutSlots = 1024u;
     constexpr uint32_t kPages = 512u;
     constexpr uint32_t kShadowPages = 512u;
@@ -265,6 +274,8 @@ struct GSGpuBackend::Impl
     uint32_t ringChunk = 0u;
     size_t ringOffset = 0u;
     std::array<GLsync, kRingChunks> ringFences{};
+    std::array<GLsync, 8> frameFences{}; // GOW-Port: throttleGpuFrames
+    uint32_t frameFenceNext = 0u;
 
     Program raster;
     Program clutLoad;
@@ -1222,7 +1233,7 @@ struct GSGpuBackend::Impl
             return false;
         const std::string version = "#version 460 core\n";
         std::string body = GSGpuShaders::kRaster;
-        const std::string layout = "layout(local_size_x = 16, local_size_y = 16) in;";
+        const std::string layout = "layout(local_size_x = TILE_SIZE, local_size_y = TILE_SIZE) in;";
         const std::string stateRead = "uint st(uint s, uint i) { return states[s * STATE_WORDS + i]; }";
         const std::string coverType = "    uint type = header & 0xFFu;";
         const std::string drawType = "    switch (header & 0xFFu)";
@@ -1359,7 +1370,7 @@ struct GSGpuBackend::Impl
         ring = static_cast<uint8_t *>(gl().MapBufferRange(kShaderStorageBuffer, 0, static_cast<GLsizeiptr>(kRingChunk * kRingChunks),
                                                           kMapWriteBit | kMapPersistentBit | kMapCoherentBit));
 
-        const bool ok = compile(raster, prefix, GSGpuShaders::kRaster, {"uRaster"}) &&
+        const bool ok = compile(raster, prefix + "#define TILE_SIZE " + std::to_string(kTileSize) + "\n", GSGpuShaders::kRaster, {"uRaster"}) &&
                         compile(pageCopy, prefix, GSGpuShaders::kPageCopy, {}) &&
                         compile(clutLoad, prefix, GSGpuShaders::kClutLoad, {"uClutA", "uClutB"}) &&
                         compile(upload, prefix, GSGpuShaders::kUpload, {"uUpload"}) &&
@@ -1689,9 +1700,15 @@ struct GSGpuBackend::Impl
             bindUpload(5u, tileBuffer, tileHeaders.data(), tileHeaders.size() * sizeof(uint32_t));
             bindUpload(6u, tileListBuffer, tileList.data(), tileList.size() * sizeof(uint32_t));
             g.UseProgram(raster.id);
-            g.Uniform4ui(raster.loc[0], epoch, 0u, 0u, 0u);
             const GLuint profRaster = profBegin();
-            g.DispatchCompute(static_cast<GLuint>(touched.size()), 1u, 1u);
+            // GOW-Port: como mucho 65535 grupos por dispatch (mínimo de GL); con tiles de 8x8 un destino de 2048x2048
+            // tiene 65536. Los trozos se ejecutan en orden y cada tile está en uno solo: mismo resultado.
+            for (size_t first = 0u; first < touched.size(); first += 65535u)
+            {
+                const size_t count = std::min<size_t>(65535u, touched.size() - first);
+                g.Uniform4ui(raster.loc[0], epoch, static_cast<GLuint>(first), 0u, 0u);
+                g.DispatchCompute(static_cast<GLuint>(count), 1u, 1u);
+            }
             profEnd(0u, profRaster);
             if (prof.enabled)
             {
@@ -2400,6 +2417,7 @@ struct GSGpuBackend::Impl
     PresentationFrame presentAsync(uint32_t width, uint32_t height, uint32_t displayFbp,
                                    uint32_t sourceFbp, bool usedPreferred)
     {
+        throttleGpuFrames();
         for (uint32_t i = 0; i < readbacks.size(); ++i)
             harvest(readbacks[(readbackNext + i) % readbacks.size()]);
         Readback &slot = readbacks[readbackNext];
@@ -2459,6 +2477,28 @@ struct GSGpuBackend::Impl
             reportPresentStats();
         }
         return lastFrame;
+    }
+
+    // GOW-Port: como mucho N presentaciones (PS2X_GS_GPU_CUADROS, 2 por defecto; 0 desactiva) de trabajo pendiente
+    // en la GPU. Sin límite, con la GPU llena el hilo del GS encolaba decenas de ms de rasterizado por delante
+    // (esperas del anillo de 30-90 ms) y el intercambio de la ventana esperaba detrás: ventana a 6-15 cuadros/s.
+    // Con el límite el hilo del GS espera aquí, el EE nota la cola llena y todo baja al ritmo de la GPU.
+    void throttleGpuFrames()
+    {
+        static const uint32_t depth = [] {
+            const char *value = std::getenv("PS2X_GS_GPU_CUADROS");
+            return value ? static_cast<uint32_t>(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 8ul)) : 2u;
+        }();
+        if (depth == 0u || !gl().FenceSync || !gl().ClientWaitSync || !gl().DeleteSync)
+            return;
+        GLsync &oldest = frameFences[frameFenceNext];
+        if (oldest)
+        {
+            gl().ClientWaitSync(oldest, kSyncFlushCommandsBit, 100000000ull); // 100 ms como mucho
+            gl().DeleteSync(oldest);
+        }
+        oldest = gl().FenceSync(kSyncGpuCommandsComplete, 0u);
+        frameFenceNext = (frameFenceNext + 1u) % depth;
     }
 
     void reportPresentStats()
@@ -2793,9 +2833,10 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     const auto &source = request.preferredSource;
     const bool sourceFormat = source.psm == GS_PSM_CT32 || source.psm == GS_PSM_CT24 ||
                               source.psm == GS_PSM_CT16 || source.psm == GS_PSM_CT16S;
+    // GOW-Port: mismo criterio de dirección física que CPU cuando TEX0 no tiene TBW.
     if (circuits[0].enabled != circuits[1].enabled && request.hasPreferredSource && sourceFormat &&
         request.preferredDestFbp == result.displayFbp &&
-        (source.fbw != 0u || source.fbp != result.displayFbp))
+        (source.fbw != 0u || source.fbp != result.displayFbp * 32u))
     {
         auto &c = circuits[0].enabled ? c1 : c2;
         c[1] = source.fbp;

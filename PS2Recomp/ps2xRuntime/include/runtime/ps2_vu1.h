@@ -263,6 +263,8 @@ private:
     Unit m_unit;
     VU1State m_state;
     std::array<DecodedInstructionPair, kMaxDecodedPairs> m_decodedCodeCache{};
+    // GOW-Port: un bit por par de m_decodedCodeCache; cada par se decodifica la primera vez que se pide.
+    std::array<uint64_t, kMaxDecodedPairs / 64u> m_decodedValid{};
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
@@ -297,6 +299,11 @@ private:
     // en que se emiten: una cola circular (cabeza y número de entradas) en lugar de buscar huecos.
     uint32_t m_flagHead = 0u, m_flagCount = 0u;
     XgkickPipeline m_xgkick{};
+    // GOW-Port: PATH1 avanza por eventos. m_xgkickCycle es el ciclo hasta el que se ha contado el crédito de
+    // PATH1; m_xgkickEvent, el próximo ciclo en que PATH1 lee una GIFtag o termina el paquete (~0 si no hay
+    // envío). Entre eventos solo copia carga útil, que se puede aplazar mientras la VU no escriba en su memoria.
+    uint64_t m_xgkickCycle = 0;
+    uint64_t m_xgkickEvent = ~0ull;
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
     std::array<uint64_t, 4> m_accReady{};
@@ -345,6 +352,8 @@ private:
     uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
     uint32_t calculateFmacProductSticky(uint8_t dest) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
+    // GOW-Port: igual que updateFmacFlags con MAC y status ya calculados (código compilado de VU1).
+    void pushFmacFlags(uint32_t mac, uint32_t status, uint32_t extraSticky);
     FlagPipelineEntry *pushFlagEntry();
     void queueFsset(uint16_t immediate);
     void queueClip(uint32_t clip);
@@ -368,6 +377,9 @@ private:
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
     void progressXgkick();
+    void xgkickCopy();
+    void xgkickAdvanceTo(uint64_t cycle);
+    void xgkickScheduleEvent();
     void finishXgkick();
     uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;
     void markPairWrites(const DecodedInstructionPair &decoded);
@@ -376,12 +388,14 @@ private:
     template <uint32_t Upper, uint32_t C>
     void fmacLaneT(float &result, uint8_t &laneFlags, uint8_t &productFlags);
     template <uint32_t Upper, bool DeadFlags>
+    void fmacScalarT();
+    template <uint32_t Upper, bool DeadFlags>
     void upperT();
     template <uint32_t Lower>
     void lowerT(StepContext &context, uint32_t upperInstr);
     template <class T>
     uint64_t readyCycleT() const;
-    template <class T, bool DeadFlags, bool Plain = false>
+    template <class T, bool DeadFlags, bool Plain = false, bool Chained = false>
     bool stepPairT(StepContext &context);
     bool blockPreconditions(StepContext &context, uint32_t pc, const uint32_t *words, size_t bytes) const;
     bool stepInterpreted(StepContext &context);
@@ -429,6 +443,13 @@ private:
         const uint32_t exponent = (bits >> 23) & 0xFFu;
         if (exponent >= 2u && exponent <= 0xFDu)
             return (bits & 0x80000000u) != 0u ? 0x2u : 0u;
+        // GOW-Port: con un factor cero (los operandos llegan normalizados: finitos, sin subnormales) el
+        // producto exacto es cero con el signo de a XOR b, igual que productStickyFlagsExact.
+        uint32_t aBits = 0u, bBits = 0u;
+        std::memcpy(&aBits, &a, sizeof(aBits));
+        std::memcpy(&bBits, &b, sizeof(bBits));
+        if ((aBits & 0x7FFFFFFFu) == 0u || (bBits & 0x7FFFFFFFu) == 0u)
+            return ((aBits ^ bBits) & 0x80000000u) != 0u ? 0x3u : 0x1u;
         return productStickyFlagsExact(a, b);
     }
     static uint8_t productStickyFlagsExact(float a, float b)

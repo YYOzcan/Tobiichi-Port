@@ -1,0 +1,596 @@
+#include "lanzador.h"
+
+#include <QCoreApplication>
+#include <QDesktopServices>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QDateTime>
+#include <QGuiApplication>
+#include <QImage>
+#include <QImageReader>
+#include <QProcessEnvironment>
+#include <QScreen>
+#include <QSettings>
+#include <QStandardPaths>
+#include <QTextStream>
+#include <QTimer>
+
+#include <algorithm>
+#include <cmath>
+#include <utility>
+
+namespace
+{
+    // XOR de todas las palabras de 32 bits del ELF (el CRC con el que PCSX2 identifica los juegos).
+    constexpr quint32 kCrcGodOfWar = 0xD6385328u;
+
+#ifdef Q_OS_WIN
+    const QString kNombreEjecutable = QStringLiteral("ps2EntryRunner.exe");
+#else
+    const QString kNombreEjecutable = QStringLiteral("ps2EntryRunner");
+#endif
+
+    // Ajustes de rendimiento probados (los de run_gow.sh). Una variable que ya esté en el entorno del usuario se
+    // respeta, para poder comparar sin tocar el lanzador.
+    const std::pair<const char *, const char *> kEntornoBase[] = {
+        {"PS2X_GS_GPU", "1"},
+        {"PS2X_GS_THREAD", "1"},
+        {"GOW_XGKICK_IMMEDIATE", "1"},
+        {"GOW_PERF_FRAME_PC", "0x001837B8"},
+        {"GOW_GS_FINISH_ASINCRONO", "1"},
+        {"PS2X_GS_QUEUE_CHUNKS", "128"},
+        {"PS2X_GS_GPU_DEFER_UPLOADS", "1"},
+        {"PS2X_GS_COMPACT_QUEUE", "1"},
+        {"GOW_UNLOCKED_FPS", "0"},
+        {"GOW_TARGET_FPS", "60"},
+        {"GOW_IOP_BATCH", "1024"},
+        {"GOW_VBLANK_REALTIME", "1"},
+        {"GOW_EE_CICLOS", "50"},
+        {"PS2X_VU1_HILO", "1"},
+        {"PS2X_GS_FRENTE", "1"},
+        {"PS2X_GS_ASYNC_PRESENT", "1"},
+        {"PS2X_GS_PRESENT_BUZON", "1"},
+    };
+
+    QString leerTexto(const QString &ruta)
+    {
+        QFile archivo(ruta);
+        if (!archivo.open(QIODevice::ReadOnly))
+            return {};
+        return QString::fromUtf8(archivo.readAll()).trimmed();
+    }
+
+    // Nombre comercial a partir de pci.ids: "Rembrandt [Radeon 680M]" -> "Radeon 680M".
+    QString nombrePci(const QString &fabricante, const QString &dispositivo)
+    {
+        static const QStringList bases = {QStringLiteral("/usr/share/hwdata/pci.ids"), QStringLiteral("/usr/share/misc/pci.ids"),
+                                          QStringLiteral("/usr/share/pci.ids")};
+        for (const QString &base : bases)
+        {
+            QFile archivo(base);
+            if (!archivo.open(QIODevice::ReadOnly | QIODevice::Text))
+                continue;
+            QTextStream entrada(&archivo);
+            bool dentro = false;
+            while (!entrada.atEnd())
+            {
+                const QString linea = entrada.readLine();
+                if (linea.isEmpty() || linea.startsWith(QLatin1Char('#')))
+                    continue;
+                if (!linea.startsWith(QLatin1Char('\t')))
+                {
+                    if (dentro)
+                        break;
+                    dentro = linea.startsWith(fabricante + QStringLiteral("  "));
+                    continue;
+                }
+                if (dentro && !linea.startsWith(QStringLiteral("\t\t")) && linea.mid(1, 4) == dispositivo)
+                {
+                    QString nombre = linea.mid(7).trimmed();
+                    const qsizetype abre = nombre.indexOf(QLatin1Char('['));
+                    const qsizetype cierra = nombre.lastIndexOf(QLatin1Char(']'));
+                    if (abre >= 0 && cierra > abre)
+                        nombre = nombre.mid(abre + 1, cierra - abre - 1);
+                    return nombre;
+                }
+            }
+        }
+        return {};
+    }
+
+    QString nombreFabricante(const QString &id)
+    {
+        if (id == QStringLiteral("10de"))
+            return QStringLiteral("NVIDIA");
+        if (id == QStringLiteral("1002"))
+            return QStringLiteral("AMD");
+        if (id == QStringLiteral("8086"))
+            return QStringLiteral("Intel");
+        return id.toUpper();
+    }
+
+    QString buscarHaciaArriba(const QString &desde, const QString &relativa)
+    {
+        QDir dir(desde);
+        for (int nivel = 0; nivel < 6; ++nivel)
+        {
+            const QString candidata = dir.absoluteFilePath(relativa);
+            if (QFileInfo::exists(candidata))
+                return QDir::cleanPath(candidata);
+            if (!dir.cdUp())
+                break;
+        }
+        return {};
+    }
+
+    QString primeraIso(const QString &carpeta)
+    {
+        const QFileInfoList isos = QDir(carpeta).entryInfoList({QStringLiteral("*.iso"), QStringLiteral("*.ISO")}, QDir::Files, QDir::Name);
+        return isos.isEmpty() ? QString() : isos.first().absoluteFilePath();
+    }
+}
+
+Lanzador::Lanzador(QObject *parent) : QObject(parent)
+{
+    QDir().mkpath(carpetaDatos() + QStringLiteral("/registros"));
+}
+
+Lanzador::~Lanzador()
+{
+    // El juego sigue abierto si se cierra el lanzador: se desliga el proceso en lugar de matarlo.
+    if (m_proceso && m_proceso->state() != QProcess::NotRunning)
+    {
+        m_proceso->disconnect(this);
+        m_proceso->setParent(nullptr);
+    }
+}
+
+bool Lanzador::jugando() const
+{
+    return m_proceso && m_proceso->state() != QProcess::NotRunning;
+}
+
+QString Lanzador::version() const
+{
+    return QStringLiteral(TOBIICHI_VERSION);
+}
+
+QString Lanzador::sistema() const
+{
+#ifdef Q_OS_WIN
+    return QStringLiteral("windows");
+#else
+    return QStringLiteral("linux");
+#endif
+}
+
+QString Lanzador::carpetaDatos() const
+{
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+}
+
+QString Lanzador::rutaIcono() const
+{
+    return carpetaDatos() + QStringLiteral("/icono.png");
+}
+
+QString Lanzador::rutaRegistro() const
+{
+    return carpetaDatos() + QStringLiteral("/registros/ultimo.log");
+}
+
+QVariantList Lanzador::tarjetasGraficas() const
+{
+    QVariantList lista;
+#ifdef Q_OS_WIN
+    // Windows elige la GPU por programa (Configuración > Pantalla > Gráficos); el lanzador escribe esa preferencia.
+    lista.append(QVariantMap{{QStringLiteral("id"), QStringLiteral("ahorro")}, {QStringLiteral("tipo"), QStringLiteral("integrada")},
+                             {QStringLiteral("nombre"), QString()}, {QStringLiteral("fabricante"), QString()}});
+    lista.append(QVariantMap{{QStringLiteral("id"), QStringLiteral("rendimiento")}, {QStringLiteral("tipo"), QStringLiteral("dedicada")},
+                             {QStringLiteral("nombre"), QString()}, {QStringLiteral("fabricante"), QString()}});
+#else
+    const QDir dispositivos(QStringLiteral("/sys/bus/pci/devices"));
+    for (const QString &ranura : dispositivos.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name))
+    {
+        const QString base = dispositivos.absoluteFilePath(ranura);
+        const QString clase = leerTexto(base + QStringLiteral("/class"));
+        // 0x0300xx = VGA, 0x0302xx = 3D (las NVIDIA de los portátiles híbridos), 0x0380xx = otra pantalla.
+        if (!clase.startsWith(QStringLiteral("0x0300")) && !clase.startsWith(QStringLiteral("0x0302")) &&
+            !clase.startsWith(QStringLiteral("0x0380")))
+            continue;
+        const QString fabricante = leerTexto(base + QStringLiteral("/vendor")).mid(2);
+        const QString dispositivo = leerTexto(base + QStringLiteral("/device")).mid(2);
+        const QString controlador = QFileInfo(base + QStringLiteral("/driver")).symLinkTarget().section(QLatin1Char('/'), -1);
+        QString nombre = nombrePci(fabricante, dispositivo);
+        if (nombre.isEmpty())
+            nombre = fabricante + QLatin1Char(':') + dispositivo;
+        lista.append(QVariantMap{
+            {QStringLiteral("id"), ranura},
+            {QStringLiteral("nombre"), nombre},
+            {QStringLiteral("fabricante"), nombreFabricante(fabricante)},
+            {QStringLiteral("controlador"), controlador},
+            {QStringLiteral("predeterminada"), leerTexto(base + QStringLiteral("/boot_vga")) == QStringLiteral("1")},
+        });
+    }
+    // Integrada: la que arranca el sistema (boot_vga) salvo que sea la única; el resto, dedicadas.
+    for (QVariant &v : lista)
+    {
+        QVariantMap tarjeta = v.toMap();
+        const bool predeterminada = tarjeta.value(QStringLiteral("predeterminada")).toBool();
+        const bool nvidia = tarjeta.value(QStringLiteral("fabricante")).toString() == QStringLiteral("NVIDIA");
+        tarjeta.insert(QStringLiteral("tipo"), lista.size() == 1 ? QString() : (predeterminada && !nvidia ? QStringLiteral("integrada") : QStringLiteral("dedicada")));
+        v = tarjeta;
+    }
+#endif
+    return lista;
+}
+
+QVariantMap Lanzador::pantalla() const
+{
+    QScreen *pantalla = QGuiApplication::primaryScreen();
+    if (!pantalla)
+        return {{QStringLiteral("ancho"), 1920}, {QStringLiteral("alto"), 1080}, {QStringLiteral("hz"), 60}};
+    const QSize tam = pantalla->size() * pantalla->devicePixelRatio();
+    return {{QStringLiteral("ancho"), tam.width()}, {QStringLiteral("alto"), tam.height()},
+            {QStringLiteral("hz"), static_cast<int>(std::lround(pantalla->refreshRate()))}};
+}
+
+QVariantMap Lanzador::rutasDetectadas() const
+{
+    const QString desde = QCoreApplication::applicationDirPath();
+    QString elf = buscarHaciaArriba(desde, QStringLiteral("SCUS_973.99"));
+    QString ejecutable = buscarHaciaArriba(desde, kNombreEjecutable);
+    if (ejecutable.isEmpty())
+        ejecutable = buscarHaciaArriba(desde, QStringLiteral("PS2Recomp/build/ps2xRuntime/") + kNombreEjecutable);
+    if (ejecutable.isEmpty())
+        ejecutable = buscarHaciaArriba(desde, QStringLiteral("build/ps2xRuntime/") + kNombreEjecutable);
+    const QString iso = elf.isEmpty() ? QString() : primeraIso(QFileInfo(elf).absolutePath());
+    return {{QStringLiteral("elf"), elf}, {QStringLiteral("iso"), iso}, {QStringLiteral("ejecutable"), ejecutable}};
+}
+
+QVariantMap Lanzador::comprobarJuego(const QString &elf) const
+{
+    QVariantMap resultado{{QStringLiteral("existe"), false}, {QStringLiteral("valido"), false}, {QStringLiteral("crc"), QString()}};
+    QFile archivo(elf);
+    if (elf.isEmpty() || !archivo.open(QIODevice::ReadOnly))
+        return resultado;
+    resultado.insert(QStringLiteral("existe"), true);
+    const QByteArray datos = archivo.readAll();
+    quint32 crc = 0u;
+    const qsizetype palabras = datos.size() / 4;
+    const auto *bytes = reinterpret_cast<const uchar *>(datos.constData());
+    for (qsizetype i = 0; i < palabras; ++i)
+        crc ^= static_cast<quint32>(bytes[i * 4]) | static_cast<quint32>(bytes[i * 4 + 1]) << 8u |
+               static_cast<quint32>(bytes[i * 4 + 2]) << 16u | static_cast<quint32>(bytes[i * 4 + 3]) << 24u;
+    resultado.insert(QStringLiteral("crc"), QStringLiteral("%1").arg(crc, 8, 16, QLatin1Char('0')).toUpper());
+    resultado.insert(QStringLiteral("valido"), datos.startsWith("\x7F" "ELF") && crc == kCrcGodOfWar);
+    return resultado;
+}
+
+QVariantMap Lanzador::comprobarDatos(const QString &elf, const QString &iso) const
+{
+    const QString carpeta = QFileInfo(elf).absolutePath();
+    QString imagen = iso;
+    if (!imagen.isEmpty() && !QFileInfo(imagen).isFile())
+        imagen.clear();
+    if (imagen.isEmpty() && iso.isEmpty() && !elf.isEmpty())
+    {
+        // Mismo orden que configureGowCdImage: "../God of War.iso" respecto al ELF o la primera .iso de su carpeta.
+        const QString hermana = QDir(carpeta).absoluteFilePath(QStringLiteral("../God of War.iso"));
+        imagen = QFileInfo(hermana).isFile() ? QDir::cleanPath(hermana) : primeraIso(carpeta);
+    }
+    const QDir dir(carpeta);
+    const bool extraidos = !elf.isEmpty() && dir.exists(QStringLiteral("GODOFWAR.TOC")) && dir.exists(QStringLiteral("PART1.PAK"));
+    return {{QStringLiteral("ok"), !imagen.isEmpty() || extraidos}, {QStringLiteral("iso"), imagen},
+            {QStringLiteral("extraidos"), extraidos}, {QStringLiteral("isoElegidaFalta"), !iso.isEmpty() && imagen.isEmpty()}};
+}
+
+QVariantMap Lanzador::comprobarEjecutable(const QString &ruta) const
+{
+    const QFileInfo info(ruta);
+    return {{QStringLiteral("existe"), !ruta.isEmpty() && info.isFile()}, {QStringLiteral("ejecutable"), !ruta.isEmpty() && info.isFile() && info.isExecutable()}};
+}
+
+QString Lanzador::carpetaMemoria(const QString &elf) const
+{
+    return elf.isEmpty() ? QString() : QDir(QFileInfo(elf).absolutePath()).absoluteFilePath(QStringLiteral("mc0"));
+}
+
+QString Lanzador::rutaDesdeUrl(const QUrl &url) const
+{
+    return url.isLocalFile() ? QDir::cleanPath(url.toLocalFile()) : url.toString();
+}
+
+QUrl Lanzador::urlDesdeRuta(const QString &ruta) const
+{
+    return QUrl::fromLocalFile(ruta);
+}
+
+void Lanzador::aplicarTarjeta(QProcessEnvironment &entorno, const QString &id, const QString &ejecutable) const
+{
+#ifdef Q_OS_WIN
+    // Preferencia por programa de Windows 10/11 (la misma que escribe Configuración > Gráficos).
+    QSettings preferencias(QStringLiteral("HKEY_CURRENT_USER\\Software\\Microsoft\\DirectX\\UserGpuPreferences"), QSettings::NativeFormat);
+    const QString clave = QDir::toNativeSeparators(ejecutable);
+    if (id == QStringLiteral("ahorro"))
+        preferencias.setValue(clave, QStringLiteral("GpuPreference=1;"));
+    else if (id == QStringLiteral("rendimiento"))
+        preferencias.setValue(clave, QStringLiteral("GpuPreference=2;"));
+    else
+        preferencias.remove(clave);
+    Q_UNUSED(entorno);
+#else
+    Q_UNUSED(ejecutable);
+    if (id.isEmpty() || id == QStringLiteral("auto"))
+        return;
+    for (const QVariant &v : tarjetasGraficas())
+    {
+        const QVariantMap tarjeta = v.toMap();
+        if (tarjeta.value(QStringLiteral("id")).toString() != id)
+            continue;
+        if (tarjeta.value(QStringLiteral("controlador")).toString() == QStringLiteral("nvidia"))
+        {
+            // Controlador propietario de NVIDIA en un portátil híbrido: PRIME render offload.
+            entorno.insert(QStringLiteral("__NV_PRIME_RENDER_OFFLOAD"), QStringLiteral("1"));
+            entorno.insert(QStringLiteral("__GLX_VENDOR_LIBRARY_NAME"), QStringLiteral("nvidia"));
+            entorno.insert(QStringLiteral("__VK_LAYER_NV_optimus"), QStringLiteral("NVIDIA_only"));
+        }
+        else if (!tarjeta.value(QStringLiteral("predeterminada")).toBool())
+        {
+            // Mesa: DRI_PRIME=pci-0000_03_00_0 elige esa tarjeta.
+            QString etiqueta = id;
+            etiqueta.replace(QLatin1Char(':'), QLatin1Char('_')).replace(QLatin1Char('.'), QLatin1Char('_'));
+            entorno.insert(QStringLiteral("DRI_PRIME"), QStringLiteral("pci-") + etiqueta);
+        }
+        return;
+    }
+#endif
+}
+
+bool Lanzador::iniciar(const QVariantMap &a)
+{
+    if (jugando())
+        return false;
+    const QString ejecutable = a.value(QStringLiteral("ejecutable")).toString();
+    const QString elf = a.value(QStringLiteral("elf")).toString();
+    if (!comprobarEjecutable(ejecutable).value(QStringLiteral("ejecutable")).toBool())
+    {
+        emit error(QStringLiteral("errorEjecutable"), ejecutable);
+        return false;
+    }
+    if (!QFileInfo(elf).isFile())
+    {
+        emit error(QStringLiteral("errorElf"), elf);
+        return false;
+    }
+
+    QProcessEnvironment entorno = QProcessEnvironment::systemEnvironment();
+    for (const auto &[nombre, valor] : kEntornoBase)
+        if (!entorno.contains(QLatin1String(nombre)))
+            entorno.insert(QLatin1String(nombre), QLatin1String(valor));
+    const auto bandera = [&](const char *nombre, bool activa, const char *valorApagado = nullptr)
+    {
+        if (activa)
+            entorno.insert(QLatin1String(nombre), QStringLiteral("1"));
+        else if (valorApagado)
+            entorno.insert(QLatin1String(nombre), QLatin1String(valorApagado));
+        else
+            entorno.remove(QLatin1String(nombre));
+    };
+    // Opciones del juego.
+    bandera("GOW_SKIP_FMV", a.value(QStringLiteral("saltarVideos")).toBool());
+    bandera("GOW_FAST_BOOT", a.value(QStringLiteral("arranqueRapido")).toBool());
+    bandera("TOBIICHI_DMC5_CONTROLS", a.value(QStringLiteral("controlesDmc5")).toBool(), "0");
+    bandera("TOBIICHI_ESC_SALIR", a.value(QStringLiteral("escSalir")).toBool(), "0");
+    // Ventana.
+    const bool completa = a.value(QStringLiteral("modoPantalla")).toString() == QStringLiteral("completa");
+    entorno.insert(QStringLiteral("TOBIICHI_PANTALLA"), completa ? QStringLiteral("completa") : QStringLiteral("ventana"));
+    entorno.insert(QStringLiteral("TOBIICHI_ANCHO"), QString::number(a.value(QStringLiteral("ancho")).toInt()));
+    entorno.insert(QStringLiteral("TOBIICHI_ALTO"), QString::number(a.value(QStringLiteral("alto")).toInt()));
+    entorno.insert(QStringLiteral("TOBIICHI_TITULO"), QStringLiteral("God of War"));
+    entorno.insert(QStringLiteral("TOBIICHI_PANEL"), QStringLiteral("0")); // el panel de depuración se abre con F1
+    if (QFileInfo::exists(rutaIcono()))
+        entorno.insert(QStringLiteral("TOBIICHI_ICONO"), rutaIcono());
+    // Imagen: proporción (la panorámica cambia la cámara del juego) y escalado.
+    const QString aspecto = a.value(QStringLiteral("aspecto")).toString();
+    if (aspecto.isEmpty() || aspecto == QStringLiteral("4:3"))
+        entorno.remove(QStringLiteral("TOBIICHI_PANORAMICO"));
+    else
+        entorno.insert(QStringLiteral("TOBIICHI_PANORAMICO"), aspecto);
+    entorno.insert(QStringLiteral("TOBIICHI_ASPECTO"), a.value(QStringLiteral("estirar")).toBool() ? QStringLiteral("estirar") : QStringLiteral("auto"));
+    entorno.insert(QStringLiteral("TOBIICHI_FILTRO"), a.value(QStringLiteral("filtro"), QStringLiteral("fsr")).toString());
+    // Nitidez 0..1 en la interfaz -> pasos de RCAS (2 = suave, 0 = máxima).
+    const double nitidez = std::clamp(a.value(QStringLiteral("nitidez"), 0.8).toDouble(), 0.0, 1.0);
+    entorno.insert(QStringLiteral("TOBIICHI_NITIDEZ"), QString::number(2.0 * (1.0 - nitidez), 'f', 2));
+    bandera("TOBIICHI_FXAA", a.value(QStringLiteral("fxaa")).toBool());
+    // Ritmo de la ventana.
+    entorno.insert(QStringLiteral("TOBIICHI_VENTANA_FPS"), QString::number(a.value(QStringLiteral("fpsLimite"), 120).toInt()));
+    bandera("TOBIICHI_VSYNC", a.value(QStringLiteral("vsync")).toBool());
+    bandera("TOBIICHI_FPS_GOSTER", a.value(QStringLiteral("mostrarFps")).toBool());
+    // Archivos.
+    const QString iso = a.value(QStringLiteral("iso")).toString();
+    if (iso.isEmpty())
+        entorno.remove(QStringLiteral("GOW_ISO"));
+    else
+        entorno.insert(QStringLiteral("GOW_ISO"), iso);
+    const QString cache = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/sombreadores");
+    QDir().mkpath(cache);
+    if (!entorno.contains(QStringLiteral("PS2X_GS_SHADER_CACHE_DIR")))
+        entorno.insert(QStringLiteral("PS2X_GS_SHADER_CACHE_DIR"), cache);
+    aplicarTarjeta(entorno, a.value(QStringLiteral("gpu")).toString(), ejecutable);
+
+    // Registro: el de la partida anterior se conserva como anterior.log.
+    const QString registro = rutaRegistro();
+    const QString anterior = carpetaDatos() + QStringLiteral("/registros/anterior.log");
+    QFile::remove(anterior);
+    QFile::rename(registro, anterior);
+
+    delete m_proceso;
+    m_proceso = new QProcess(this);
+    m_proceso->setProgram(ejecutable);
+    m_proceso->setArguments({elf});
+    m_proceso->setProcessEnvironment(entorno);
+    m_proceso->setWorkingDirectory(carpetaDatos());
+    m_proceso->setProcessChannelMode(QProcess::MergedChannels);
+    m_proceso->setStandardOutputFile(registro);
+    connect(m_proceso, &QProcess::finished, this, &Lanzador::terminado);
+    connect(m_proceso, &QProcess::errorOccurred, this, [this](QProcess::ProcessError fallo)
+    {
+        if (fallo == QProcess::FailedToStart)
+        {
+            emit error(QStringLiteral("errorArranque"), m_proceso->errorString());
+            emit jugandoCambiado();
+        }
+    });
+    m_reloj.start();
+    m_proceso->start();
+    emit jugandoCambiado();
+    return true;
+}
+
+void Lanzador::terminado(int codigo, QProcess::ExitStatus estado)
+{
+    const int segundos = static_cast<int>(m_reloj.elapsed() / 1000);
+    const bool fallo = estado == QProcess::CrashExit || codigo != 0;
+    QString resumen;
+    if (fallo)
+    {
+        // Últimas líneas con errores del registro, para el aviso.
+        QFile archivo(rutaRegistro());
+        if (archivo.open(QIODevice::ReadOnly | QIODevice::Text))
+        {
+            const QStringList lineas = QString::fromUtf8(archivo.readAll()).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+            QStringList utiles;
+            for (qsizetype i = lineas.size() - 1; i >= 0 && utiles.size() < 6; --i)
+            {
+                const QString &linea = lineas[i];
+                if (linea.contains(QStringLiteral("error"), Qt::CaseInsensitive) || linea.contains(QStringLiteral("fatal"), Qt::CaseInsensitive) ||
+                    linea.contains(QStringLiteral("failed"), Qt::CaseInsensitive))
+                    utiles.prepend(linea.left(200));
+            }
+            if (utiles.isEmpty())
+                for (qsizetype i = std::max<qsizetype>(0, lineas.size() - 4); i < lineas.size(); ++i)
+                    utiles.append(lineas[i].left(200));
+            resumen = utiles.join(QLatin1Char('\n'));
+        }
+    }
+    emit juegoTerminado(codigo, fallo, segundos, resumen);
+    emit jugandoCambiado();
+}
+
+void Lanzador::detener()
+{
+    if (!jugando())
+        return;
+    m_proceso->terminate();
+    QProcess *proceso = m_proceso;
+    QTimer::singleShot(3000, proceso, [proceso]
+    {
+        if (proceso->state() != QProcess::NotRunning)
+            proceso->kill();
+    });
+}
+
+void Lanzador::abrirCarpeta(const QString &ruta) const
+{
+    QString carpeta = ruta;
+    if (QFileInfo(ruta).isFile())
+        carpeta = QFileInfo(ruta).absolutePath();
+    QDir().mkpath(carpeta);
+    QDesktopServices::openUrl(QUrl::fromLocalFile(carpeta));
+}
+
+void Lanzador::abrirRegistro() const
+{
+    const QString registro = rutaRegistro();
+    QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo::exists(registro) ? registro : QFileInfo(registro).absolutePath()));
+}
+
+bool Lanzador::crearAccesoDirecto(bool escritorio) const
+{
+#ifdef Q_OS_WIN
+    // Acceso directo de Windows (.lnk) en el menú Inicio o en el escritorio.
+    const QString destino = QStandardPaths::writableLocation(escritorio ? QStandardPaths::DesktopLocation : QStandardPaths::ApplicationsLocation);
+    return QFile::link(QCoreApplication::applicationFilePath(), destino + QStringLiteral("/God Of War - Tobiichi Launcher.lnk"));
+#else
+    const QString ejecutable = QCoreApplication::applicationFilePath();
+    QString contenido;
+    QTextStream salida(&contenido);
+    salida << "[Desktop Entry]\n"
+           << "Type=Application\n"
+           << "Name=God Of War: Tobiichi Launcher\n"
+           << "GenericName=Game Launcher\n"
+           << "Comment=God of War (PS2) PC port\n"
+           << "Exec=\"" << ejecutable << "\"\n"
+           << "Icon=" << rutaIcono() << "\n"
+           << "Terminal=false\n"
+           << "Categories=Game;\n"
+           << "StartupWMClass=tobiichi-launcher\n"
+           << "Actions=jugar;\n"
+           << "\n[Desktop Action jugar]\n"
+           << "Name=Play now\n"
+           << "Name[tr]=Hemen oyna\n"
+           << "Name[es]=Jugar ya\n"
+           << "Exec=\"" << ejecutable << "\" --jugar\n";
+    const auto escribir = [&](const QString &ruta, bool marcarEjecutable)
+    {
+        QDir().mkpath(QFileInfo(ruta).absolutePath());
+        QFile archivo(ruta);
+        if (!archivo.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
+            return false;
+        archivo.write(contenido.toUtf8());
+        archivo.close();
+        if (marcarEjecutable)
+            archivo.setPermissions(archivo.permissions() | QFileDevice::ExeOwner | QFileDevice::ExeUser);
+        return true;
+    };
+    bool ok = escribir(QStandardPaths::writableLocation(QStandardPaths::ApplicationsLocation) + QStringLiteral("/tobiichi-launcher.desktop"), false);
+    if (escritorio)
+        ok = escribir(QStandardPaths::writableLocation(QStandardPaths::DesktopLocation) + QStringLiteral("/tobiichi-launcher.desktop"), true) && ok;
+    return ok;
+#endif
+}
+
+QString Lanzador::guardarPortada(const QString &origen) const
+{
+    QImageReader lector(origen);
+    if (!lector.canRead())
+        return {};
+    borrarPortada();
+    // Nombre nuevo cada vez: así QML no reutiliza la imagen anterior de su caché.
+    const QString sufijo = QFileInfo(origen).suffix().toLower();
+    const QString destino = carpetaDatos() + QStringLiteral("/portada-") +
+                            QString::number(QDateTime::currentMSecsSinceEpoch()) + QLatin1Char('.') + sufijo;
+    return QFile::copy(origen, destino) ? destino : QString();
+}
+
+void Lanzador::borrarPortada() const
+{
+    const QDir dir(carpetaDatos());
+    for (const QString &nombre : dir.entryList({QStringLiteral("portada-*")}, QDir::Files))
+        QFile::remove(dir.absoluteFilePath(nombre));
+}
+
+bool Lanzador::esRecorte(const QString &ruta) const
+{
+    const QImage imagen(ruta);
+    if (imagen.isNull() || !imagen.hasAlphaChannel())
+        return false;
+    // Borde superior, izquierdo y derecho (el inferior suele cortar a la figura).
+    int transparentes = 0, total = 0;
+    const auto mirar = [&](int x, int y)
+    {
+        ++total;
+        if (qAlpha(imagen.pixel(x, y)) < 16)
+            ++transparentes;
+    };
+    for (int x = 0; x < imagen.width(); x += 2)
+        mirar(x, 0);
+    for (int y = 0; y < imagen.height(); y += 2)
+    {
+        mirar(0, y);
+        mirar(imagen.width() - 1, y);
+    }
+    return total > 0 && transparentes * 10 >= total * 7;
+}

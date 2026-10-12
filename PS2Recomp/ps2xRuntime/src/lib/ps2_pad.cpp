@@ -134,45 +134,55 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     }
     else
     {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-            clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-            clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-            clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-            clearBit(PAD_RIGHT);
-
         if (dmc5Controls)
         {
-            // DMC5 PC style keyboard layout:
-            // Space -> Jump
-            // J -> Light Attack (Square)
-            // I -> Heavy Attack (Triangle)
-            // K -> Grab / Special (Circle)
-            // Shift -> Block / Parry (L1)
-            // E -> Lock-on / Combat (R1)
-            // Q -> Magic (R2)
-            if (IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_X))
+            // GOW-Port: teclado y ratón (Tobiichi). Los sticks los pone gowPad2Read (gow_overrides.cpp):
+            // WASD = stick izquierdo, Ctrl + WASD = stick derecho (esquiva).
+            //   Flechas -> cruceta (selección)     Espacio -> X (salto)
+            //   Clic izquierdo -> Cuadrado (ligero) Clic derecho -> Triángulo (fuerte)
+            //   F -> Círculo (agarre)              Shift -> L1 (bloqueo / parada)
+            //   Q -> R2 (magia)                    E -> R1 (habilidad / acción)
+            //   V -> L3 + R3 (Furia de los dioses)
+            if (IsKeyDown(KEY_UP))
+                clearBit(PAD_UP);
+            if (IsKeyDown(KEY_DOWN))
+                clearBit(PAD_DOWN);
+            if (IsKeyDown(KEY_LEFT))
+                clearBit(PAD_LEFT);
+            if (IsKeyDown(KEY_RIGHT))
+                clearBit(PAD_RIGHT);
+
+            if (IsKeyDown(KEY_SPACE))
                 clearBit(PAD_CROSS);
-            if (IsKeyDown(KEY_I) || IsKeyDown(KEY_V))
-                clearBit(PAD_TRIANGLE);
-            if (IsKeyDown(KEY_K) || IsKeyDown(KEY_C))
-                clearBit(PAD_CIRCLE);
-            if (IsKeyDown(KEY_J) || IsKeyDown(KEY_Z))
+            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
                 clearBit(PAD_SQUARE);
+            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+                clearBit(PAD_TRIANGLE);
+            if (IsKeyDown(KEY_F))
+                clearBit(PAD_CIRCLE);
 
             if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))
                 clearBit(PAD_L1);
-            if (IsKeyDown(KEY_E))
-                clearBit(PAD_R1);
             if (IsKeyDown(KEY_Q))
                 clearBit(PAD_R2);
-            if (IsKeyDown(KEY_R))
-                clearBit(PAD_L2);
+            if (IsKeyDown(KEY_E))
+                clearBit(PAD_R1);
+            if (IsKeyDown(KEY_V))
+            {
+                clearBit(PAD_L3);
+                clearBit(PAD_R3);
+            }
         }
         else
         {
+            if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+                clearBit(PAD_UP);
+            if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+                clearBit(PAD_DOWN);
+            if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+                clearBit(PAD_LEFT);
+            if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+                clearBit(PAD_RIGHT);
             if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
                 clearBit(PAD_CROSS);
             if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))

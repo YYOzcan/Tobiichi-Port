@@ -149,6 +149,7 @@ namespace ps2x::iop::detail
             totalCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            pacedCycles = 0;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -750,6 +751,18 @@ namespace ps2x::iop::detail
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        // GOW-Port: el salto ocioso no conoce la IRQ del SPU2 (IRQA alcanzada por una voz): con el
+                        // IOP esperando al SPU2 (el driver de sonido duerme hasta su IRQ) se saltaba hasta el final
+                        // del tramo (hasta un VBlank), el SPU2 avanzaba de golpe y la IRQ llegaba tarde, o dos en una
+                        // sola: el driver rellenaba tarde el búfer de streaming y se repetía un trozo ("loop").
+                        // Como mucho 32 muestras por salto (GOW_SPU2_PASO en ciclos del IOP; 0 = sin límite).
+                        static const uint64_t spuStep = []
+                        {
+                            const char *value = std::getenv("GOW_SPU2_PASO");
+                            return value ? static_cast<uint64_t>(std::strtoull(value, nullptr, 10)) : uint64_t{Spu2::CyclesPerSample} * 32u;
+                        }();
+                        if (spuStep != 0u)
+                            nextWake = std::min(nextWake, totalCycles + spuStep);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -909,6 +922,7 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        uint64_t pacedCycles = 0; // GOW-Port: ciclos del IOP que el EE ha concedido (runEeCycles)
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -951,8 +965,27 @@ namespace ps2x::iop::detail
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
         const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
+        if (!iopCycles)
+            return;
+        // GOW-Port: el reloj del IOP sigue al del EE. runCycles avanzaba "posición actual + ciclos", y lo que el IOP
+        // corre fuera de este ritmo (hilos del IOP durante una RPC del EE: runReadyThreads, waitOutsideThread, y el
+        // exceso del último tramo de CPU) nunca se descontaba: el reloj del IOP iba ~2 % por delante y el SPU2
+        // daba ~49.100 muestras/s en vez de 48.000 (el estirado tenía que comprimir siempre). Ahora ese adelanto se
+        // devuelve esperando al EE; una deuda mayor de 1/30 s (esperas largas fuera de hilo) se perdona para no
+        // dejar al IOP parado. GOW_IOP_RITMO=0 vuelve al comportamiento anterior.
+        static const bool paced = [] { const char *v = std::getenv("GOW_IOP_RITMO"); return !(v && v[0] == '0'); }();
+        if (!paced)
+        {
             m_impl->runCycles(iopCycles);
+            return;
+        }
+        constexpr uint64_t kMaxDebt = 36864000u / 30u;
+        Impl &d = *m_impl;
+        d.pacedCycles += iopCycles;
+        if (d.totalCycles > d.pacedCycles + kMaxDebt)
+            d.pacedCycles = d.totalCycles - kMaxDebt;
+        if (d.totalCycles < d.pacedCycles)
+            d.runCycles(d.pacedCycles - d.totalCycles);
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)

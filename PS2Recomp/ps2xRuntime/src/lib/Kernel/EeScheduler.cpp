@@ -8,11 +8,105 @@
 #include <atomic>
 #include <chrono>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 
 void gowCountGuestFrame(uint32_t pc, const uint8_t *rdram); // GOW-Port: ps2_runtime.cpp (contador del panel F1)
+// GOW-Port: GOW_FRAME_DIAG=1: por cuadro del juego, ciclos del EE emulados, VBlanks, espera de ritmo (el EE va por
+// delante del reloj y espera al VBlank) y ciclos añadidos al ir por detrás (VBlank al reloj real).
+namespace
+{
+    std::atomic<uint64_t> g_frameDiagPacingNs{0};
+    std::atomic<uint64_t> g_frameDiagCatchUp{0};
+    bool frameDiag()
+    {
+        static const bool on = [] { const char *v = std::getenv("GOW_FRAME_DIAG"); return v && v[0] == '1'; }();
+        return on;
+    }
+}
+extern std::atomic<uint64_t> g_gowGuestFrames; // GOW-Port: ps2_runtime.cpp (contador de cuadros del juego)
+
+// GOW-Port: pantalla panorámica de God of War (SCUS-97399), a partir del parche "Widescreen 16:9" de PCSX2
+// (nemesis2000 y CRASHARKI). La proyección de la cámara (sub_00169238) y la lectura del indicador panorámico
+// del reproductor de vídeo (0x21E4F0) se cambian al recompilar (config/recomp.template.toml) y leen dos palabras
+// de la memoria del núcleo que el juego no usa y que escribe el runtime antes de arrancar y en cada VBlank:
+//   0x7F00 (float) F: la proyección multiplica el campo de visión horizontal por F * aspecto (0x32F1B0).
+//   0x7F04: indicador panorámico que recibe el reproductor de vídeo.
+// Sin TOBIICHI_PANORAMICO, F * aspecto = 1 exacto (0,75 * 4/3 o 0,5625 * 16/9) y el vídeo recibe el indicador
+// del juego (0x29CC90): mismo resultado que el código original. Con TOBIICHI_PANORAMICO=16:9 (16:10, 21:9, un
+// número...), en cada VBlank y como el parche: aspecto A en 0x32F1B0 y en los dos modos de pantalla
+// (0x2FD930/0x2FD968), indicador del juego 0x29CC90 = 1, 0x304D94 = 2 y vídeos sin modo panorámico; F = 0,75
+// (Hor+: se ve más a los lados) salvo con el fondo del menú (0x29CC50 = 1), donde F = 1/A (recorte vertical).
+float gowAspectoPanoramico()
+{
+    static const float aspect = []
+    {
+        const char *value = std::getenv("TOBIICHI_PANORAMICO");
+        if (!value || !*value)
+            return 0.0f;
+        float width = 0.0f, height = 0.0f;
+        float result = 0.0f;
+        if (std::sscanf(value, "%f:%f", &width, &height) == 2 && width > 0.0f && height > 0.0f)
+            result = width / height;
+        else
+            result = std::strtof(value, nullptr);
+        return result >= 1.0f && result <= 4.0f ? result : 0.0f;
+    }();
+    return aspect;
+}
+
+namespace
+{
+    void gowPanoramicoVBlank(uint8_t *rdram)
+    {
+        if (!rdram)
+            return;
+        const auto read32 = [rdram](uint32_t address)
+        {
+            uint32_t value = 0u;
+            std::memcpy(&value, rdram + address, sizeof(value));
+            return value;
+        };
+        const auto write32 = [rdram](uint32_t address, uint32_t value) { std::memcpy(rdram + address, &value, sizeof(value)); };
+        const auto floatBits = [](float value)
+        {
+            uint32_t bits = 0u;
+            std::memcpy(&bits, &value, sizeof(bits));
+            return bits;
+        };
+        const float target = gowAspectoPanoramico();
+        float factor = 0.75f;
+        if (target > 0.0f)
+        {
+            const uint32_t bits = floatBits(target);
+            write32(0x32F1B0u, bits);
+            write32(0x2FD930u, bits);
+            write32(0x2FD968u, bits);
+            rdram[0x29CC90u] = 1u;
+            write32(0x304D94u, 2u);
+            write32(0x7F04u, 0u);
+            uint16_t menuBackground = 0u;
+            std::memcpy(&menuBackground, rdram + 0x29CC50u, sizeof(menuBackground));
+            if (menuBackground == 1u)
+                factor = 1.0f / target;
+        }
+        else
+        {
+            const uint32_t bits = read32(0x32F1B0u);
+            float aspect = 0.0f;
+            std::memcpy(&aspect, &bits, sizeof(aspect));
+            if (bits == 0x3FE38E39u) // 16/9: modo panorámico del propio juego
+                factor = 0.5625f;
+            else if (bits != 0x3FAAAAABu && aspect > 0.5f && aspect < 4.0f) // 4/3 o aún sin escribir: 0,75
+                factor = 1.0f / aspect;
+            write32(0x7F04u, read32(0x29CC90u));
+        }
+        write32(0x7F00u, floatBits(factor));
+    }
+}
 
 namespace
 {
@@ -142,6 +236,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
 {
     m_executorThread = std::this_thread::get_id();
     m_rdram = rdram;
+    gowPanoramicoVBlank(rdram); // GOW-Port: F y el indicador de vídeo listos antes del primer cuadro
     m_readyQueues = {};
     m_threads.clear();
     m_semaphores.clear();
@@ -418,6 +513,23 @@ void EeScheduler::postEvent(EeEvent event)
 
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
+    // GOW-Port: GOW_EE_CICLOS=N (por ciento, 100 por defecto): escala los ciclos que cobra el código del juego
+    // (32 por vuelta de bucle y 8 por llamada: una estimación gruesa). Como el VBlank va al reloj real
+    // (GOW_VBLANK_REALTIME), cobrar menos no acelera el juego: el EE hace más trabajo por VBlank y, si va por
+    // detrás del reloj, el tiempo emulado se pone al día (EE, temporizadores e IOP). Es el "EE cycle rate" de
+    // PCSX2: con 100, partidas que caben en un VBlank del host se contaban como dos y el juego iba a 30 cuadros/s.
+    static const uint32_t percent = [] {
+        const char *value = std::getenv("GOW_EE_CICLOS");
+        const long parsed = value ? std::strtol(value, nullptr, 10) : 100;
+        return static_cast<uint32_t>(std::clamp<long>(parsed, 10, 400));
+    }();
+    if (percent != 100u)
+    {
+        static uint64_t remainder = 0; // solo el hilo ejecutor del EE cobra ciclos
+        const uint64_t scaled = static_cast<uint64_t>(cycles) * percent + remainder;
+        cycles = static_cast<uint32_t>(scaled / 100u);
+        remainder = scaled % 100u;
+    }
     accountCycles(cycles);
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
@@ -462,6 +574,41 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
     m_eeCycle += elapsed;
+    if (frameDiag()) [[unlikely]]
+    {
+        // GOW-Port: GOW_FRAME_DIAG. El cuadro lo marca gowCountGuestFrame (salto al PC del cuadro); aquí se mira
+        // si cambió el contador y se acumulan ciclos emulados y VBlanks por cuadro.
+        static uint64_t lastFrames = 0, lastCycle = 0, lastTick = 0, cyclesSum = 0, ticksSum = 0;
+        static unsigned frames = 0;
+        static auto window = std::chrono::steady_clock::now();
+        const uint64_t f = g_gowGuestFrames.load(std::memory_order_relaxed);
+        if (f != lastFrames)
+        {
+            const uint64_t tick = currentVSyncTick();
+            if (lastFrames != 0u)
+            {
+                cyclesSum += m_eeCycle - lastCycle;
+                ticksSum += tick - lastTick;
+                frames += static_cast<unsigned>(f - lastFrames);
+            }
+            lastFrames = f;
+            lastCycle = m_eeCycle;
+            lastTick = tick;
+            const auto now = std::chrono::steady_clock::now();
+            const double wall = std::chrono::duration<double>(now - window).count();
+            if (wall >= 1.0)
+            {
+                std::fprintf(stderr, "[gow-frame] cuadros=%u ciclos/cuadro=%.2fM vblank/cuadro=%.2f ritmo_ms/s=%.0f "
+                                     "alcance_Mciclos/s=%.2f (VBlank=%.2fM ciclos)\n",
+                             frames, frames ? cyclesSum / 1e6 / frames : 0.0, frames ? static_cast<double>(ticksSum) / frames : 0.0,
+                             g_frameDiagPacingNs.exchange(0) / 1e6 / wall, g_frameDiagCatchUp.exchange(0) / 1e6 / wall,
+                             getVBlankPeriodCycles() / 1e6);
+                frames = 0;
+                cyclesSum = ticksSum = 0;
+                window = now;
+            }
+        }
+    }
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
     if (m_pendingEeTimerInterrupts != 0u)
@@ -1899,6 +2046,8 @@ void EeScheduler::processDueDeadlines()
             }
             if (catchUp != 0u)
             {
+                if (frameDiag())
+                    g_frameDiagCatchUp.fetch_add(catchUp, std::memory_order_relaxed);
                 lock.unlock();
                 while (catchUp != 0u)
                 {
@@ -1920,6 +2069,10 @@ void EeScheduler::processDueDeadlines()
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
+                if (frameDiag())
+                    g_frameDiagPacingNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                      std::chrono::steady_clock::now() - now).count()),
+                                                  std::memory_order_relaxed);
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
                 {
                     updateNextDeadline();
@@ -1986,6 +2139,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+        gowPanoramicoVBlank(m_rdram); // GOW-Port
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)

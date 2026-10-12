@@ -530,6 +530,8 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
+bool gowGsPresentMailboxActive(); // GOW-Port: gs_threaded_backend.cpp
+
 void GS::latchHostPresentationFrame()
 {
     GSPresentationRequest request{};
@@ -551,7 +553,9 @@ void GS::latchHostPresentationFrame()
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
         if (m_backend)
         {
-            m_backend->Flush();
+            // GOW-Port: con el buzón de presentación (gs_threaded_backend.cpp) no se espera al hilo del GS.
+            if (!gowGsPresentMailboxActive())
+                m_backend->Flush();
             m_backend->Sync(GSSyncReason::Presentation);
             frame = m_backend->Present(request);
         }
@@ -1800,8 +1804,9 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
     const int yEnd = y0 + std::max(1, y1 - y0) - 1;
     const uint8_t alphaMode = static_cast<uint8_t>(ctx.alpha & 0xFFu);
     const uint8_t alphaFix = static_cast<uint8_t>((ctx.alpha >> 32u) & 0xFFu);
+    // GOW-Port: FRAME usa páginas de 8 KiB y TEX0 bloques de 256 B; comparar direcciones.
     const bool displayCopy = state.prim.tme && state.prim.abe && state.prim.fst && state.prim.ctxt &&
-                             ctx.frame.fbp != ctx.tex0.tbp0 && alphaMode == 0x64u &&
+                             ctx.frame.fbp * 32u != ctx.tex0.tbp0 && alphaMode == 0x64u &&
                              (alphaFix == 0x60u || alphaFix == 0x80u) &&
                              x0 <= 0 && y0 <= 0 && xEnd >= 639 && yEnd >= 447;
     if (displayCopy)
