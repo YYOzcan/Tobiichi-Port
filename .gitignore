@@ -58,3 +58,6 @@ desktop.ini
 __pycache__/
 PS2Recomp_backup/
 build_generar_vu1
+
+# Oyun microcodigo generado (se regenera con tools/vu1/generar_vu1.cpp)
+PS2Recomp/ps2xRuntime/src/vu1_compiled/programa*.cpp
