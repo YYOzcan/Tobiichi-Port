@@ -412,7 +412,6 @@ src/lib/gs/gpu/gs_texture_store.cpp
     src/lib/gow_fijar.cpp
     src/lib/gow_cancelar.cpp
     src/lib/gow_sondeo.cpp
-    src/lib/gow_iconos.cpp
     src/lib/gow_espera.cpp
     src/lib/ps2_audio_device.cpp # GOW-Port: sound output on a chosen device
     src/lib/ps2_pad_rumble_win.cpp # GOW-Port: Windows gamepad rumble (XInput, DualShock 4 / DualSense)
@@ -543,20 +542,6 @@ endif()
 if(MSVC)
     target_compile_options(ps2EntryRunner PRIVATE /FS)
 endif()
-
-# GOW-Port: fuente de los rótulos de los iconos de botones (gow_iconos.cpp), incrustada en el ejecutable.
-set(GOW_FUENTE_ICONOS "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/fuentes/Cinzel.ttf")
-set(GOW_FUENTE_ICONOS_CPP "${CMAKE_CURRENT_BINARY_DIR}/gow_fuente_iconos.cpp")
-if(EXISTS "${GOW_FUENTE_ICONOS}")
-    file(READ "${GOW_FUENTE_ICONOS}" GOW_FUENTE_HEX HEX)
-    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," GOW_FUENTE_BYTES "${GOW_FUENTE_HEX}")
-    set(GOW_FUENTE_CONTENIDO "#include <cstddef>\nextern const unsigned char gowFuenteIconos[] = {${GOW_FUENTE_BYTES}};\nextern const std::size_t gowFuenteIconosTam = sizeof(gowFuenteIconos);\n")
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GOW_FUENTE_ICONOS}")
-else()
-    set(GOW_FUENTE_CONTENIDO "#include <cstddef>\nextern const unsigned char gowFuenteIconos[] = {0};\nextern const std::size_t gowFuenteIconosTam = 0;\n")
-endif()
-file(CONFIGURE OUTPUT "${GOW_FUENTE_ICONOS_CPP}" CONTENT "${GOW_FUENTE_CONTENIDO}" @ONLY)
-target_sources(ps2_runtime PRIVATE "${GOW_FUENTE_ICONOS_CPP}")
 
 target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include

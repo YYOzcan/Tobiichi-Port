@@ -141,3 +141,12 @@ mientras el indicador está activo (medido con seis iconos del menú de pausa y 
   El límite es la VU1 (~19 ms por cuadro con ese perfil, frente a ~9 ms del generador de VU1 de la rama main con
   `gow_espera`). Siguiente paso: el generador de VU1 de main (rondas 2 y 3 de KIexster, SIMD, modo rápido) en este
   runtime.
+
+## Versión de salida (15 de octubre de 2026)
+
+- **Iconos de botones originales.** Se quitó la sustitución de iconos por dispositivo (`gow_iconos.cpp`, la fuente
+  incrustada, los rótulos de `ps2_pad.cpp` y la opción "Iconos de botones" del lanzador): el juego muestra sus propios
+  iconos de PlayStation, como en la PS2.
+- **Lanzador:** filtro "bilineal" (imagen suave) por defecto en instalaciones nuevas; el filtro "fsr" se llama ahora
+  "Bicúbico (nítido)", que es lo que hace con este runtime.
+- **README** (los tres idiomas) al día con esta versión.

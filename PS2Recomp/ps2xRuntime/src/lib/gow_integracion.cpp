@@ -10,8 +10,7 @@
 //     recomp.template.toml) y aquí se escribe en cada VBlank. Sin la variable, F = 0,5625 con el modo 16:9 del juego
 //     (el que fuerzan los overrides de Waffle): la imagen es bit a bit la misma que sin el parche.
 //   - Teclado configurable (TOBIICHI_TECLAS, ps2_pad.cpp), menú de trucos (F2, gow_trucos.cpp), fijar objetivo
-//     (Alt, gow_fijar.cpp), combate ágil (gow_cancelar.cpp), iconos de botones por dispositivo (gow_iconos.cpp),
-//     escaneo progresivo (gow_video.cpp) y la sonda de funciones (GOW_SONDEO, gow_sondeo.cpp).
+//     (Alt, gow_fijar.cpp), combate ágil (gow_cancelar.cpp), escaneo progresivo (gow_video.cpp) y la sonda de funciones (GOW_SONDEO, gow_sondeo.cpp).
 //   - gow_espera.cpp (el EE duerme mientras espera el cuadro) queda opcional con GOW_ESPERA_EE=1: Waffle mide la
 //     velocidad del juego con los ciclos de ese bucle y la deja en 1,00.
 #include "ps2_runtime.h"
@@ -33,11 +32,9 @@ void gowVideoInstalar(PS2Runtime &runtime, const std::string &elfPath);
 void gowFijarInstalar(PS2Runtime &runtime, const std::string &elfPath);
 void gowCancelarInstalar(PS2Runtime &runtime, const std::string &elfPath);
 void gowSondeoInstalar(PS2Runtime &runtime);
-void gowIconosInstalar(PS2Runtime &runtime, const std::string &elfPath);
 void gowEsperaInstalar(PS2Runtime &runtime, const std::string &elfPath);
 void gowFijarEntrada();
 void gowFijarDibujar(float x, float y, float w, float h);
-void gowIconosDibujar(float x, float y, float w, float h);
 bool gowTrucosEntradaBloqueada();
 void gowTrucosMenuEntrada(bool escCierraJuego);
 void gowTrucosMenuDibujar();
@@ -396,7 +393,6 @@ void gowIntegracionInstalar(PS2Runtime &runtime, const std::string &elfPath)
     gowFijarInstalar(runtime, elfPath);    // fijar objetivo (envuelve la lectura del mando)
     gowCancelarInstalar(runtime, elfPath); // cancelar ataques (después de fijar: encadena su envoltorio)
     gowSondeoInstalar(runtime);            // GOW_SONDEO (diagnóstico)
-    gowIconosInstalar(runtime, elfPath);   // iconos de botones según el dispositivo
     if (envFlag("GOW_ESPERA_EE", false))
         gowEsperaInstalar(runtime, elfPath);
 }
@@ -414,7 +410,6 @@ void gowCuadroEntrada()
 void gowCuadroDibujar(float x, float y, float w, float h)
 {
     gowFijarDibujar(x, y, w, h);
-    gowIconosDibujar(x, y, w, h);
     gowTrucosMenuDibujar();
     if (g_funcionCuadro)
         dibujarFps(x, y, h);

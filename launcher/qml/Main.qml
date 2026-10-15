@@ -29,7 +29,7 @@ ApplicationWindow {
         property int alto: 800
         property string aspecto: ""
         property bool estirar: false
-        property string filtro: "fsr"
+        property string filtro: "bilineal" // GOW-Port (ultimate): imagen suave por defecto
         property real nitidez: 0.8
         property bool fxaa: true
         property string resolucionInterna: "2" // GOW-Port: "auto" (según la pantalla) o "1".."8" (PS2X_GS_ESCALA)
@@ -47,7 +47,6 @@ ApplicationWindow {
         property int versionAjustes: 0
         property bool controlesDmc5: true
         property bool cancelarAnimaciones: true // GOW-Port: evasión y búfer de entrada más ágiles (GOW_CANCELAR)
-        property string iconosBotones: "auto" // GOW-Port: iconos de botones: auto | teclado | xbox | original (GOW_ICONOS_ESTILO)
         property bool escSalir: false
         property bool minimizarAlJugar: true
         property int segundosJugados: 0
@@ -112,7 +111,7 @@ ApplicationWindow {
         ajustes.alto = pantalla.ancho / pantalla.alto < 1.7 ? 800 : 720
         ajustes.aspecto = aspectoPorDefecto()
         ajustes.estirar = false
-        ajustes.filtro = "fsr"
+        ajustes.filtro = "bilineal"
         ajustes.nitidez = 0.8
         ajustes.fxaa = true
         ajustes.resolucionInterna = "2"
@@ -126,7 +125,6 @@ ApplicationWindow {
         ajustes.arranqueRapido = false
         ajustes.controlesDmc5 = true
         ajustes.cancelarAnimaciones = true
-        ajustes.iconosBotones = "auto"
         ajustes.escSalir = false
         ajustes.minimizarAlJugar = true
         ajustes.trucos = ""
@@ -154,7 +152,7 @@ ApplicationWindow {
             elf: ajustes.elf, iso: ajustes.iso, ejecutable: ajustes.ejecutable,
             saltarVideos: ajustes.saltarVideos, arranqueRapido: ajustes.arranqueRapido,
             controlesDmc5: ajustes.controlesDmc5, escSalir: ajustes.escSalir,
-            cancelarAnimaciones: ajustes.cancelarAnimaciones, iconosBotones: ajustes.iconosBotones,
+            cancelarAnimaciones: ajustes.cancelarAnimaciones,
             teclas: Teclas.cadena(Teclas.leer(ajustes.teclas)),
             trucos: ajustes.trucos, idioma: Tema.idioma
         }
@@ -631,7 +629,7 @@ ApplicationWindow {
                                                                 : Tema.t("ventana") + " · " + ajustes.ancho + "×" + ajustes.alto,
                             ajustes.aspecto,
                             ventana.textoEscala(ventana.escalaElegida()) + (ajustes.escalaDinamica ? " · " + Tema.t("dinamicaCorta") : ""),
-                            ajustes.filtro === "fsr" ? "FSR 1.0" + (ajustes.fxaa ? " + FXAA" : "") : (ajustes.filtro === "bilineal" ? "Bilinear" : "Pixel"),
+                            (ajustes.filtro === "fsr" ? "Bicubic" : "Bilinear") + (ajustes.fxaa ? " + FXAA" : ""),
                             (ajustes.fpsLimite > 0 ? ajustes.fpsLimite + " FPS" : Tema.t("sinLimite")) + (ajustes.vsync ? " · VSync" : "")
                         ]
                         delegate: Rectangle {

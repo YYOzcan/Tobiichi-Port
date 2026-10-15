@@ -122,16 +122,6 @@ ScrollView {
             }
         }
         Fila {
-            titulo: Tema.t("iconosBotones")
-            descripcion: Tema.t("iconosBotonesDesc")
-            Selector {
-                opciones: [{ texto: Tema.t("iconosAuto"), valor: "auto" }, { texto: Tema.t("iconosTeclado"), valor: "teclado" },
-                           { texto: "Xbox", valor: "xbox" }, { texto: "PlayStation", valor: "original" }]
-                valor: raiz.ajustes.iconosBotones
-                onElegido: (v) => raiz.ajustes.iconosBotones = v
-            }
-        }
-        Fila {
             titulo: Tema.t("cancelarAnimaciones")
             descripcion: Tema.t("cancelarAnimacionesDesc")
             Interruptor {

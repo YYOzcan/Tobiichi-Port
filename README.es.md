@@ -36,93 +36,71 @@
 
 En lugar de emular la PlayStation 2 instrucción a instrucción, este proyecto **traduce el ejecutable original del
 juego (`SCUS_973.99`) a C++** con [PS2Recomp](https://github.com/ran-j/PS2Recomp) y lo compila como un programa
-nativo de PC, enlazado con un runtime que reimplementa el hardware y el sistema operativo de la PS2 (núcleo del EE,
-GS, VU1, DMA, SPU2, CD/DVD…). El procesador de E/S (IOP) ejecuta los **módulos IRX originales** del juego (driver de
-sonido, lector de datos…) en un intérprete R3000A.
+nativo de PC. Desde la versión *Ultimate* funciona sobre el runtime de
+[God-Of-War-Native-Port de Waffle565](https://github.com/Waffle565/God-Of-War-Native-Port): renderizador nativo del
+GS por render targets en la GPU, los 8 módulos IRX del juego y su microcódigo de VU1 compilados por adelantado a C++,
+vídeos, sonido, mando y tarjeta de memoria nativos. Tobiichi Port añade la compilación para Linux, el lanzador, el
+panorámico Hor+ y sus extras de juego.
 
-El objetivo es un port con sensación nativa: velocidad de juego en tiempo real, presentación fluida, gráficos y
-sonido correctos.
+El objetivo es un port que se sienta nativo: velocidad de juego en tiempo real, imagen fluida, gráficos y sonido
+correctos.
 
 ## Lo más destacado
 
 | | |
 |---|---|
-| **Lanzador** | Tarjeta gráfica, resolución, panorámica, escalado FSR, límite de FPS y rutas de archivos en un solo sitio |
-| **Panorámica** | Cámara Hor+ real (16:9, 16:10, 21:9), basada en el parche de PCSX2; desactivada = idéntica bit a bit al original |
-| **Resolución interna** | El GS dibuja a 1×–8× (supermuestreo); 2× por defecto, con resolución dinámica que baja un paso si la GPU no llega a 60 FPS. "Imagen nítida" quita el doblado de líneas y el antiparpadeo de la PS2 |
-| **Escalado** | AMD FSR 1.0 (EASU + RCAS) y FXAA en la capa de presentación; reducción por área si la imagen es mayor que la pantalla |
-| **Ventana fluida** | La ventana presenta hasta 120+ FPS con independencia de la lógica del juego a 60 Hz |
-| **Audio** | Estirado temporal con zona muerta y reloj del IOP ligado al tiempo del EE: el tempo se queda en 1,00, sin bucles |
-| **VU1 recompilada** | El microcódigo VU1 del juego se compila a código nativo; modo rápido con la precisión de PCSX2 (1,5 veces más rápido) o modo exacto bit a bit |
-| **Velocidad real** | El VBlank sigue al reloj real: el juego pierde cuadros en lugar de ir a cámara lenta |
-| **Fijar objetivo** | **Alt** fija el enemigo más cercano y Kratos dirige sus ataques a él; mueve el ratón a izquierda o derecha para cambiar de objetivo |
-| **Combate ágil** | Desde una voltereta se ataca o se bloquea al 20 % en lugar del 50 %, y una pulsación de ataque perdida se repite un momento (por ejemplo, soltar L1 y atacar en el mismo cuadro); cortar ataques con el bloqueo o la evasión ya estaba en el juego |
-| **Iconos de botones** | Los iconos de botones del juego siguen al dispositivo: la tecla o el botón del ratón asignados, los botones Xbox con otros mandos (A/B/X/Y, LB/RB/LT/RT) y los originales con uno de PlayStation; dibujados a la resolución de la ventana con el estilo de los menús del juego |
-| **Menú de trucos** | **F2** en el juego: inmortalidad, muerte de un golpe, magia y Furia de los Dioses infinitas, orbes al máximo, todas las mejoras y poderes, todos los extras |
+| **Lanzador** | Tarjeta gráfica, resolución, relación de aspecto, filtro de imagen, límite de cuadros, rutas — todo en un sitio |
+| **Panorámico** | Cámara Hor+ real (16:9, 16:10, 21:9), basada en el parche de PCSX2; los vídeos pasan a las versiones panorámicas del propio juego y llenan la pantalla |
+| **Renderizador nativo** | Render targets del GS en la GPU (OpenGL 4.3+), resolución interna 1×–4× (2× por defecto) |
+| **Imagen** | Bilineal (suave) o bicúbico con realce ajustable, FXAA opcional |
+| **Vídeos** | Todos los vídeos se reproducen de forma nativa (libmpeg2) a velocidad real, con su sonido, y devuelven el control al juego |
+| **IOP y VU1 nativos** | Los módulos IRX y el microcódigo de VU1 del juego funcionan como C++ compilado, no interpretado (~20 s hasta la partida) |
+| **Fijar objetivo** | **Alt** fija el enemigo más cercano y Kratos dirige sus ataques a él; mover el ratón a izquierda o derecha cambia de objetivo |
+| **Combate ágil** | Los ataques y bloqueos salen de una voltereta al 20 % en lugar del 50 %, y una pulsación de ataque perdida se reintenta un momento |
+| **Menú de trucos** | **F2** en la partida: inmortalidad, matar de un golpe, magia y Furia de los Dioses infinitas, orbes al máximo, todas las mejoras y poderes, desbloquear todos los extras |
+| **Aspecto original** | Los iconos de botones de PlayStation y el HUD del propio juego, sin cambios |
 
 ## Estado actual
 
-<a href="docs/estado/detalle.es.md"><img src="docs/estado/mapa.es.svg" alt="Mapa de estado del port: funciones de las bibliotecas del SDK de Sony y componentes de hardware de la PS2, coloreados por estado" width="100%"></a>
-
-Desglose por biblioteca y componente: [`docs/estado/detalle.es.md`](docs/estado/detalle.es.md).
-
 | Hito | Estado |
 |---|:---:|
-| Recompilar `SCUS_973.99` a C++ (6 418 archivos) y compilar de forma nativa | ✅ |
-| Módulos IRX originales en el emulador del IOP; lectura desde la ISO original | ✅ |
-| Menús, selección de dificultad, juego, mando y teclado/ratón | ✅ |
-| Imagen (OpenGL; rasterizador por hardware con `fragment_shader_interlock` o de cómputo) | ✅ |
-| Audio a tempo de tiempo real | ✅ |
-| Panorámica (Hor+) y escalado FSR | ✅ |
-| Resolución interna 2×–8× e imagen nítida | ✅ |
-| FMV: la intro se reproduce entera con imagen y sonido y pasa al juego; los demás vídeos usan el mismo camino, sin comprobar uno a uno | 🔧 |
-| Tarjeta de memoria: guardar/cargar verificado; formatear sin verificar | 🔧 |
-| Rendimiento: 60 FPS en partida con el modo rápido de VU1 (la escena de prueba del barco pasó de 30 a 60 en una RTX 4050) | ✅ |
+| Recompilar `SCUS_973.99` a C++ (6.418 archivos) y compilarlo de forma nativa en Linux | ✅ |
+| Arranque, menús, partida, mando y teclado/ratón | ✅ |
+| Renderizador nativo del GS, panorámico Hor+, resolución interna 1×–4× | ✅ |
+| Vídeos con sonido, a pantalla completa | ✅ |
+| Módulos del IOP y VU1 como código nativo; sonido, mando, tarjeta de memoria | ✅ |
+| Compilación para Windows de esta versión | 🔧 el código de Windows es el de Waffle565, aún sin recompilar aquí |
 
 ### Sobre los cuadros por segundo
 
-La lógica del juego está ligada al VBlank de 60 Hz de la PS2, así que **el juego en sí no puede pasar de 60 FPS**;
-subir el VBlank solo hace que se juegue más rápido. La ventana sí puede presentar a 120 Hz o más, lo que muestra cada
-cuadro nuevo antes y reduce la latencia. El límite es el hilo de VU1 (CPU). El **modo rápido de VU1**
-(`PS2X_VU1_RAPIDO=ON`, la compilación por defecto aquí) usa la precisión de PCSX2 (SSE con redondeo hacia cero, DAZ/FTZ,
-flags Z/S perezosos) en lugar del modelo exacto: VU1 por cuadro 22 → 13 ms y la escena de prueba más pesada de 30 a
-60 FPS, con la imagen del cuadro de prueba idéntica píxel a píxel. `PS2X_VU1_RAPIDO=OFF` compila el modo exacto. Una
-GPU dedicada importa para el rasterizador del GS (4–7 ms por cuadro en una RTX 4050 frente a 20–26 ms en una Radeon
-680M).
-
-**Resolución interna:** cada posición de muestra tiene su propia copia de la VRAM del GS (el esquema de
-paraLLEl-GS); las lecturas y las paletas usan la copia nativa, así que el juego ve la misma memoria que en una PS2.
-El coste de GPU crece con el cuadrado de la escala. En una RTX 4050 Laptop: 1× 60 FPS, 2× 40–60 FPS, 3× 18–24 FPS.
-4× o más necesitan una GPU mucho más rápida. La resolución dinámica (activada por defecto)
-mantiene los 60 FPS bajando hasta 1×; por debajo de eso el límite es la GPU. "Imagen nítida" ya quita por sí sola casi
-todo el desenfoque de la PS2.
+La lógica del juego va atada al VBlank de 60 Hz de la PS2, así que **el juego no puede pasar de 60 cuadros/s**. En
+un portátil con Radeon 680M (perfil de rendimiento) el combate en la cubierta del barco va a 50-60 cuadros/s a 1× y
+a 46-47 a 2×; el límite es el hilo de VU1 (CPU). A 3× la GPU integrada se llena: con gráficos integrados, 2× o menos.
+La opción de contador de cuadros del lanzador muestra en una esquina los del juego y los de la ventana.
 
 ## Inicio rápido
 
-Necesitas tu propio `SCUS_973.99`, los módulos del disco (`*.IRX`) a su lado y la ISO original (llamada
-`God of War.iso`, en la carpeta superior a la del ELF, o indica su ruta con `GOW_ISO`). Lista completa:
-[`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md).
+Necesitas tu propio `SCUS_973.99`, los módulos del disco (`*.IRX`) a su lado y la ISO original (`God of War.iso`
+junto al ELF, o elígela en el lanzador). Pasos completos: [`docs/ULTIMATE.md`](docs/ULTIMATE.md).
 
 ### Linux
 
 ```bash
 cd PS2Recomp
-cmake --build build --target ps2EntryRunner -j$(nproc)    # compila el ejecutor del juego
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2X_ENABLE_RUNTIME_LOGS=OFF \
+  -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_IOP_RPC_TRACE=OFF -DPS2X_BUILD_STUDIO=OFF
+ninja -C build ps2EntryRunner                              # tras colocar el código generado (docs/ULTIMATE.md)
 cd .. && cmake -S launcher -B launcher/build -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja -C launcher/build                                    # compila el lanzador
+ninja -C launcher/build                                    # compilar el lanzador
 launcher/build/tobiichi-launcher                           # ábrelo, revisa "Archivos" y pulsa JUGAR
 ```
 
-Sin el lanzador: `./run_gow.sh`. Usa la GPU por defecto del sistema; `TOBIICHI_GPU=nvidia ./run_gow.sh` fuerza la
-NVIDIA dedicada (PRIME offload).
+Sin el lanzador: `./run_gow.sh`.
 
 ### Windows
 
-```bat
-scripts\1_instalar_herramientas.cmd   :: solo la primera vez (Git y Build Tools con winget)
-scripts\2_compilar.cmd                :: 20–40 min la primera vez
-scripts\3_ejecutar.cmd
-```
+El camino de Windows (WGL, vibración por XInput) viene sin cambios del runtime de Waffle565; esta versión aún no se ha
+recompilado en Windows. Los pasos de Waffle565 están en [`docs/waffle/build-and-run.md`](docs/waffle/build-and-run.md).
 
 ## God Of War: Tobiichi Launcher
 
@@ -131,7 +109,7 @@ variables `TOBIICHI_*` correspondientes. Detalle: [`docs/LANZADOR.md`](docs/LANZ
 
 | Pestaña | Qué se puede ajustar |
 |---|---|
-| **Gráficos** | Tarjeta gráfica, pantalla completa/ventana y resolución, relación de aspecto (4:3, 16:9, 16:10, 21:9 Hor+), estirar, escalado FSR / bilineal / píxel, nitidez, FXAA, resolución de dibujo (automática, 1×–8×), imagen nítida |
+| **Gráficos** | Tarjeta gráfica, pantalla completa/ventana y resolución, relación de aspecto (4:3, 16:9, 16:10, 21:9 Hor+), estirar, filtro de imagen bilineal / bicúbico, nitidez, FXAA, resolución de dibujo (1×–4×) |
 | **Rendimiento** | Límite de FPS (30 … sin límite), VSync, contador de FPS en pantalla |
 | **Archivos** | Ejecutable del juego (verificado por CRC), ISO, ejecutor del port, carpeta de la tarjeta de memoria, detección automática |
 | **Controles** | Esquema de teclado, comportamiento de ESC, tabla de teclas |
@@ -167,10 +145,10 @@ flowchart LR
     B --> D[~6 400 archivos C++]
     D --> E[CMake + Ninja]
     O[gow_overrides.cpp] --> E
-    P[Runtime de PS2Recomp + parches] --> E
-    V[Microcódigo VU1 compilado a C++] --> E
+    P[Runtime de Waffle565 + extras de Tobiichi] --> E
+    V[Microcódigo VU1 compilado a C++<br/>renderizador nativo del GS] --> E
     E --> F[ps2EntryRunner]
-    I[Módulos IRX originales] --> G[Emulador del IOP R3000A]
+    I[Módulos IRX originales] --> G[IRX compilados a C++]
     G --> F
     L[Lanzador] -->|variables TOBIICHI_*| F
 ```
@@ -186,10 +164,11 @@ Convenciones para colaborar: [`AGENTS.md`](AGENTS.md).
 ## Créditos y licencia
 
 - [**PS2Recomp**](https://github.com/ran-j/PS2Recomp) de ran-j y colaboradores — recompilador y runtime (GPL-3.0).
+- [**God-Of-War-Native-Port de Waffle565**](https://github.com/Waffle565/God-Of-War-Native-Port) — el runtime de la versión Ultimate: renderizador nativo del GS, IOP y VU1 compilados, vídeos, sonido y tarjeta de memoria nativos (GPL-3.0).
 - [**Fork del runtime de SotC**](https://github.com/LightVelox/PS2Recomp/tree/ac9efa070638ad3b3accd284de6f898d5ab271d1) de Taylor N. Albarnaz / LightVelox — backend GS OpenGL, cola de comandos y arreglos del EE (GPL-3.0).
 - [**god-of-war-recomp de KIexster**](https://github.com/KIexster/god-of-war-recomp) — la tubería de recompilación de God of War y los parches de VU1/VIF sobre los que se construye este port.
 - Panorámica: basada en el parche "Widescreen 16:9" de PCSX2 para SCUS-97399, de nemesis2000 y CRASHARKI.
-- Lanzador: fuente [Cinzel](https://github.com/NDISCOVER/Cinzel) (SIL OFL 1.1, `launcher/recursos/fuentes/OFL.txt`); escalado adaptado de AMD FidelityFX Super Resolution 1.0 (MIT).
+- Lanzador: fuente [Cinzel](https://github.com/NDISCOVER/Cinzel) (SIL OFL 1.1, `launcher/recursos/fuentes/OFL.txt`).
 - *God of War* © Sony Interactive Entertainment / Santa Monica Studio. Este proyecto no está afiliado ni respaldado por Sony. No se distribuye ningún contenido del juego.
 
 El código de este repositorio se publica bajo la licencia **GPL-3.0**, en coherencia con PS2Recomp. Ver [`LICENSE`](LICENSE).

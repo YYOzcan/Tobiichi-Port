@@ -371,11 +371,6 @@ bool Lanzador::iniciar(const QVariantMap &a)
     bandera("TOBIICHI_DMC5_CONTROLS", a.value(QStringLiteral("controlesDmc5")).toBool(), "0");
     bandera("TOBIICHI_ESC_SALIR", a.value(QStringLiteral("escSalir")).toBool(), "0");
     bandera("GOW_CANCELAR", a.value(QStringLiteral("cancelarAnimaciones"), true).toBool(), "0");
-    const QString iconos = a.value(QStringLiteral("iconosBotones"), QStringLiteral("auto")).toString();
-    if (iconos == QStringLiteral("teclado") || iconos == QStringLiteral("xbox") || iconos == QStringLiteral("original"))
-        entorno.insert(QStringLiteral("GOW_ICONOS_ESTILO"), iconos);
-    else
-        entorno.remove(QStringLiteral("GOW_ICONOS_ESTILO"));
     // Teclado y ratón configurables (ps2_pad.cpp): "accion=codigo,codigo;...".
     const QString teclas = a.value(QStringLiteral("teclas")).toString();
     if (teclas.isEmpty())
