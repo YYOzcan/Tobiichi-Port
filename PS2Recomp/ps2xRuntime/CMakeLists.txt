@@ -388,10 +388,24 @@ add_library(ps2_runtime STATIC
     src/lib/gs/gs_swizzle.cpp
     src/lib/gs/gpu/gs_gl.cpp
     src/lib/gs/gpu/gs_gpu_backend.cpp
+    src/lib/gs/gpu/gs_hw_render.cpp
     src/lib/gs/gpu/gs_gpu_shaders.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
+    # GOW-Port: menú de trucos de God of War (F2).
+    src/lib/gow_trucos.cpp
+    # GOW-Port: vídeos (FMV) de God of War.
+    src/lib/gow_peliculas.cpp
+    src/lib/gow_video.cpp
+    src/lib/gow_fijar.cpp
+    src/lib/gow_cancelar.cpp
+    src/lib/gow_captura_gs.cpp
+    src/lib/gow_sondeo.cpp
+    src/lib/gow_iconos.cpp
+    src/lib/ps2_muestreo.cpp
+    src/lib/gow_espera.cpp
+    src/lib/ps2_afinidad.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
@@ -473,6 +487,19 @@ if(NOT MSVC)
         src/lib/vu/ps2_vu1_lower.cpp
         ${VU1_COMPILED_SRCS}
         PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+endif()
+
+# GOW-Port: modo rápido de VU1 (precisión de PCSX2 en lugar de la exacta; ver ps2_vu1_compiled.inl). Con OFF
+# el código de VU1 es bit a bit igual al intérprete (huellas de repetir_cadena_vif).
+option(PS2X_VU1_RAPIDO "VU1 con la precisión de PCSX2 (más rápido) en lugar de la exacta" OFF)
+if(PS2X_VU1_RAPIDO)
+    set_property(SOURCE
+        src/lib/vu/ps2_vu1_core.cpp
+        src/lib/vu/ps2_vu1_upper.cpp
+        src/lib/vu/ps2_vu1_lower.cpp
+        ${VU1_COMPILED_SRCS}
+        APPEND PROPERTY COMPILE_DEFINITIONS PS2X_VU1_RAPIDO=1)
+    message(STATUS "VU1 en modo rápido (precisión de PCSX2)")
 endif()
 
 # GOW-Port: PGO de VU1 (solo Clang). PS2X_VU1_PGO_PROFILE es un .profdata local (llvm-profdata merge) de una
@@ -572,6 +599,20 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+
+# GOW-Port: fuente de los rótulos de los iconos de botones (assets/fuentes/Cinzel.ttf, OFL) incrustada en el binario.
+set(GOW_FUENTE_ICONOS "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/fuentes/Cinzel.ttf")
+set(GOW_FUENTE_ICONOS_CPP "${CMAKE_CURRENT_BINARY_DIR}/gow_fuente_iconos.cpp")
+if(EXISTS "${GOW_FUENTE_ICONOS}")
+    file(READ "${GOW_FUENTE_ICONOS}" GOW_FUENTE_HEX HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," GOW_FUENTE_BYTES "${GOW_FUENTE_HEX}")
+    set(GOW_FUENTE_CONTENIDO "#include <cstddef>\nextern const unsigned char gowFuenteIconos[] = {${GOW_FUENTE_BYTES}};\nextern const std::size_t gowFuenteIconosTam = sizeof(gowFuenteIconos);\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GOW_FUENTE_ICONOS}")
+else()
+    set(GOW_FUENTE_CONTENIDO "#include <cstddef>\nextern const unsigned char gowFuenteIconos[] = {0};\nextern const std::size_t gowFuenteIconosTam = 0;\n")
+endif()
+file(CONFIGURE OUTPUT "${GOW_FUENTE_ICONOS_CPP}" CONTENT "${GOW_FUENTE_CONTENIDO}" @ONLY)
+target_sources(ps2_runtime PRIVATE "${GOW_FUENTE_ICONOS_CPP}")
 if(WIN32)
     # GOW-Port: WGL propio del hilo GS.
     target_link_libraries(ps2_runtime PRIVATE opengl32 gdi32)
@@ -580,6 +621,24 @@ target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
 )
+
+# GOW-Port: banco de pruebas de VIF1/VU1 (tools/render/repetir_cadena_vif.cpp) con el microcódigo compilado del
+# juego: mide y compara (huellas) el mismo envío de VIF1 capturado en partida con GOW_VIF_CAPTURA. Fuera de "all".
+set(GOW_REPETIR_VIF "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/render/repetir_cadena_vif.cpp")
+if(EXISTS "${GOW_REPETIR_VIF}" AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    add_executable(repetir_cadena_vif EXCLUDE_FROM_ALL "${GOW_REPETIR_VIF}" ${VU1_COMPILED_SRCS})
+    target_link_libraries(repetir_cadena_vif PRIVATE ps2_runtime)
+endif()
+
+# GOW-Port: gow_captura_gs.cpp incluye src/gow_gs_replay.h de la raíz del repositorio.
+set_source_files_properties(src/lib/gow_captura_gs.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/../../src")
+# GOW-Port: extrae a PNG las texturas de una captura GOW_GS_REPLAY_TRACE (tools/render/texturas_gs.cpp).
+set(GOW_TEXTURAS_GS "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/render/texturas_gs.cpp")
+if(EXISTS "${GOW_TEXTURAS_GS}" AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    add_executable(texturas_gs EXCLUDE_FROM_ALL "${GOW_TEXTURAS_GS}")
+    target_include_directories(texturas_gs PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../src" "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs")
+    target_link_libraries(texturas_gs PRIVATE ps2_runtime)
+endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE

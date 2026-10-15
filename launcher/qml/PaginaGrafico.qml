@@ -9,6 +9,7 @@ ScrollView {
     required property var tarjetas
     required property var pantalla
     required property bool gpuPerdida
+    required property int escalaAuto
     contentWidth: availableWidth
     clip: true
 
@@ -45,6 +46,21 @@ ScrollView {
         var esta = false
         for (var j = 0; j < lista.length; ++j) if (lista[j].valor === clave) esta = true
         if (!esta) lista.push({ texto: pantalla.ancho + " × " + pantalla.alto + "  (" + Tema.t("nativa") + ")", valor: clave })
+        return lista
+    }
+
+    function textoEscala(n) {
+        return n + "× · " + (512 * n) + "×" + (448 * n)
+    }
+
+    readonly property var opcionesEscala: {
+        var lista = [{ texto: Tema.tf("internaAuto", textoEscala(raiz.escalaAuto)), valor: "auto" }]
+        var pasos = [1, 2, 3, 4, 5, 6, 8]
+        for (var i = 0; i < pasos.length; ++i) {
+            var n = pasos[i]
+            var detalle = n === 1 ? Tema.t("internaNativa") : (n >= 6 ? Tema.t("internaExtrema") : (n >= 4 ? Tema.t("internaPesada") : ""))
+            lista.push({ texto: textoEscala(n), valor: String(n), detalle: detalle })
+        }
         return lista
     }
 
@@ -148,12 +164,35 @@ ScrollView {
         Fila {
             titulo: Tema.t("interna")
             descripcion: Tema.t("internaDesc")
+            Selector {
+                opciones: raiz.opcionesEscala
+                valor: raiz.ajustes.resolucionInterna
+                onElegido: (v) => raiz.ajustes.resolucionInterna = v
+            }
+        }
+        Fila {
+            titulo: Tema.t("dibujoHardware")
+            descripcion: Tema.t("dibujoHardwareDesc")
+            Interruptor {
+                checked: raiz.ajustes.dibujoHardware
+                onToggled: raiz.ajustes.dibujoHardware = checked
+            }
+        }
+        Fila {
+            titulo: Tema.t("escalaDinamica")
+            descripcion: Tema.t("escalaDinamicaDesc")
+            Interruptor {
+                checked: raiz.ajustes.escalaDinamica
+                onToggled: raiz.ajustes.escalaDinamica = checked
+            }
+        }
+        Fila {
+            titulo: Tema.t("imagenNitida")
+            descripcion: Tema.t("imagenNitidaDesc")
             separador: false
-            Text {
-                anchors.right: parent.right
-                text: Tema.t("internaValor")
-                color: Tema.textoSuave
-                font.pixelSize: 14
+            Interruptor {
+                checked: raiz.ajustes.imagenNitida
+                onToggled: raiz.ajustes.imagenNitida = checked
             }
         }
     }

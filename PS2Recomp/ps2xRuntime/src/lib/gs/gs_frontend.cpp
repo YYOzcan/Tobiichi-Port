@@ -416,6 +416,41 @@ void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
 
 void GS::recordDrawDebugEventUnlocked(int vertexCount)
 {
+    // GOW-Port (antes de la pausa del historial): GOW_GS_DRAW_DIAG=<saltar>:<cuántos>: primitivas (tipo, textura, marco, rango de XY y UV) para ver cómo
+    // dibuja el juego las imágenes de los vídeos.
+    {
+        static const std::pair<uint32_t, uint32_t> drawDiag = []
+        {
+            const char *v = std::getenv("GOW_GS_DRAW_DIAG");
+            const char *colon = v ? std::strchr(v, ':') : nullptr;
+            if (!colon)
+                return std::pair<uint32_t, uint32_t>{0u, 0u};
+            return std::pair<uint32_t, uint32_t>{static_cast<uint32_t>(std::strtoul(v, nullptr, 10)),
+                                                 static_cast<uint32_t>(std::strtoul(colon + 1, nullptr, 10))};
+        }();
+        static uint32_t drawDiagCount = 0;
+        static const long drawDiagTbp = [] { const char *v = std::getenv("GOW_GS_DRAW_TBP"); return v ? std::strtol(v, nullptr, 0) : -1L; }();
+        if (drawDiag.second != 0u && (drawDiagTbp < 0 || (m_prim.tme && static_cast<long>(m_ctx[m_prim.ctxt ? 1u : 0u].tex0.tbp0) == drawDiagTbp)) &&
+            drawDiagCount++ >= drawDiag.first && drawDiagCount <= drawDiag.first + drawDiag.second)
+        {
+            const int n = std::min(vertexCount, kMaxVerts);
+            float x0 = m_vtxQueue[0].x, x1 = x0, y0 = m_vtxQueue[0].y, y1 = y0;
+            uint32_t u0 = m_vtxQueue[0].u, u1 = u0, v0 = m_vtxQueue[0].v, v1 = v0;
+            float s0 = m_vtxQueue[0].s, t0 = m_vtxQueue[0].t;
+            for (int i = 1; i < n; ++i)
+            {
+                x0 = std::min(x0, m_vtxQueue[i].x); x1 = std::max(x1, m_vtxQueue[i].x);
+                y0 = std::min(y0, m_vtxQueue[i].y); y1 = std::max(y1, m_vtxQueue[i].y);
+                u0 = std::min<uint32_t>(u0, m_vtxQueue[i].u); u1 = std::max<uint32_t>(u1, m_vtxQueue[i].u);
+                v0 = std::min<uint32_t>(v0, m_vtxQueue[i].v); v1 = std::max<uint32_t>(v1, m_vtxQueue[i].v);
+            }
+            std::fprintf(stderr, "[gs-draw] prim=%u tme=%u fst=%u tbp=0x%x tbw=%u psm=0x%x tw=%u th=%u fbp=0x%x fbw=%u "
+                                 "xy=%.1f,%.1f:%.1f,%.1f uv=%u,%u:%u,%u st=%.4f,%.4f n=%d\n",
+                         static_cast<unsigned>(m_prim.type), m_prim.tme ? 1u : 0u, m_prim.fst ? 1u : 0u,
+                         m_ctx[m_prim.ctxt ? 1u : 0u].tex0.tbp0, m_ctx[m_prim.ctxt ? 1u : 0u].tex0.tbw, m_ctx[m_prim.ctxt ? 1u : 0u].tex0.psm, m_ctx[m_prim.ctxt ? 1u : 0u].tex0.tw, m_ctx[m_prim.ctxt ? 1u : 0u].tex0.th, m_ctx[m_prim.ctxt ? 1u : 0u].frame.fbp,
+                         m_ctx[m_prim.ctxt ? 1u : 0u].frame.fbw, x0, y0, x1, y1, u0, v0, u1, v1, s0, t0, vertexCount);
+        }
+    }
     if (m_debugHistoryPaused)
     {
         return;
@@ -530,7 +565,8 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
-bool gowGsPresentMailboxActive(); // GOW-Port: gs_threaded_backend.cpp
+bool gowGsPresentMailboxActive();       // GOW-Port: gs_threaded_backend.cpp
+uint64_t gowGsPresentMailboxDelivered(); // GOW-Port: gs_threaded_backend.cpp
 
 void GS::latchHostPresentationFrame()
 {
@@ -549,17 +585,24 @@ void GS::latchHostPresentationFrame()
     }
 
     PresentationFrame frame{};
+    bool mismoCuadro = false;
     {
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
         if (m_backend)
         {
             // GOW-Port: con el buzón de presentación (gs_threaded_backend.cpp) no se espera al hilo del GS.
-            if (!gowGsPresentMailboxActive())
+            const bool buzon = gowGsPresentMailboxActive();
+            if (!buzon)
                 m_backend->Flush();
             m_backend->Sync(GSSyncReason::Presentation);
+            const uint64_t entregado = buzon ? gowGsPresentMailboxDelivered() : 0u;
             frame = m_backend->Present(request);
+            // Buzón sin cuadro nuevo: se conserva el cuadro ya fijado, sin copiarlo de nuevo.
+            mismoCuadro = buzon && !frame && entregado != 0u && gowGsPresentMailboxDelivered() == entregado;
         }
     }
+    if (mismoCuadro)
+        return;
 
     const bool hasFrame = static_cast<bool>(frame);
     const uint32_t displayFbp = frame.displayFbp;
@@ -620,7 +663,9 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        // GOW-Port: filas de 640 píxeles, salvo cuadros sin relleno (resolución interna, gs_gpu_backend.cpp).
+        const bool sinRelleno = m_hostPresentationFrame.size() == packedRowBytes * static_cast<size_t>(outHeight);
+        const size_t sourceRowBytes = sinRelleno ? packedRowBytes : static_cast<size_t>(kHostFrameWidth) * 4u;
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
@@ -962,6 +1007,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         uint16_t y = static_cast<uint16_t>((lo >> 32) & 0xFFFF);
         uint32_t z = static_cast<uint32_t>((hi >> 4) & 0xFFFFFF);
         uint8_t f = static_cast<uint8_t>((hi >> 36) & 0xFF);
+        m_curFog = f; // GOW-Port: XYZF escribe FOG también con ADC, para el XYZ posterior.
         bool adk = ((hi >> 47) & 1) != 0;
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
@@ -1063,7 +1109,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         vtx.t = m_curT;
         vtx.u = m_curU;
         vtx.v = m_curV;
-        vtx.fog = static_cast<uint8_t>((hi >> 36) & 0xFF);
+        m_curFog = static_cast<uint8_t>((hi >> 36) & 0xFF); // GOW-Port: XYZF3 retiene FOG sin dibujar.
+        vtx.fog = m_curFog;
         vertexKick(false);
         break;
     }
@@ -1243,7 +1290,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         vtx.x = static_cast<float>(value & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((value >> 16) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<double>((value >> 32) & 0xFFFFFF);
-        vtx.fog = static_cast<uint8_t>((value >> 56) & 0xFF);
+        m_curFog = static_cast<uint8_t>((value >> 56) & 0xFF); // GOW-Port: A+D/REGLIST comparten FOG.
+        vtx.fog = m_curFog;
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1437,6 +1485,26 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        // GOW-Port: GOW_GS_TRX_DIAG=<saltar>:<cuántas> (o 1 = 0:4000): transferencias (destino, posición, tamaño,
+        // sentido) a partir de la número <saltar>, para ver cómo sube el juego las imágenes de los vídeos.
+        static const std::pair<uint32_t, uint32_t> trxDiag = []
+        {
+            const char *v = std::getenv("GOW_GS_TRX_DIAG");
+            if (!v || !*v || v[0] == '0')
+                return std::pair<uint32_t, uint32_t>{0u, 0u};
+            const char *colon = std::strchr(v, ':');
+            if (!colon)
+                return std::pair<uint32_t, uint32_t>{0u, 4000u};
+            return std::pair<uint32_t, uint32_t>{static_cast<uint32_t>(std::strtoul(v, nullptr, 10)),
+                                                 static_cast<uint32_t>(std::strtoul(colon + 1, nullptr, 10))};
+        }();
+        static uint32_t trxDiagCount = 0;
+        if (trxDiag.second != 0u && trxDiagCount++ >= trxDiag.first && trxDiagCount <= trxDiag.first + trxDiag.second)
+        {
+            std::fprintf(stderr, "[gs-trx] dir=%u dbp=0x%x dbw=%u dpsm=0x%x pos=%u,%u size=%ux%u sbp=0x%x\n", m_trxdir,
+                         m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw,
+                         m_trxreg.rrh, m_bitbltbuf.sbp);
+        }
 
         if (m_backend)
         {

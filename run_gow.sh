@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 cd "/home/yigit/Belgeler/Origami Tobiichi/PS2Recomp"
-export GOW_FAST_BOOT=1
-export GOW_SKIP_FMV=1
+# GOW_FAST_BOOT=1 da por terminada la animación de entrada en cuanto carga el nivel (acorta la apertura): no se usa.
+export GOW_FAST_BOOT=${GOW_FAST_BOOT:-0}
+export GOW_SKIP_FMV=${GOW_SKIP_FMV:-1} # GOW-Port: vídeos desactivados por ahora (se retomarán tras optimizar la partida)
 export TOBIICHI_DMC5_CONTROLS=1
-export PS2X_GS_GPU=1
+export PS2X_GS_GPU=${PS2X_GS_GPU:-1}
 # GOW-Port: GPU. Por defecto la del sistema (en el portátil híbrido, la integrada AMD): radeonsi no tiene
 # GL_ARB_fragment_shader_interlock y el GS usa el rasterizador de cómputo puro. TOBIICHI_GPU=nvidia fuerza la
 # dedicada (PRIME offload) si `nvidia-smi` responde: rasterizado por hardware y mucha más potencia.
@@ -40,5 +41,8 @@ export PS2X_GS_ASYNC_PRESENT=${PS2X_GS_ASYNC_PRESENT:-1}
 # Presentación por buzón: el hilo principal muestra el último cuadro listo sin esperar a que el hilo del GS vacíe
 # su cola. Sin esto, con el juego a 50-60 cuadros/s la ventana caía a 6-10 cuadros/s.
 export PS2X_GS_PRESENT_BUZON=${PS2X_GS_PRESENT_BUZON:-1}
+# Presentación compartida: el contexto del GS comparte texturas con el de la ventana y entrega el cuadro en la GPU, sin
+# leerlo a la RAM ni volver a subirlo (2048x1792 a 4x). PS2X_GS_DIRECT_PRESENT=0 vuelve a la lectura.
+export PS2X_GS_DIRECT_PRESENT=${PS2X_GS_DIRECT_PRESENT:-1}
 # PS2X_RUNNER: otro ejecutable (p. ej. uno guardado) para comparar.
 "${PS2X_RUNNER:-./build/ps2xRuntime/ps2EntryRunner}" "/home/yigit/Belgeler/Origami Tobiichi/SCUS_973.99" "$@"

@@ -16,6 +16,8 @@ extern "C"
 }
 #endif
 
+#include <algorithm>
+#include <chrono>
 #include <deque>
 #include <memory>
 
@@ -33,6 +35,40 @@ namespace ps2_stubs
             int64_t pts90k = -1;
             std::vector<uint8_t> rgba;
         };
+
+        // GOW-Port: último cuadro pedido con sceMpegGetPictureRAW8, para el CSC del IPU (ver mpegCuadroParaCsc).
+        struct MpegCscState
+        {
+            std::mutex mutex;
+            MpegDecodedFrame frame;
+            uint32_t nextMacroblock = 0u; // siguiente macrobloque del cuadro (un CSC puede ir en varias tandas)
+            uint64_t serial = 0u;
+        };
+        MpegCscState g_mpegCsc;
+
+        // GOW-Port: último cuadro servido al juego, para presentarlo en la ventana (ps2MpegCuadroPantalla). God of War
+        // muestra los vídeos releyendo la imagen RGB32 como PSMZ16 y redibujándola en franjas de 8 píxeles (truco de
+        // la memoria del GS que nuestro GS no reproduce); la ventana muestra este cuadro mientras dura el vídeo.
+        struct MpegPantalla
+        {
+            std::mutex mutex;
+            std::vector<uint8_t> rgba;
+            int width = 0;
+            int height = 0;
+            uint64_t serial = 0u;
+        };
+        MpegPantalla g_mpegPantalla;
+
+        void publicarCuadroPantalla(const MpegDecodedFrame &frame)
+        {
+            if (frame.width <= 0 || frame.height <= 0 || frame.rgba.size() < static_cast<size_t>(frame.width) * frame.height * 4u)
+                return;
+            std::lock_guard<std::mutex> lock(g_mpegPantalla.mutex);
+            g_mpegPantalla.rgba.assign(frame.rgba.begin(), frame.rgba.begin() + static_cast<std::ptrdiff_t>(frame.width) * frame.height * 4);
+            g_mpegPantalla.width = frame.width;
+            g_mpegPantalla.height = frame.height;
+            ++g_mpegPantalla.serial;
+        }
 
 #if PS2X_HAS_FFMPEG
         std::string ffmpegErrorString(int err)
@@ -482,7 +518,11 @@ namespace ps2_stubs
         // NTSC-style fields at ~59.94 Hz to keep MPEG timing yet (29.97 fps).
         constexpr uint64_t kDefaultPictureIntervalQ32 = 2ull * kPictureClockOne;
         constexpr size_t kMpegTimingScanLimit = 4096u;
-        constexpr size_t kMaxDecodedPicturesAhead = 8u;
+        // GOW-Port: 8 cuadros (0,27 s) no bastaban: en tramos en los que el PSS lleva el vídeo por delante del
+        // audio, el demux se paraba antes de llegar a los paquetes de audio y el sonido de God of War se quedaba sin
+        // datos (su anillo del IOP es de 85 ms: se oía un tramo repetido y el audio quedaba retrasado). ~1 s de vídeo
+        // decodificado por delante (30 cuadros 640x480, ~37 MB) da margen al audio.
+        constexpr size_t kMaxDecodedPicturesAhead = 30u;
 
         struct MpegPlaybackState
         {
@@ -494,6 +534,8 @@ namespace ps2_stubs
             bool sawInput = false;
             bool sawSequenceEnd = false;
             bool streamEnded = false;
+            // GOW-Port: el PSS demultiplexado llegó a su código de fin de programa (0x000001B9).
+            bool programEndSeen = false;
             bool decoderFailed = false;
             uint64_t cdStreamGeneration = 0u;
             bool waitingForVideoSequenceHeader = true;
@@ -1221,6 +1263,7 @@ namespace ps2_stubs
                 if (streamId == kMpegProgramEnd)
                 {
                     playback.streamEnded = true;
+                    playback.programEndSeen = true; // GOW-Port
                     playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
                     flushDecoderIfEnded(playback);
                     erasePssPrefix(playback, buffer.size());
@@ -1656,6 +1699,58 @@ namespace ps2_stubs
             dispatchStreamCallbacks(rdram, ctx, runtime, events);
         }
 
+        // GOW-Port: como libmpeg, las funciones de flujo (sceMpegAddStrCallback) se ejecutan durante el
+        // demultiplexado, antes de volver a quien llamó a sceMpegDemuxPss(Ring). Encolarlas (dispatchStreamCallbacks)
+        // las dejaba para después: God of War lee la cabecera de secuencia del vídeo (ancho y alto, 0x189E44) justo
+        // tras el primer sceMpegDemuxPss, con su función de vídeo (0x18A788) aún sin ejecutar; quedaba en 0x0, el
+        // juego reservaba un búfer de imagen de 0 bytes y cada cuadro se escribía encima de otros datos (paquetes
+        // GIF rotos, pantalla con basura). Aquí se ejecutan en orden en el hilo actual y después sigue quien llamó
+        // (con el valor de retorno ya puesto en ctx). Si no hay ninguna, vuelve sin más.
+        void dispatchStreamCallbacksNow(uint8_t *rdram,
+                                        R5900Context *ctx,
+                                        PS2Runtime *runtime,
+                                        const std::vector<MpegStreamCallbackEvent> &events)
+        {
+            std::vector<GuestInvocation> invocations;
+            for (const MpegStreamCallbackEvent &event : events)
+            {
+                for (const MpegRegisteredCallback &callback : event.callbacks)
+                {
+                    if (!rdram || !ctx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
+                        continue;
+                    const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+                    if (cbDataAddr == 0u)
+                        continue;
+                    if (!writeMpegCallbackData(rdram, cbDataAddr, event))
+                    {
+                        runtime->guestFree(cbDataAddr);
+                        continue;
+                    }
+                    R5900Context callbackCtx = *ctx;
+                    SET_GPR_U32(&callbackCtx, 4, event.mpegAddr);
+                    SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
+                    SET_GPR_U32(&callbackCtx, 6, callback.data);
+                    SET_GPR_U32(&callbackCtx, 7, 0u);
+                    SET_GPR_U32(&callbackCtx, 29, 0u);
+                    SET_GPR_U32(&callbackCtx, 31, 0u);
+                    callbackCtx.pc = callback.func;
+                    GuestInvocation invocation{};
+                    invocation.kind = GuestInvocationKind::HleCall;
+                    invocation.context = callbackCtx;
+                    invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
+                    {
+                        runtime->guestFree(cbDataAddr);
+                    };
+                    invocations.push_back(std::move(invocation));
+                }
+            }
+            if (invocations.empty())
+                return;
+            EeScheduler &scheduler = runtime->eeScheduler();
+            scheduler.bindMainContextForSyscall(*ctx, rdram);
+            scheduler.invokeCurrentSequence(std::move(invocations));
+        }
+
         void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height)
         {
             if (!rdram || destAddr == 0u)
@@ -1962,8 +2057,15 @@ namespace ps2_stubs
         g_mpeg_stub_state.initialized = true;
         (void)getPlaybackState(mpegAddr);
         const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
-        g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
-            MpegRegisteredCallback{streamType, streamId, callbackFunc, callbackData, handle, true});
+        // GOW-Port: como en libmpeg, cada flujo (tipo y canal) tiene un solo callback y volver a añadirlo lo sustituye.
+        // God of War los registra antes y después de su segundo sceMpegCreate: cada paquete de audio y vídeo se
+        // entregaba dos veces, el anillo de audio del juego se llenaba al doble de ritmo y rechazaba paquetes.
+        std::vector<MpegRegisteredCallback> &callbacks = g_mpeg_stub_state.callbacksByMpeg[mpegAddr];
+        callbacks.erase(std::remove_if(callbacks.begin(), callbacks.end(),
+                                       [&](const MpegRegisteredCallback &c)
+                                       { return c.stream && c.type == streamType && c.streamId == streamId; }),
+                        callbacks.end());
+        callbacks.push_back(MpegRegisteredCallback{streamType, streamId, callbackFunc, callbackData, handle, true});
         setReturnU32(ctx, 0u);
     }
 
@@ -2170,8 +2272,8 @@ namespace ps2_stubs
             });
         }
 
-        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
+        dispatchStreamCallbacksNow(rdram, ctx, runtime, callbackEvents); // GOW-Port: síncronas, como libmpeg
     }
 
     void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2265,8 +2367,8 @@ namespace ps2_stubs
             });
         }
 
-        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
+        dispatchStreamCallbacksNow(rdram, ctx, runtime, callbackEvents); // GOW-Port: síncronas, como libmpeg
     }
 
     void sceMpegDispCenterOffX(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2333,9 +2435,14 @@ namespace ps2_stubs
     // GOW-Port: llama a sceMpegCbNodata(mpeg, &cbData{type = Nodata}, data) en el hilo actual y despues vuelve a
     // evaluar sceMpegGetPicture. Si el callback no aporto datos, espera al siguiente VSync antes de reintentar
     // para no acaparar la CPU que necesita el hilo que lee del disco.
+    // GOW-Port: sceMpegGetPicture y sceMpegGetPictureRAW8 comparten la espera del cuadro y su ritmo. Con raw8 el
+    // cuadro no se escribe en la memoria del juego: queda para la conversión de color del IPU (CSC), que el juego
+    // pide después (God of War: RAW8 + CSC a RGB16) y que ps2_memory.cpp resuelve con ps2MpegCsc.
+    static void getPictureImpl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool raw8);
+
     [[noreturn]] static void dispatchNodataCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
                                                     uint32_t mpegAddr, const MpegRegisteredCallback &callback,
-                                                    uint64_t demuxedBefore)
+                                                    uint64_t demuxedBefore, bool raw8)
     {
         EeScheduler &scheduler = runtime->eeScheduler();
         scheduler.bindMainContextForSyscall(*ctx, rdram);
@@ -2356,8 +2463,8 @@ namespace ps2_stubs
         SET_GPR_U32(&invocation.context, 6, callback.data);
         SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
-        invocation.onComplete = [rdram, runtime, mpegAddr, cbDataAddr, demuxedBefore](const R5900Context &,
-                                                                                      R5900Context &parent)
+        invocation.onComplete = [rdram, runtime, mpegAddr, cbDataAddr, demuxedBefore, raw8](const R5900Context &,
+                                                                                            R5900Context &parent)
         {
             if (cbDataAddr != 0u)
             {
@@ -2376,23 +2483,59 @@ namespace ps2_stubs
                 runtime->eeScheduler().waitVSync(
                     runtime->eeScheduler().currentVSyncTick(),
                     -1,
-                    [rdram, runtime](R5900Context &resumeContext)
+                    [rdram, runtime, raw8](R5900Context &resumeContext)
                     {
                         if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
                         {
                             return;
                         }
-                        sceMpegGetPicture(rdram, &resumeContext, runtime);
+                        getPictureImpl(rdram, &resumeContext, runtime, raw8);
                     });
             }
-            sceMpegGetPicture(rdram, &parent, runtime);
+            getPictureImpl(rdram, &parent, runtime, raw8);
         };
         scheduler.invokeCurrent(std::move(invocation));
     }
 
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        getPictureImpl(rdram, ctx, runtime, false);
+    }
+
+    static void getPictureImpl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool raw8)
+    {
         const uint32_t mpegAddr = getRegU32(ctx, 4);
+        {
+            static const bool diag = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
+            static uint32_t diagCount = 0;
+            if (diag && diagCount++ < 60u)
+            {
+                uint32_t campos[8]{};
+                const uint32_t base = mpegAddr & 0x01FFFFFFu;
+                if (base + 0x60u <= PS2_RAM_SIZE)
+                    std::memcpy(campos, rdram + base + 0x48u, sizeof(campos));
+                std::fprintf(stderr, "[fmv-entrada] mpeg=0x%x a1=0x%x a2=%u ra=0x%x +48..64=%x %x %x %x %x %x %x %x\n", mpegAddr,
+                             getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 31), campos[0], campos[1], campos[2],
+                             campos[3], campos[4], campos[5], campos[6], campos[7]);
+                if (diagCount == 1u && base + 0x100u <= PS2_RAM_SIZE)
+                {
+                    uint32_t punteros[8]{};
+                    std::memcpy(punteros, rdram + base + 0xE8u, sizeof(punteros));
+                    std::fprintf(stderr, "[fmv-entrada] +e8..104=%x %x %x %x %x %x %x %x\n", punteros[0], punteros[1], punteros[2],
+                                 punteros[3], punteros[4], punteros[5], punteros[6], punteros[7]);
+                    for (uint32_t k : {punteros[0], punteros[3], punteros[4]})
+                    {
+                        const uint32_t a = k & 0x01FFFFFFu;
+                        if (a == 0u || a + 64u > PS2_RAM_SIZE)
+                            continue;
+                        std::fprintf(stderr, "[fmv-entrada] 0x%x:", a);
+                        for (uint32_t i = 0; i < 48u; ++i)
+                            std::fprintf(stderr, " %02x", rdram[a + i]);
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
         const uint32_t imageAddr = getRegU32(ctx, 5);
         uint32_t width = kStubMovieWidth;
         uint32_t height = kStubMovieHeight;
@@ -2414,7 +2557,7 @@ namespace ps2_stubs
                 {
                     const uint64_t demuxedBefore = playback.demuxedBytes;
                     lock.unlock();
-                    dispatchNodataCallback(rdram, ctx, runtime, mpegAddr, nodata, demuxedBefore);
+                    dispatchNodataCallback(rdram, ctx, runtime, mpegAddr, nodata, demuxedBefore, raw8);
                 }
                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
                 {
@@ -2431,13 +2574,13 @@ namespace ps2_stubs
                     EeWaitReason::Mpeg,
                     kMpegPictureWaitType,
                     mpegAddr,
-                    [rdram, runtime](R5900Context &resumeContext)
+                    [rdram, runtime, raw8](R5900Context &resumeContext)
                     {
                         if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
                         {
                             return;
                         }
-                        sceMpegGetPicture(rdram, &resumeContext, runtime);
+                        getPictureImpl(rdram, &resumeContext, runtime, raw8);
                     });
             }
 
@@ -2467,13 +2610,13 @@ namespace ps2_stubs
                     runtime->eeScheduler().waitVSync(
                         eligibleTick - 1u,
                         -1,
-                        [rdram, runtime](R5900Context &resumeContext)
+                        [rdram, runtime, raw8](R5900Context &resumeContext)
                         {
                             if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
                             {
                                 return;
                             }
-                            sceMpegGetPicture(rdram, &resumeContext, runtime);
+                            getPictureImpl(rdram, &resumeContext, runtime, raw8);
                         });
                 }
 
@@ -2525,9 +2668,91 @@ namespace ps2_stubs
             }
         }
 
-        if (haveFrame)
         {
+            static const bool diag = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
+            static uint32_t diagCount = 0;
+            const auto diagLeer32 = [](const uint8_t *ram, uint32_t addr)
+            {
+                uint32_t v = 0u;
+                addr &= 0x01FFFFFFu;
+                if (addr + 4u <= PS2_RAM_SIZE)
+                    std::memcpy(&v, ram + addr, 4u);
+                return v;
+            };
+            if (diag && diagCount++ < 400u)
+            {
+                const uint32_t pelicula = diagLeer32(rdram, 0x304F20u);
+                std::fprintf(stderr, "[fmv-cuadro] raw8=%d mpeg=0x%x imagen=0x%x hay=%d %ux%u n=%u modo140=%u modo14c=0x%x "
+                             "obj=0x%x 58=%u 5c=%u img=0x%x,0x%x,0x%x,0x%x raw=0x%x,0x%x\n",
+                             raw8 ? 1 : 0, mpegAddr, imageAddr, haveFrame ? 1 : 0, width, height, frameCount,
+                             pelicula ? diagLeer32(rdram, pelicula + 0x140u) : 0u,
+                             pelicula ? diagLeer32(rdram, pelicula + 0x14Cu) : 0u, pelicula,
+                             diagLeer32(rdram, pelicula + 0x58u), diagLeer32(rdram, pelicula + 0x5Cu),
+                             diagLeer32(rdram, pelicula + 0x94u), diagLeer32(rdram, pelicula + 0x98u),
+                             diagLeer32(rdram, pelicula + 0x9Cu), diagLeer32(rdram, pelicula + 0xA0u),
+                             diagLeer32(rdram, pelicula + 0x9Cu), diagLeer32(rdram, pelicula + 0xA0u));
+            }
+        }
+        if (raw8)
+        {
+            // El CSC posterior usa este cuadro (o uno negro si aún no hay ninguno).
+            std::lock_guard<std::mutex> lock(g_mpegCsc.mutex);
+            if (haveFrame)
+            {
+                publicarCuadroPantalla(frame);
+                g_mpegCsc.frame = std::move(frame);
+            }
+            else if (frameCount == 0u)
+            {
+                g_mpegCsc.frame = MpegDecodedFrame{};
+                g_mpegCsc.frame.width = static_cast<int>(width);
+                g_mpegCsc.frame.height = static_cast<int>(height);
+                g_mpegCsc.frame.rgba.assign(static_cast<size_t>(width) * height * 4u, 0u);
+            }
+            g_mpegCsc.nextMacroblock = 0u;
+            ++g_mpegCsc.serial;
+        }
+        else if (haveFrame)
+        {
+            {
+                // GOW-Port: GOW_FMV_DIAG=1: hora de cada cuadro servido (sincronía con el sonido, que registra spu2.cpp).
+                static const bool diagAv = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
+                if (diagAv && (frameCount < 3u || frameCount % 150u == 0u))
+                    std::fprintf(stderr, "[fmv-av] cuadro=%u pts=%lld t_ms=%lld\n", frameCount, static_cast<long long>(frame.pts90k),
+                                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                            std::chrono::steady_clock::now().time_since_epoch())
+                                                            .count()));
+            }
             writeDecodedFrameToGuest(rdram, imageAddr, frame);
+            publicarCuadroPantalla(frame);
+            // GOW-Port: GOW_FMV_DIAG=1: el cuadro 60 en fmv_cuadro.ppm (FFmpeg) y fmv_guest.ppm (memoria del juego leída
+            // por columnas de 16 píxeles, como la escribe writeDecodedFrameToGuest).
+            static const bool volcar = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
+            if (volcar && frameCount == 60u && frame.width > 0 && frame.height > 0)
+            {
+                const uint32_t w = static_cast<uint32_t>(frame.width), h = static_cast<uint32_t>(frame.height);
+                if (std::FILE *f = std::fopen("fmv_cuadro.ppm", "wb"))
+                {
+                    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+                    for (uint32_t i = 0; i < w * h; ++i)
+                        std::fwrite(frame.rgba.data() + i * 4u, 1, 3, f);
+                    std::fclose(f);
+                }
+                if (std::FILE *f = std::fopen("fmv_guest.ppm", "wb"))
+                {
+                    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+                    const uint32_t oh = align16(h);
+                    for (uint32_t y = 0; y < h; ++y)
+                        for (uint32_t x = 0; x < w; ++x)
+                        {
+                            const uint32_t off = (x / 16u) * oh * 64u + y * 64u + (x % 16u) * 4u;
+                            const uint8_t *px = getMemPtr(rdram, imageAddr + off);
+                            const uint8_t zero[3] = {0, 0, 0};
+                            std::fwrite(px ? px : zero, 1, 3, f);
+                        }
+                    std::fclose(f);
+                }
+            }
         }
         else if (frameCount == 0u)
         {
@@ -2539,7 +2764,7 @@ namespace ps2_stubs
 
     void sceMpegGetPictureRAW8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceMpegGetPictureRAW8", rdram, ctx, runtime);
+        getPictureImpl(rdram, ctx, runtime, true);
     }
 
     void sceMpegGetPictureRAW8xy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2577,9 +2802,12 @@ namespace ps2_stubs
         // Only the producer/demux EOF is authoritative. A sequence_end_code can
         // be observed while more PSS data is still buffered, and a decoder
         // failure before producer EOF may still recover on a later sequence.
+        // GOW-Port: el fin de programa del PSS también es definitivo. God of War lee el PSS con su propio lector
+        // y llama a sceMpegDemuxPss, sin sceCdSt*, así que el productor nunca marca EOF y el vídeo no terminaba.
         const bool producerEnded =
-            g_mpeg_stub_state.currentCdStreamEofSeen &&
-            playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
+            playback.programEndSeen ||
+            (g_mpeg_stub_state.currentCdStreamEofSeen &&
+             playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration);
         const bool ended = producerEnded &&
                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
         const uint64_t presentationEnd = playback.presentationEndTickQ32;
@@ -2689,4 +2917,96 @@ namespace ps2_stubs
         getPlaybackState(mpegAddr).imageBufferAddr = imageBufferAddr;
         setReturnS32(ctx, 0);
     }
+}
+
+// GOW-Port: CSC del IPU (comando 7) con el cuadro de sceMpegGetPictureRAW8. God of War pide RAW8 (YCbCr por
+// macrobloque) y lo convierte con el IPU (DMA a IPU, CSC a RGB16 con tramado, DMA desde IPU). El runtime no emula el
+// IPU: el cuadro ya está decodificado en RGBA (FFmpeg), así que aquí se escriben directamente los macrobloques de
+// salida: 16x16 píxeles en orden de líneas, RGB16 (5:5:5, bit 15 = alfa) o RGB32 (alfa 0x80), en el mismo orden de
+// macrobloques que sceMpegGetPicture (columnas: de arriba abajo y de izquierda a derecha; GOW_FMV_ORDEN=filas para
+// probar el otro). Sin tramado. Devuelve false si no hay cuadro (no se ha llamado a RAW8).
+bool ps2MpegCsc(uint8_t *rdram, uint32_t destAddr, uint32_t maxBytes, uint32_t macroblocks, bool rgb16)
+{
+    using namespace ps2_stubs;
+    std::lock_guard<std::mutex> lock(g_mpegCsc.mutex);
+    if (g_mpegCsc.serial == 0u || !rdram)
+        return false;
+    static const bool porFilas = []
+    {
+        const char *v = std::getenv("GOW_FMV_ORDEN");
+        return v && std::strcmp(v, "filas") == 0;
+    }();
+    const MpegDecodedFrame &frame = g_mpegCsc.frame;
+    static const bool diag = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
+    static uint32_t diagCount = 0;
+    if (diag && diagCount++ < 200u)
+        std::fprintf(stderr, "[fmv-csc] destino=0x%x bytes=%u mb=%u rgb16=%d cuadro=%dx%d serie=%llu siguiente=%u\n", destAddr,
+                     maxBytes, macroblocks, rgb16 ? 1 : 0, frame.width, frame.height,
+                     static_cast<unsigned long long>(g_mpegCsc.serial), g_mpegCsc.nextMacroblock);
+    const uint32_t width = static_cast<uint32_t>(std::max(frame.width, 0));
+    const uint32_t height = static_cast<uint32_t>(std::max(frame.height, 0));
+    const uint32_t mbw = std::max(1u, (width + 15u) / 16u);
+    const uint32_t mbh = std::max(1u, (height + 15u) / 16u);
+    const uint32_t mbBytes = rgb16 ? 512u : 1024u;
+    const bool hayPixeles = frame.rgba.size() >= static_cast<size_t>(width) * height * 4u;
+    for (uint32_t n = 0; n < macroblocks && (n + 1u) * mbBytes <= maxBytes; ++n)
+    {
+        const uint32_t index = g_mpegCsc.nextMacroblock++;
+        const uint32_t mbx = porFilas ? index % mbw : index / mbh;
+        const uint32_t mby = porFilas ? index / mbw : index % mbh;
+        const uint32_t dst = destAddr + n * mbBytes;
+        if (dst + mbBytes > PS2_RAM_SIZE)
+            break;
+        uint8_t *out = rdram + dst;
+        for (uint32_t y = 0; y < 16u; ++y)
+            for (uint32_t x = 0; x < 16u; ++x)
+            {
+                const uint32_t px = mbx * 16u + x, py = mby * 16u + y;
+                uint8_t r = 0, g = 0, b = 0;
+                if (hayPixeles && px < width && py < height)
+                {
+                    const uint8_t *src = frame.rgba.data() + (static_cast<size_t>(py) * width + px) * 4u;
+                    r = src[0];
+                    g = src[1];
+                    b = src[2];
+                }
+                if (rgb16)
+                {
+                    const uint16_t v = static_cast<uint16_t>((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | 0x8000u);
+                    std::memcpy(out + (y * 16u + x) * 2u, &v, 2u);
+                }
+                else
+                {
+                    uint8_t *o = out + (y * 16u + x) * 4u;
+                    o[0] = r;
+                    o[1] = g;
+                    o[2] = b;
+                    o[3] = 0x80u;
+                }
+            }
+    }
+    return true;
+}
+
+// GOW-Port: copia el último cuadro de vídeo servido si es posterior a `serial` (y actualiza `serial`). Devuelve false si
+// no hay uno nuevo. Para la ventana (ps2_runtime.cpp), en el hilo principal.
+bool ps2MpegCuadroPantalla(std::vector<uint8_t> &rgba, int &width, int &height, uint64_t &serial)
+{
+    using namespace ps2_stubs;
+    std::lock_guard<std::mutex> lock(g_mpegPantalla.mutex);
+    if (g_mpegPantalla.serial == serial || g_mpegPantalla.rgba.empty())
+        return false;
+    rgba = g_mpegPantalla.rgba;
+    width = g_mpegPantalla.width;
+    height = g_mpegPantalla.height;
+    serial = g_mpegPantalla.serial;
+    return true;
+}
+
+// GOW-Port: número del último cuadro publicado (0 = ninguno), para no mostrar el final de un vídeo anterior.
+uint64_t ps2MpegSerieCuadroPantalla()
+{
+    using namespace ps2_stubs;
+    std::lock_guard<std::mutex> lock(g_mpegPantalla.mutex);
+    return g_mpegPantalla.serial;
 }

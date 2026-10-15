@@ -51,6 +51,10 @@ namespace
         {"PS2X_GS_FRENTE", "1"},
         {"PS2X_GS_ASYNC_PRESENT", "1"},
         {"PS2X_GS_PRESENT_BUZON", "1"},
+#if !defined(_WIN32)
+        // GOW-Port: presentación compartida (sin lectura a la RAM); en Windows sin probar con el renderizador nuevo.
+        {"PS2X_GS_DIRECT_PRESENT", "1"},
+#endif
     };
 
     QString leerTexto(const QString &ruta)
@@ -383,6 +387,25 @@ bool Lanzador::iniciar(const QVariantMap &a)
     bandera("GOW_FAST_BOOT", a.value(QStringLiteral("arranqueRapido")).toBool());
     bandera("TOBIICHI_DMC5_CONTROLS", a.value(QStringLiteral("controlesDmc5")).toBool(), "0");
     bandera("TOBIICHI_ESC_SALIR", a.value(QStringLiteral("escSalir")).toBool(), "0");
+    bandera("GOW_CANCELAR", a.value(QStringLiteral("cancelarAnimaciones"), true).toBool(), "0");
+    const QString iconos = a.value(QStringLiteral("iconosBotones"), QStringLiteral("auto")).toString();
+    if (iconos == QStringLiteral("teclado") || iconos == QStringLiteral("xbox") || iconos == QStringLiteral("original"))
+        entorno.insert(QStringLiteral("GOW_ICONOS_ESTILO"), iconos);
+    else
+        entorno.remove(QStringLiteral("GOW_ICONOS_ESTILO"));
+    // Teclado y ratón configurables (ps2_pad.cpp): "accion=codigo,codigo;...".
+    const QString teclas = a.value(QStringLiteral("teclas")).toString();
+    if (teclas.isEmpty())
+        entorno.remove(QStringLiteral("TOBIICHI_TECLAS"));
+    else
+        entorno.insert(QStringLiteral("TOBIICHI_TECLAS"), teclas);
+    // Menú de trucos (F2 en la partida): los activos al arrancar y el idioma del menú.
+    const QString trucos = a.value(QStringLiteral("trucos")).toString();
+    if (trucos.isEmpty())
+        entorno.remove(QStringLiteral("TOBIICHI_TRUCOS"));
+    else
+        entorno.insert(QStringLiteral("TOBIICHI_TRUCOS"), trucos);
+    entorno.insert(QStringLiteral("TOBIICHI_IDIOMA"), a.value(QStringLiteral("idioma"), QStringLiteral("en")).toString());
     // Ventana.
     const bool completa = a.value(QStringLiteral("modoPantalla")).toString() == QStringLiteral("completa");
     entorno.insert(QStringLiteral("TOBIICHI_PANTALLA"), completa ? QStringLiteral("completa") : QStringLiteral("ventana"));
@@ -404,6 +427,11 @@ bool Lanzador::iniciar(const QVariantMap &a)
     const double nitidez = std::clamp(a.value(QStringLiteral("nitidez"), 0.8).toDouble(), 0.0, 1.0);
     entorno.insert(QStringLiteral("TOBIICHI_NITIDEZ"), QString::number(2.0 * (1.0 - nitidez), 'f', 2));
     bandera("TOBIICHI_FXAA", a.value(QStringLiteral("fxaa")).toBool());
+    // Resolución interna del GS (1..8; la interfaz resuelve "automático" según la pantalla) e imagen nítida.
+    entorno.insert(QStringLiteral("PS2X_GS_ESCALA"), QString::number(std::clamp(a.value(QStringLiteral("escala"), 1).toInt(), 1, 8)));
+    bandera("PS2X_GS_NITIDO", a.value(QStringLiteral("imagenNitida"), true).toBool(), "0");
+    bandera("PS2X_GS_ESCALA_DINAMICA", a.value(QStringLiteral("escalaDinamica"), true).toBool(), "0");
+    bandera("PS2X_GS_HW", a.value(QStringLiteral("dibujoHardware"), true).toBool(), "0");
     // Ritmo de la ventana.
     entorno.insert(QStringLiteral("TOBIICHI_VENTANA_FPS"), QString::number(a.value(QStringLiteral("fpsLimite"), 120).toInt()));
     bandera("TOBIICHI_VSYNC", a.value(QStringLiteral("vsync")).toBool());

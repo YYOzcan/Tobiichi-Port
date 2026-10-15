@@ -108,3 +108,73 @@ PHASE_RUNTIME_BUILD
   - Verified on the Radeon 680M: guard OK, speed 1.00, window ~110-120, 60 fps in menus and 30 in gameplay (iGPU-bound), audio tempo 1.00, 16:10 captures look correct.
   - Not done: 2-4x internal resolution (needs a supersampled GS VRAM).
   - Not committed.
+- 2026-10-12 (audio loops): The SPU2 output itself repeated, so this was not the host stretch.
+  - KON reset the loop start to SSA, discarding the LSA the driver writes before KON, so loops restarted from the beginning. KON now keeps LSA (PCSX2 V_Voice::Start).
+  - The exponential ADSR decrease used truncating division, so slow releases stalled at ~12 % and voices looped forever. It now uses an arithmetic shift, and sustain decreasing to 0 stops the voice.
+  - A nested SPU2 IRQ is no longer dropped (unused by GoW).
+  - Results: active voices 26.7 → 17.8, near-exact repeated seconds 7 → 2 (the remaining ones are the menu fire loop).
+  - New opt-in diag GOW_SPU2_DIAG / GOW_SPU2_PCM. Two new regression tests; suite 564/567 (same 3 old failures).
+  - Still missing: SPU2 reverb (core 1 has it enabled), volume sweep, gaussian interpolation. Not committed.
+- 2026-10-12 (audio, real music-loop cause): NAX exposed "block + 8" as soon as the last block of a stream chunk was decoded.
+  - GoW's streaming driver (double buffer per channel with LSA ping-pong) polls NAX. It saw 0x8020, outside its chunk, so it did KOFF and restarted the music from chunk A every ~0.35 s.
+  - Fix: block end is resolved on the last sample, and NAX reads like hardware (inside the playing block, then LSA past its header).
+  - Trace tool GOW_SPU2_TRAZA=<core><voice>. New regression test; suite 565/568.
+  - User confirmed by ear: music plays through.
+- 2026-10-12 (perf analysis, crash guards):
+  - Crash: NVIDIA driver SIGSEGV in rlDrawRenderBatch during FSR presentation. Fix: no auto-iconify in fullscreen, no drawing while minimized or at size 0.
+  - VU1 load (GOW_VU1_PERFIL): ~57k programs/s, 3 entries, ~3.4M VU cycles per game frame. Real PS2 VU1 would also need ~22.7 ms, so these scenes are 30 fps on hardware too. We cost ~8.2 ns per VU cycle.
+  - Dependency probe (GOW_VU1_DEPS): >99.9% of programs depend on the immediately previous one (VF5/VF4 live-ins, memory). Multi-threading VU1 is not viable.
+  - Sampler: VU1 thread 88% busy (blocks 67%); EE 64% (≈27% scheduler accounting while polling).
+  - 60 fps in heavy scenes needs ~1.75x VU1 speed, which requires redesigning the generated VU1 code.
+- 2026-10-12 (cheat menu): In-game trainer `src/lib/gow_trucos.cpp`, **F2** (raylib overlay, TR/EN/ES via `TOBIICHI_IDIOMA`).
+  - Cheats: god mode, one-hit kills, infinite magic, infinite Rage of the Gods, 60000 orbs, all upgrades, all powers
+    + trident, max health/magic levels, all extras (0x2A12C8 |= 0x1F; saved to the card).
+  - Addresses come from the ELF:
+    - Kratos state 0x302CC0;
+    - player tunables 0x3028E0;
+    - Kratos = `*(*0x29CD58)`, health +0x178 / max +0x17C;
+    - health setter 0x1E0A80 and damage 0x1E0A98, both wrapped via `replaceFunction`.
+  - Per-VBlank writes from `EeScheduler`.
+  - The scePad2Read wrapper is now always installed for GoW; it neutralizes the pad while the menu is open.
+  - Launcher: "Cheats" tab (`TOBIICHI_TRUCOS`). Tabs are now sized to their text.
+  - Verified with `TOBIICHI_TRUCOS_DIAG`: values applied, Kratos pointer plausible, undead die in one hit, Kratos
+    damage → 0. Details in docs/ESTADO.md and docs/CONTROLES.md. Not committed.
+- 2026-10-12 (magic keys): New key actions.
+  - 1 Poseidon (D-pad down), 2 Medusa (left), 3 Zeus (right), 4 Hades (up), per the game's control table
+    0x29CF38 and SelectMagic in 0x1D7250. The current magic is at 0x302D3E.
+  - Middle mouse = L1+R1 (draw/sheathe the Blade of Artemis).
+  - Old saved maps are migrated in Teclas.leer.
+  - L2/R2 labels fixed (L2 casts magic, R2 interacts).
+  - tst_teclas 8/8.
+- 2026-10-12 (fast VU1 mode, user chose PCSX2-level precision): CMake option `PS2X_VU1_RAPIDO` (default OFF; ON in our build).
+  - FMAC in SSE with RZ+DAZ+FTZ, no operand normalization or range checks, result clamped to ±max.
+  - Status flags not computed (no status reader in compiled code); lazy MAC queue (Z/S + ready cycle) resolved by
+    FMEQ/FMAND/FMOR.
+  - Replay 10.9 → 7.4 ms with the rendered frame pixel-identical.
+  - PGO regenerated (logs/herramientas/pgo_vu1.sh → logs/vu1_gcc_pgo_rapido).
+  - In game (RTX 4050, ship deck): median 30.00 → 59.93 fps, VU 22 → 13 ms/frame, image guard OK.
+- 2026-10-13 (FMV complete + KIexster PMULTH):
+  - Intro FMV now plays to the end with picture and sound and hands over to gameplay. Five fixes:
+    (1) game's `sceMpegIsEnd` 0x26FF70 had no stub (reads mp->sys+0, never set by the HLE decoder) → redirected to HLE in
+    `gow_peliculas.cpp`, and HLE IsEnd accepts the PSS program-end code (no sceCdSt producer EOF in GoW);
+    (2) window shows the FFmpeg frame while 0x29C838 != 0 (previous session);
+    (3) `sceMpegAddStrCallback` now replaces the callback of the same stream (GoW registers twice → every packet doubled);
+    (4) SPU2 ADMA implemented in `ps2xIOP/.../spu2.cpp` (file-scope state, no header change): 1 KB L/R blocks read lazily
+    at 48 kHz, BVOL as s16 (>>15), DMA IRQ delayed until the last block is read (`spu2AdmaRetardo`, extern in
+    `iop_memory.cpp`), overlapping DMAs queued;
+    (5) verified with `GOW_FMV_AUDIO_REF` vs `GOW_AUDIO_VOLCADO`: 8567 blocks identical (ncc 1.00).
+  - Defaults: launcher `saltarVideos=false`, `run_gow.sh` `GOW_SKIP_FMV=0`.
+  - KIexster sync: only `ee-pmulth` merged (`sincronizar_kiexster.py --parche ee-pmulth`), regenerated with the patched
+    recompiler (`PS2Recomp/build/ps2xRecomp/ps2_recomp` + `config/recomp.template.toml`), and only 3 files changed
+    (copied into `~/gow-friend-build/generated2`, old copies in `~/.cache/tobiichi-sync/generated2_antes_pmulth/`).
+    Full sync (213 commits, 21 conflicts) is pending.
+  - Full runner rebuild on Linux = ~35 CPU-min (~15 min at -j3), not hours.
+- 2026-10-13 (evening, playtest prep):
+  - User-reported "cutscene skips before Kratos says 'the gods have abandoned me'" = `GOW_FAST_BOOT=1` (launcher
+    default + hardcoded in run_gow.sh). It bypasses the 13.3 s intro animation (0x21E700 query) that holds the
+    first FMV frame while a 22 kHz voice stream plays. Fast boot is now OFF by default; launcher migrates saved
+    settings once (`versionAjustes=2`). Pattern: a debug shortcut from the 2-fps era silently cut game content.
+  - FMV audio is lossless: host queue in front of the game's audio ring (0x18A8F8 reimplemented, refilled from
+    0x189A88), decode lead 8→30 frames. The old 85 ms repeat at video 35 s is gone.
+  - Merged KIexster gs-fog-latch, gs-fog-math, gs-discard-uncovered via `--parche`. Suite 578/581 (3 known).
+  - Backup: ~/.cache/tobiichi-sync/yedek_10131626/.

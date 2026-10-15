@@ -4,6 +4,10 @@
 #include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
 
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+void vu1RapidoResolverMac(uint32_t &mac, uint64_t ciclo); // GOW-Port: ps2_vu1_core.cpp (modo rápido de VU1)
+#endif
+
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -249,6 +253,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     case 0x18: // FMEQ
     {
         commitReadyFlags(); // GOW-Port: flags listos en este ciclo
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+        if (m_unit == Unit::VU1)
+            vu1RapidoResolverMac(m_state.mac, m_cycle); // MAC perezoso del modo rápido (ps2_vu1_step.inl)
+#endif
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
@@ -258,6 +266,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     case 0x1A: // FMAND
     {
         commitReadyFlags(); // GOW-Port: flags listos en este ciclo
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+        if (m_unit == Unit::VU1)
+            vu1RapidoResolverMac(m_state.mac, m_cycle); // MAC perezoso del modo rápido (ps2_vu1_step.inl)
+#endif
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
@@ -267,6 +279,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     case 0x1B: // FMOR
     {
         commitReadyFlags(); // GOW-Port: flags listos en este ciclo
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+        if (m_unit == Unit::VU1)
+            vu1RapidoResolverMac(m_state.mac, m_cycle); // MAC perezoso del modo rápido (ps2_vu1_step.inl)
+#endif
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)

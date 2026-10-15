@@ -19,6 +19,18 @@
 #define VU1C_SIMD 0
 #endif
 
+// GOW-Port: modo rápido de VU1 (PS2X_VU1_RAPIDO=1), con la precisión de PCSX2 (microVU) en lugar de la exacta.
+// Las FMAC del código compilado se calculan en SSE con el MXCSR de run() (redondeo hacia cero; DAZ y FTZ: los
+// subnormales valen cero, como en la PS2), sin las comprobaciones de rango ni la ruta escalar exacta. Los
+// operandos con exponente 255 se llevan al máximo con signo (como normalizeOperand), así no aparecen Inf/NaN.
+// Flags: Z y S por carril; sin U/O ni los bits pegajosos del producto (PCSX2 tampoco los calcula). Los
+// resultados solo cambian en los extremos (desbordamientos, subnormales). Sin la macro, todo queda exacto.
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+inline constexpr bool kVu1Rapido = true;
+#else
+inline constexpr bool kVu1Rapido = false;
+#endif
+
 // GOW-Port: la aritmética de VU no depende de /fp:fast. El runtime se compila con /fp:fast, que deja al
 // compilador fusionar a*b+c en FMA según dónde esté el código: el intérprete y el microcódigo compilado
 // (o dos versiones del intérprete) podían dar resultados distintos. Aquí cada operación se redondea por
@@ -527,7 +539,8 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
             else if constexpr (special <= 0x17u) // FTOI
             {
                 constexpr float scale = special == 0x14u ? 1.0f : special == 0x15u ? 16.0f : special == 0x16u ? 4096.0f : 32768.0f;
-                const __m128 scaled = _mm_mul_ps(vu1c::normalize4(src), _mm_set1_ps(scale));
+                // Modo rápido: sin normalize4 (DAZ anula los subnormales; Inf sigue saturando a INT_MAX/INT_MIN).
+                const __m128 scaled = _mm_mul_ps(kVu1Rapido ? src : vu1c::normalize4(src), _mm_set1_ps(scale));
                 const __m128i truncated = _mm_cvttps_epi32(scaled);
                 const __m128 positiveOverflow = _mm_cmpge_ps(scaled, _mm_set1_ps(2147483648.0f));
                 r = _mm_blendv_ps(_mm_castsi128_ps(truncated), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)), positiveOverflow);
@@ -581,6 +594,70 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
         constexpr uint32_t dest = (Upper >> 21) & 0xFu;
         constexpr uint32_t fd = (Upper >> 6) & 0x1Fu;
 #if VU1C_SIMD
+        // GOW-Port: modo rápido (kVu1Rapido): la FMAC en SSE sin cribas de rango ni ruta escalar.
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+        if constexpr (dest != 0u && info.kind != vu1c::Kind::Max && info.kind != vu1c::Kind::Mini &&
+                      !((info.kind == vu1c::Kind::Opmsub || info.kind == vu1c::Kind::Opmula) && (dest & 1u) != 0u))
+        {
+            constexpr bool crossR = info.kind == vu1c::Kind::Opmsub || info.kind == vu1c::Kind::Opmula;
+            constexpr uint32_t fs = (Upper >> 11) & 0x1Fu;
+            constexpr uint32_t ft = (Upper >> 16) & 0x1Fu;
+            constexpr int lanes = vu1c::laneBits(dest);
+            constexpr bool productSum = info.kind == vu1c::Kind::Madd || info.kind == vu1c::Kind::Msub ||
+                                        info.kind == vu1c::Kind::Opmsub;
+            __m128 vs = _mm_loadu_ps(m_state.vf[fs]);
+            if constexpr (crossR)
+                vs = _mm_shuffle_ps(vs, vs, _MM_SHUFFLE(3, 0, 2, 1));
+            __m128 right;
+            if constexpr (info.source == vu1c::Source::Q)
+                right = _mm_set1_ps(m_state.q);
+            else if constexpr (info.source == vu1c::Source::I)
+                right = _mm_set1_ps(m_state.i);
+            else
+            {
+                right = _mm_loadu_ps(m_state.vf[ft]);
+                if constexpr (crossR)
+                    right = _mm_shuffle_ps(right, right, _MM_SHUFFLE(3, 1, 0, 2));
+                else if constexpr (info.source == vu1c::Source::Broadcast)
+                    right = _mm_shuffle_ps(right, right, _MM_SHUFFLE(info.bc, info.bc, info.bc, info.bc));
+            }
+            __m128 r;
+            if constexpr (info.kind == vu1c::Kind::Add)
+                r = _mm_add_ps(vs, right);
+            else if constexpr (info.kind == vu1c::Kind::Sub)
+                r = _mm_sub_ps(vs, right);
+            else if constexpr (productSum)
+            {
+                const __m128 product = _mm_mul_ps(vs, right);
+                r = info.kind == vu1c::Kind::Madd ? _mm_add_ps(_mm_loadu_ps(m_state.acc), product)
+                                                  : _mm_sub_ps(_mm_loadu_ps(m_state.acc), product);
+            }
+            else
+                r = _mm_mul_ps(vs, right); // Mul, Opmula
+            // Como el modo "Normal" de PCSX2: el resultado se limita a ±máximo (un operando con exponente 255 daría
+            // Inf o NaN; con redondeo hacia cero las operaciones finitas nunca desbordan a Inf). NaN -> -máximo.
+            r = _mm_min_ps(_mm_max_ps(r, _mm_set1_ps(-3.40282346638528859812e+38f)), _mm_set1_ps(3.40282346638528859812e+38f));
+            // Flags: el estado no se calcula (ningún microprograma del juego lo lee: no hay FSAND/FSEQ/FSOR/FSSET en el
+            // código compilado). Con DeadFlags (el generador sabe que otra FMAC del bloque reescribe el MAC antes de
+            // que nadie lo lea) tampoco el MAC. Si no, MAC perezoso: Z y S van a una cola pequeña con el ciclo en que
+            // se ven y FMEQ/FMAND/FMOR lo resuelven al leerlo (vu1RapidoResolverMacT, ps2_vu1_step.inl).
+            if constexpr (!DeadFlags)
+            {
+                const uint32_t signs = static_cast<uint32_t>(_mm_movemask_ps(r)) & static_cast<uint32_t>(lanes);
+                const uint32_t zeros = static_cast<uint32_t>(_mm_movemask_ps(_mm_cmpeq_ps(r, _mm_setzero_ps()))) & static_cast<uint32_t>(lanes);
+                Vu1MacRapido &cola = g_vu1MacRapido;
+                const uint32_t i = cola.n++ & (Vu1MacRapido::kN - 1u);
+                cola.listo[i] = m_cycle + kFmacLatency;
+                cola.mac[i] = vu1c::kMacStatus.v[zeros | (signs << 4)] & 0xFFu;
+            }
+            float *target = info.toAcc ? m_state.acc : m_state.vf[fd];
+            if constexpr (dest == 0xFu)
+                _mm_storeu_ps(target, r);
+            else
+                _mm_storeu_ps(target, _mm_blend_ps(_mm_loadu_ps(target), r, lanes));
+            return;
+        }
+#endif
         // Los cuatro carriles con SSE. Mismas operaciones en float que fmacLaneT (cada producto y suma se
         // redondea por separado con el MXCSR del VU), así que el resultado es el mismo bit a bit. Si algún
         // carril activo saldría del camino rápido de los flags (resultado o producto cerca de cero, de los
@@ -913,6 +990,9 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
     {
         if (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
             commitReadyFlags();
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+        vu1RapidoResolverMacT(m_state.mac, m_cycle); // MAC perezoso (ps2_vu1_step.inl)
+#endif
         if constexpr (viT != 0)
             m_state.vi[viT] = ((m_state.mac & 0xFFFFu) == static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS]))) ? 1 : 0;
     }
@@ -920,6 +1000,9 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
     {
         if (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
             commitReadyFlags();
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+        vu1RapidoResolverMacT(m_state.mac, m_cycle); // MAC perezoso (ps2_vu1_step.inl)
+#endif
         if constexpr (viT != 0)
             m_state.vi[viT] = static_cast<int32_t>(m_state.mac & static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS])));
     }

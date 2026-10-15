@@ -4,6 +4,7 @@ import QtQuick.Controls
 import QtQuick.Effects
 import QtQuick.Layouts
 import QtQuick.Shapes
+import "Teclas.js" as Teclas
 
 // Ventana principal del lanzador: portada con el botón de jugar a la izquierda y ajustes en pestañas a la derecha.
 ApplicationWindow {
@@ -31,20 +32,29 @@ ApplicationWindow {
         property string filtro: "fsr"
         property real nitidez: 0.8
         property bool fxaa: true
+        property string resolucionInterna: "2" // GOW-Port: "auto" (según la pantalla) o "1".."8" (PS2X_GS_ESCALA)
+        property bool escalaDinamica: true // GOW-Port: baja la resolución si la GPU no llega a 60 (PS2X_GS_ESCALA_DINAMICA)
+        property bool dibujoHardware: true // GOW-Port: triángulos con el pipeline de la GPU (PS2X_GS_HW, experimental)
+        property bool imagenNitida: true // GOW-Port: sin doblado de líneas ni antiparpadeo (PS2X_GS_NITIDO)
         property int fpsLimite: 120
         property bool vsync: false
         property bool mostrarFps: false
         property string elf: ""
         property string iso: ""
         property string ejecutable: ""
-        property bool saltarVideos: true
-        property bool arranqueRapido: true
+        property bool saltarVideos: true // GOW-Port: vídeos desactivados por ahora; se retomarán tras optimizar la partida
+        property bool arranqueRapido: false // GOW-Port: acortaba la apertura del juego (ver Component.onCompleted)
+        property int versionAjustes: 0
         property bool controlesDmc5: true
+        property bool cancelarAnimaciones: true // GOW-Port: evasión y búfer de entrada más ágiles (GOW_CANCELAR)
+        property string iconosBotones: "auto" // GOW-Port: iconos de botones: auto | teclado | xbox | original (GOW_ICONOS_ESTILO)
         property bool escSalir: false
         property bool minimizarAlJugar: true
         property int segundosJugados: 0
         property int ultimaSesion: 0
         property string portada: ""
+        property string teclas: "" // mapa de teclas en JSON (vacío = esquema por defecto)
+        property string trucos: "" // trucos activos al arrancar, separados por comas (gow_trucos.cpp)
         property real portadaFoco: 0.55
         property real portadaBrillo: 0.85
     }
@@ -76,6 +86,19 @@ ApplicationWindow {
         return "4:3"
     }
 
+    // GOW-Port: resolución interna. Automático: la altura de la imagen en pantalla entre 448 líneas, de 2× a 8×.
+    function escalaAuto() {
+        var alto = ajustes.modoPantalla === "completa" ? pantalla.alto : ajustes.alto
+        return Math.max(2, Math.min(8, Math.floor(alto / 448)))
+    }
+    function escalaElegida() {
+        var n = parseInt(ajustes.resolucionInterna)
+        return ajustes.resolucionInterna === "auto" || isNaN(n) ? escalaAuto() : Math.max(1, Math.min(8, n))
+    }
+    function textoEscala(n) {
+        return n + "× · " + (512 * n) + "×" + (448 * n)
+    }
+
     function detectarRutas(forzar) {
         var r = lanzador.rutasDetectadas()
         if ((forzar || ajustes.elf.length === 0) && r.elf.length > 0) ajustes.elf = r.elf
@@ -92,14 +115,21 @@ ApplicationWindow {
         ajustes.filtro = "fsr"
         ajustes.nitidez = 0.8
         ajustes.fxaa = true
+        ajustes.resolucionInterna = "2"
+        ajustes.escalaDinamica = true
+        ajustes.dibujoHardware = true
+        ajustes.imagenNitida = true
         ajustes.fpsLimite = 120
         ajustes.vsync = false
         ajustes.mostrarFps = false
         ajustes.saltarVideos = true
-        ajustes.arranqueRapido = true
+        ajustes.arranqueRapido = false
         ajustes.controlesDmc5 = true
+        ajustes.cancelarAnimaciones = true
+        ajustes.iconosBotones = "auto"
         ajustes.escSalir = false
         ajustes.minimizarAlJugar = true
+        ajustes.trucos = ""
     }
 
     function nombreGpu() {
@@ -118,10 +148,15 @@ ApplicationWindow {
             ancho: ajustes.ancho, alto: ajustes.alto,
             aspecto: ajustes.aspecto, estirar: ajustes.estirar,
             filtro: ajustes.filtro, nitidez: ajustes.nitidez, fxaa: ajustes.fxaa,
+            escala: escalaElegida(), escalaDinamica: ajustes.escalaDinamica, imagenNitida: ajustes.imagenNitida,
+            dibujoHardware: ajustes.dibujoHardware,
             fpsLimite: ajustes.fpsLimite, vsync: ajustes.vsync, mostrarFps: ajustes.mostrarFps,
             elf: ajustes.elf, iso: ajustes.iso, ejecutable: ajustes.ejecutable,
             saltarVideos: ajustes.saltarVideos, arranqueRapido: ajustes.arranqueRapido,
-            controlesDmc5: ajustes.controlesDmc5, escSalir: ajustes.escSalir
+            controlesDmc5: ajustes.controlesDmc5, escSalir: ajustes.escSalir,
+            cancelarAnimaciones: ajustes.cancelarAnimaciones, iconosBotones: ajustes.iconosBotones,
+            teclas: Teclas.cadena(Teclas.leer(ajustes.teclas)),
+            trucos: ajustes.trucos, idioma: Tema.idioma
         }
         if (lanzador.iniciar(a) && ajustes.minimizarAlJugar)
             minimizarTrasArrancar.start()
@@ -177,6 +212,28 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
+        // GOW-Port: versión 2 de los ajustes. El arranque rápido venía activado por defecto y da por terminada la
+        // animación de entrada al cargar el nivel, así que la apertura se acortaba; se desactiva una vez.
+        if (ajustes.versionAjustes < 2) {
+            ajustes.arranqueRapido = false
+            ajustes.versionAjustes = 2
+        }
+        // GOW-Port: versión 3: resolución de dibujo 2× por defecto, con la dinámica que protege los 60 FPS.
+        if (ajustes.versionAjustes < 3) {
+            ajustes.resolucionInterna = "2"
+            ajustes.escalaDinamica = true
+            ajustes.versionAjustes = 3
+        }
+        // GOW-Port: versión 4: el renderizador por hardware de triángulos, activado una vez.
+        if (ajustes.versionAjustes < 4) {
+            ajustes.dibujoHardware = true
+            ajustes.versionAjustes = 4
+        }
+        // GOW-Port: versión 5: los vídeos se saltan por defecto mientras se optimiza la partida.
+        if (ajustes.versionAjustes < 5) {
+            ajustes.saltarVideos = true
+            ajustes.versionAjustes = 5
+        }
         if (ajustes.idioma.length === 0) {
             var loc = Qt.locale().name
             ajustes.idioma = loc.indexOf("tr") === 0 ? "tr" : (loc.indexOf("es") === 0 ? "es" : "en")
@@ -568,6 +625,7 @@ ApplicationWindow {
                             ajustes.modoPantalla === "completa" ? Tema.t("completa") + " · " + ventana.pantalla.ancho + "×" + ventana.pantalla.alto
                                                                 : Tema.t("ventana") + " · " + ajustes.ancho + "×" + ajustes.alto,
                             ajustes.aspecto,
+                            ventana.textoEscala(ventana.escalaElegida()) + (ajustes.escalaDinamica ? " · " + Tema.t("dinamicaCorta") : ""),
                             ajustes.filtro === "fsr" ? "FSR 1.0" + (ajustes.fxaa ? " + FXAA" : "") : (ajustes.filtro === "bilineal" ? "Bilinear" : "Pixel"),
                             (ajustes.fpsLimite > 0 ? ajustes.fpsLimite + " FPS" : Tema.t("sinLimite")) + (ajustes.vsync ? " · VSync" : "")
                         ]
@@ -665,6 +723,7 @@ ApplicationWindow {
                 Pestana { text: Tema.t("pestRendimiento") }
                 Pestana { text: Tema.t("pestArchivos") }
                 Pestana { text: Tema.t("pestControles") }
+                Pestana { text: Tema.t("pestTrucos") }
                 Pestana { text: Tema.t("pestOtros") }
             }
 
@@ -687,6 +746,7 @@ ApplicationWindow {
                         tarjetas: ventana.tarjetas
                         pantalla: ventana.pantalla
                         gpuPerdida: ventana.gpuPerdida
+                        escalaAuto: ventana.escalaAuto()
                     }
                     PaginaRendimiento {
                         ajustes: ajustes
@@ -700,6 +760,9 @@ ApplicationWindow {
                         onDetectar: ventana.detectarRutas(true)
                     }
                     PaginaControles {
+                        ajustes: ajustes
+                    }
+                    PaginaTrucos {
                         ajustes: ajustes
                     }
                     PaginaOtros {

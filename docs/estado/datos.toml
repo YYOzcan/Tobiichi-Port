@@ -18,7 +18,7 @@ hasta = 0x0029BBA4
 nombre = "libmpeg"
 inicio = 0x0026F228
 estado = "parcial"
-nota = { es = "La intro FMV se decodifica por software y se presenta sin GOW_SKIP_FMV; falta verificar el resto de vídeos", en = "The FMV intro is software-decoded and displayed without GOW_SKIP_FMV; other videos remain unverified", pt = "A intro FMV é decodificada por software e exibida sem GOW_SKIP_FMV; os demais vídeos ainda precisam ser verificados" }
+nota = { es = "La intro FMV se reproduce entera (imagen, sonido por ADMA y fin con sceMpegIsEnd) y pasa al juego; falta verificar el resto de vídeos", en = "The FMV intro plays to the end (picture, ADMA sound and sceMpegIsEnd) and hands over to the game; other videos remain unverified", pt = "A intro FMV é reproduzida até o fim (imagem, som via ADMA e sceMpegIsEnd) e passa ao jogo; os demais vídeos ainda precisam ser verificados" }
 
 [[librerias.grupo]]
 nombre = "libipu"
@@ -219,7 +219,7 @@ nombre = "IOP"
   nombre = { es = "SPU2: salida de audio", en = "SPU2: audio output", pt = "SPU2: saída de áudio" }
   estado = "parcial"
   peso = 3
-  nota = { es = "Bancos cargados y sonido continuo en tiempo emulado verificados; a ~2 fps se oye entrecortado; faltan reverb y ADMA", en = "Bank loading and continuous sound in emulated time verified; at ~2 fps playback stutters; reverb and ADMA are missing", pt = "Carregamento de bancos e som contínuo em tempo emulado verificados; a ~2 fps o áudio tem cortes; faltam reverb e ADMA" }
+  nota = { es = "Bancos cargados y sonido continuo en tiempo emulado verificados; a ~2 fps se oye entrecortado; ADMA (sonido de los vídeos) emulado; falta reverb", en = "Bank loading and continuous sound in emulated time verified; at ~2 fps playback stutters; ADMA (video sound) emulated; reverb is missing", pt = "Carregamento de bancos e som contínuo em tempo emulado verificados; a ~2 fps o áudio tem cortes; ADMA (som dos vídeos) emulado; falta reverb" }
 
   [[hardware.grupo.componente]]
   corto = "IRX"

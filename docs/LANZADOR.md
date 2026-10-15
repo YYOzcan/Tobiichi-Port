@@ -29,6 +29,38 @@ tobiichi-launcher.desktop`, con la acción "Jugar ya" = `--jugar`) y un acceso d
 El juego se ejecuta con la carpeta de datos del lanzador como directorio de trabajo. Al arrancar crea ahí `mc0/` y
 `mc1/` vacías (rutas por defecto antes de cargar el ELF); las partidas van a `mc0/` junto al ELF.
 
+## Controles
+
+Las teclas son configurables: dos teclas o botones del ratón por acción y grupos Movimiento, Combate, Poderes,
+Menús y Avanzado (stick derecho y clics de stick).
+
+- Clic en el hueco y luego la tecla o el botón del ratón (una capa a toda la ventana recoge también los clics).
+  Escape cancela; clic derecho borra.
+- La tecla se toma por su posición física (código de escaneo de X/Wayland → tecla GLFW, `Teclas.js`), igual que
+  GLFW en el juego, así que también vale en teclados turcos.
+- Las teclas repetidas se marcan en ámbar con las otras acciones, salvo la pareja intencionada esquiva + R2 (Ctrl).
+  F1/F2/F11 se avisan como reservadas.
+- El mapa se guarda en `teclas` (JSON) y va al juego en `TOBIICHI_TECLAS` (ver `CONTROLES.md`).
+- Magias con nombre (1 Poseidón, 2 Medusa, 3 Zeus, 4 Hades) y Espada de Artemisa con clic central (L1 + R1).
+  - Un mapa guardado sin `poseidon` es de antes: `Teclas.leer` quita 1-4 de la cruceta y las magias toman sus
+    teclas por defecto; lo demás se conserva.
+  - La cruceta queda en el grupo "Menús" (flechas).
+- Pruebas: `qmltestrunner -import <dir con Tobiichi/qmldir> -input launcher/pruebas/tst_teclas.qml`. El qmldir de
+  `launcher/build/Tobiichi` no sirve tal cual (`prefer :/qt/qml/...` apunta a recursos que solo están dentro del
+  ejecutable); vale una carpeta `Tobiichi/` con `qml/*.qml`, `qml/*.js` y ese qmldir sin las líneas `prefer` y
+  `typeinfo`. Las pruebas cubren:
+  - captura de una tecla y de un botón del ratón;
+  - Escape;
+  - conflictos y borrado;
+  - esquema por defecto.
+
+## Trucos
+
+La pestaña "Trucos" elige los trucos activos al arrancar (ajuste `trucos`, separados por comas; "Apagar todos" lo
+vacía). En la partida, **F2** abre el menú de trucos del juego y los cambia al momento (ver
+[`CONTROLES.md`](CONTROLES.md#menú-de-trucos-f2)); lo que se cambia ahí no vuelve al lanzador. Con seis pestañas,
+cada pestaña mide lo que su texto (14 px): repartidas a partes iguales, "PERFORMANCE" se montaba sobre "GRAPHICS".
+
 ## Imagen de portada
 
 En "Otros" (o arrastrándola a la ventana) se puede poner una imagen propia en la portada (p. ej. Origami Tobiichi,
@@ -52,7 +84,8 @@ que da nombre al port). El repositorio no incluye ninguna: el personaje tiene de
 ## Variables que pasa al juego
 
 Las de rendimiento son las de `run_gow.sh` (`PS2X_GS_GPU`, `GOW_EE_CICLOS=50`, `PS2X_VU1_HILO`,
-`PS2X_GS_PRESENT_BUZON`...). Si una ya está en el entorno del usuario, se respeta.
+`PS2X_GS_PRESENT_BUZON`, y en Linux `PS2X_GS_DIRECT_PRESENT=1`, la presentación compartida...). Si una ya está en el
+entorno del usuario, se respeta.
 
 | Ajuste | Variable |
 |---|---|
@@ -62,7 +95,13 @@ Las de rendimiento son las de `run_gow.sh` (`PS2X_GS_GPU`, `GOW_EE_CICLOS=50`, `
 | Relación de aspecto | `TOBIICHI_PANORAMICO=16:9\|16:10\|21:9` (sin variable: 4:3), `TOBIICHI_ASPECTO=auto\|estirar` |
 | Escalado | `TOBIICHI_FILTRO=fsr\|bilineal\|pixel`, `TOBIICHI_NITIDEZ` (pasos de RCAS, 0-2), `TOBIICHI_FXAA=1` |
 | Límite de FPS / VSync / contador | `TOBIICHI_VENTANA_FPS` (0 = sin límite), `TOBIICHI_VSYNC=1`, `TOBIICHI_FPS_GOSTER=1` |
-| Opciones | `GOW_SKIP_FMV=1`, `GOW_FAST_BOOT=1` (o sin ellas), `TOBIICHI_DMC5_CONTROLS=1\|0`, `TOBIICHI_ESC_SALIR=0\|1` |
+| Opciones | `GOW_SKIP_FMV=1`, `GOW_FAST_BOOT=1` (o sin ellas), `TOBIICHI_DMC5_CONTROLS=1\|0` (esquema del mando), `TOBIICHI_ESC_SALIR=0\|1`, `GOW_ICONOS_ESTILO=teclado\|xbox\|original` (iconos de botones; sin la variable, automático), `GOW_CANCELAR=1\|0` (combate ágil, pestaña "Controles"; ver [`CONTROLES.md`](CONTROLES.md#cancelar-animaciones-combate-ágil)) |
+
+El arranque rápido viene desactivado y los ajustes de la versión 2 (`versionAjustes`) lo desactivan una vez en las
+instalaciones anteriores: daba por terminada la animación de entrada de cada vídeo al cargar el nivel, así que se
+cortaba la frase de Kratos al principio ("The gods of Olympus have abandoned me") y la espera de los demás vídeos.
+| Teclado y ratón | `TOBIICHI_TECLAS` con el mapa de la pestaña "Controles" ([`CONTROLES.md`](CONTROLES.md#teclado)) |
+| Trucos | `TOBIICHI_TRUCOS=inmortal,un_golpe,...` (los activos al arrancar, pestaña "Trucos") y `TOBIICHI_IDIOMA=tr\|en\|es` (idioma del menú F2) |
 | Siempre | `TOBIICHI_TITULO=God of War`, `TOBIICHI_ICONO=<icono.png>`, `TOBIICHI_PANEL=0` (panel de depuración oculto, F1 lo abre) |
 
 ## Lado del runtime
@@ -123,16 +162,21 @@ El HUD y las pantallas 2D se estiran en horizontal (el parche tampoco los corrig
 estos parches, el runtime escribe en 0x7F00/0x7F04 sin efecto (el código original no lee ahí) y solo queda el modo
 panorámico del juego, con recorte.
 
-### Lo que no hay: resolución interna 2×-4×
+### Resolución de dibujo e imagen nítida (13 de octubre de 2026)
 
-El GS se emula sobre su VRAM de 4 MB con direcciones entrelazadas por formato (rasterizador de cómputo o por
-hardware con `fragment_shader_interlock`). Dibujar a 2×-4× exigiría una copia supermuestreada de la VRAM,
-resolverla en las transferencias local→local y al leer render targets como texturas, y presentar desde ella. Es
-el esquema de paraLLEl-GS y supone un trabajo grande.
-
-Además, el coste de rasterizado crece con el cuadrado de la escala. Hoy cuesta 4-7 ms por cuadro en la RTX 4050
-y 20-26 ms en la 680M; a 2× serían 16-28 ms en la 4050. El lanzador lo indica ("Resolución de dibujo: 1×") y
-ofrece FSR 1.0 para ganar nitidez a la resolución de la pantalla.
+- **Resolución de dibujo** (`resolucionInterna`: `auto` o `1`..`8`) → `PS2X_GS_ESCALA`. Automático:
+  `floor(alto / 448)` entre 2 y 8, con el alto de la pantalla en pantalla completa o el de la ventana; 1080p y
+  1200p dan 2×, 1440p 3×, 4K 4×, 8K 8×. Cada opción muestra la imagen que produce (2× · 1024×896); 4× y 5× avisan de
+  que necesitan una GPU potente y 6× y 8× de que son experimentales. El resumen de la portada muestra la escala.
+- **Imagen nítida** (`imagenNitida`, activada) → `PS2X_GS_NITIDO=1`, o `0` si se apaga.
+- **Resolución dinámica** (`escalaDinamica`, activada) → `PS2X_GS_ESCALA_DINAMICA=1`: la resolución elegida es el
+  tope. Versión 3 de los ajustes: `resolucionInterna` pasa a `"2"` (2× por defecto, a petición del usuario) y la
+  dinámica se activa una vez.
+- Detalles del GS en [`RENDERIZADO.md`](RENDERIZADO.md#resolución-interna-supermuestreo). Si la imagen supera el
+  destino, la presentación la reduce por área (sin FXAA ni EASU; RCAS sigue afilando con FSR).
+- Rendimiento medido en la RTX 4050 Laptop (cubierta del barco, imagen nítida): 1× 60 FPS; 2× 40-60 FPS con la
+  GPU al 100 %; 3× 18-24 FPS. La escala automática sigue a la pantalla y no a la potencia de la GPU, como se pidió:
+  en equipos modestos hay que bajar a 1×.
 
 ## Verificado (12 de octubre de 2026, Radeon 680M, pantalla 1920x1200)
 
@@ -151,3 +195,11 @@ ofrece FSR 1.0 para ganar nitidez a la resolución de la pantalla.
   - el registro quedó en `registros/ultimo.log`.
 - Recompilación: con `config/recomp.template.toml` el recompilador genera exactamente los 6418 archivos de
   `generated2` (0 diferencias). Sin las palabras nuevas también: el `generated2` de antes salía igual.
+
+### Vídeos desactivados por defecto (13 de octubre de 2026)
+
+Ajustes v5: `saltarVideos` pasa a `true` una vez (`GOW_SKIP_FMV=1`). A petición del usuario, los vídeos se retoman
+después de optimizar la partida. `run_gow.sh` usa el mismo valor por defecto.
+
+La resolución dinámica también baja un paso cuando la media de cuadros del juego cae por debajo de 55. Ver
+`RENDIMIENTO.md`, "Portátil en ahorro de energía con la iGPU".

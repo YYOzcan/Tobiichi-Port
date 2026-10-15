@@ -16,6 +16,8 @@
 #include <chrono>
 #include <unordered_map>
 
+bool ps2MpegCsc(uint8_t *rdram, uint32_t destAddr, uint32_t maxBytes, uint32_t macroblocks, bool rgb16); // GOW-Port: Kernel/Stubs/MPEG.cpp
+
 namespace
 {
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
@@ -339,9 +341,12 @@ void PS2Memory::enqueueVu1Work(std::vector<uint8_t> &&data)
     worker.workCv.notify_one();
 }
 
+void ps2AfinidadVu1(); // GOW-Port: ps2_afinidad.cpp
+
 void PS2Memory::vu1WorkerLoop()
 {
     t_onVu1Worker = true;
+    ps2AfinidadVu1(); // GOW-Port: núcleo físico propio para VU1
     Vu1Worker &worker = *g_vu1Worker;
     for (;;)
     {
@@ -356,10 +361,99 @@ void PS2Memory::vu1WorkerLoop()
             worker.busy = true;
         }
         const auto busyStart = std::chrono::steady_clock::now();
+        {
+            // GOW-Port: GOW_VIF_CAPTURA="<carpeta>:<segundos>": el primer envío grande (> 1 MB) desde ese segundo se
+            // guarda para tools/render/repetir_cadena_vif.cpp (vif1_stream.bin, memorias de VU1, VRAM y registros de
+            // VIF1 en eeHwRegs.bin). Datos del juego: solo en local, nunca se publican.
+            static const char *captura = std::getenv("GOW_VIF_CAPTURA");
+            static bool capturado = false;
+            static const auto arranque = std::chrono::steady_clock::now();
+            if (captura && !capturado && data.size() > (1u << 20))
+            {
+                const std::string spec(captura);
+                const size_t dos = spec.rfind(':');
+                const std::string carpeta = spec.substr(0, dos);
+                const double desde = dos == std::string::npos ? 0.0 : std::atof(spec.c_str() + dos + 1);
+                if (std::chrono::duration<double>(busyStart - arranque).count() >= desde)
+                {
+                    capturado = true;
+                    const auto escribir = [&](const char *nombre, const void *bytes, size_t n) {
+                        if (FILE *f = std::fopen((carpeta + "/" + nombre).c_str(), "wb"))
+                        {
+                            std::fwrite(bytes, 1, n, f);
+                            std::fclose(f);
+                        }
+                    };
+                    escribir("vif1_stream.bin", data.data(), data.size());
+                    escribir("vu1MicroMem.bin", m_vu1Code, PS2_VU1_CODE_SIZE);
+                    escribir("vu1Memory.bin", m_vu1Data, PS2_VU1_DATA_SIZE);
+                    escribir("vram.bin", m_gsVRAM, PS2_GS_VRAM_SIZE);
+                    std::vector<uint8_t> hw(0x4000u, 0u);
+                    const auto reg = [&](uint32_t offset, uint32_t v) { std::memcpy(hw.data() + offset, &v, 4); };
+                    reg(0x3C00, vif1_regs.stat); reg(0x3C40, vif1_regs.cycle); reg(0x3C50, vif1_regs.mode);
+                    reg(0x3C70, vif1_regs.mask); reg(0x3C90, vif1_regs.itops); reg(0x3CA0, vif1_regs.base);
+                    reg(0x3CB0, vif1_regs.ofst); reg(0x3CC0, vif1_regs.tops); reg(0x3CD0, vif1_regs.itop);
+                    reg(0x3CE0, vif1_regs.top);
+                    for (uint32_t i = 0; i < 4u; ++i)
+                    {
+                        reg(0x3D00 + i * 16u, vif1_regs.row[i]);
+                        reg(0x3D40 + i * 16u, vif1_regs.col[i]);
+                    }
+                    escribir("eeHwRegs.bin", hw.data(), hw.size());
+                    std::fprintf(stderr, "[vif-captura] %zu bytes de VIF1 en %s\n", data.size(), carpeta.c_str());
+                }
+            }
+        }
+        timespec cpuInicio{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpuInicio);
         processVIF1Data(data.data(), static_cast<uint32_t>(data.size()));
         if (m_gifArbiter)
             m_gifArbiter->drain();
         publishGsFrontBatch(worker);
+        {
+            // GOW-Port: GOW_ESPERA_DIAG: llegada (respecto al final de la espera del cuadro del EE) y duración de los
+            // dos primeros envíos de VIF1 de cada cuadro.
+            extern std::atomic<int64_t> g_gowFinCuadroNs;
+            static const bool diag = [] { const char *v = std::getenv("GOW_ESPERA_DIAG"); return v && v[0] == '1'; }();
+            if (diag)
+            {
+                static int64_t cuadro = 0;
+                static unsigned indice = 0, cuadros = 0;
+                static double llegada[3] = {}, duracion[3] = {}, bytes[3] = {}, cpu[3] = {};
+                static unsigned cuenta[3] = {};
+                static auto ventana = busyStart;
+                const auto busyEnd = std::chrono::steady_clock::now();
+                const int64_t inicioNs = std::chrono::duration_cast<std::chrono::nanoseconds>(busyStart.time_since_epoch()).count();
+                const int64_t fin = g_gowFinCuadroNs.load(std::memory_order_relaxed);
+                if (fin != cuadro)
+                {
+                    cuadro = fin;
+                    indice = 0;
+                    ++cuadros;
+                }
+                const unsigned k = std::min(indice++, 2u);
+                llegada[k] += (inicioNs - fin) / 1e6;
+                duracion[k] += std::chrono::duration<double, std::milli>(busyEnd - busyStart).count();
+                bytes[k] += static_cast<double>(data.size());
+                timespec cpuFin{};
+                clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpuFin);
+                cpu[k] += (cpuFin.tv_sec - cpuInicio.tv_sec) * 1e3 + (cpuFin.tv_nsec - cpuInicio.tv_nsec) / 1e6;
+                ++cuenta[k];
+                if (busyEnd - ventana >= std::chrono::seconds(5) && cuadros)
+                {
+                    for (unsigned i = 0; i < 3u; ++i)
+                        if (cuenta[i])
+                            std::fprintf(stderr, "[gow-espera] VU1 envío %u%s: llega a %.2f ms, dura %.2f ms (CPU %.2f ms), %.0f KB (%u veces en %u cuadros)\n",
+                                         i, i == 2u ? "+" : "", llegada[i] / cuenta[i], duracion[i] / cuenta[i], cpu[i] / cuenta[i],
+                                         bytes[i] / cuenta[i] / 1024.0,
+                                         cuenta[i], cuadros);
+                    for (unsigned i = 0; i < 3u; ++i)
+                        llegada[i] = duracion[i] = bytes[i] = cpu[i] = 0.0, cuenta[i] = 0u;
+                    cuadros = 0;
+                    ventana = busyEnd;
+                }
+            }
+        }
         g_gowVu1BusyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                      std::chrono::steady_clock::now() - busyStart).count()),
                                  std::memory_order_relaxed);
@@ -1558,6 +1652,27 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         else
         {
             m_ioRegisters[address] = value;
+            // GOW-Port: CSC (comando 7: YCbCr RAW8 -> RGB) con el cuadro de sceMpegGetPictureRAW8 (MPEG.cpp). La salida
+            // va al destino del DMA desde el IPU (canal 3), que el juego programa antes del comando; el DMA queda
+            // terminado. El resto de comandos del IPU sigue sin emular.
+            static const bool ipuDiag = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
+            static uint32_t ipuDiagCount = 0;
+            if (ipuDiag && address == 0x10002000u && ipuDiagCount++ < 300u)
+                std::fprintf(stderr, "[fmv-ipu] cmd=0x%08x to=0x%x/%u desde=0x%x/%u\n", value, m_ioRegisters[0x1000B410u],
+                             m_ioRegisters[0x1000B420u], m_ioRegisters[0x1000B010u], m_ioRegisters[0x1000B020u]);
+            if (address == 0x10002000u && (value >> 28) == 7u)
+            {
+                const uint32_t madr = m_ioRegisters[0x1000B010u] & 0x01FFFFF0u;
+                const uint32_t qwc = m_ioRegisters[0x1000B020u] & 0xFFFFu;
+                const bool rgb16 = ((value >> 27) & 1u) != 0u;
+                if (ps2MpegCsc(m_rdram, madr, qwc * 16u, value & 0x7FFu, rgb16))
+                {
+                    m_ioRegisters[0x1000B020u] = 0u;
+                    m_ioRegisters[0x1000B420u] = 0u;
+                    m_ioRegisters[0x1000B000u] &= ~0x100u;
+                    m_ioRegisters[0x1000B400u] &= ~0x100u;
+                }
+            }
         }
         return true;
     }

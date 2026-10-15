@@ -30,10 +30,13 @@ set(ARCHIVOS_QML
     qml/BotonSecundario.qml
     qml/CampoRuta.qml
     qml/Tecla.qml
+    qml/TeclaAsignable.qml
+    qml/Teclas.js
     qml/PaginaGrafico.qml
     qml/PaginaRendimiento.qml
     qml/PaginaArchivos.qml
     qml/PaginaControles.qml
+    qml/PaginaTrucos.qml
     qml/PaginaOtros.qml
 )
 # Los QML van en la raíz del módulo (sin "qml/"): así el import implícito de su carpeta es el propio módulo y

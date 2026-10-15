@@ -666,7 +666,12 @@ namespace ps2x::iop::detail
             }();
             Spu2 &spu = memory.spu2();
             spu.advanceTo(totalCycles);
-            if (!spu.takeInterrupt() || !irqEnabled || servicingSpu2Interrupt)
+            // GOW-Port: una IRQ que llega mientras se atiende la anterior (el manejador del driver corre aquí dentro)
+            // se queda pendiente para después; antes takeInterrupt() la borraba y se perdía: el driver no rellenaba
+            // ese trozo del búfer de streaming y la voz repetía datos viejos.
+            if (servicingSpu2Interrupt)
+                return;
+            if (!spu.takeInterrupt() || !irqEnabled)
                 return;
             servicingSpu2Interrupt = true;
             try

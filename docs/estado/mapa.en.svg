@@ -942,7 +942,7 @@
 <text class="badge-t" x="499.9" y="229.7" font-size="11" text-anchor="middle" pointer-events="none">SIF</text>
 <rect class="ok" x="539.4" y="194.1" width="76.9" height="63.5"><title>CDVD: reading the original ISO</title></rect>
 <text class="badge-t" x="577.8" y="229.7" font-size="11" text-anchor="middle" pointer-events="none">CDVD</text>
-<rect class="parcial" x="461.5" y="258.6" width="65.8" height="111.9"><title>SPU2: audio output — Bank loading and continuous sound in emulated time verified; at ~2 fps playback stutters; reverb and ADMA are missing</title></rect>
+<rect class="parcial" x="461.5" y="258.6" width="65.8" height="111.9"><title>SPU2: audio output — Bank loading and continuous sound in emulated time verified; at ~2 fps playback stutters; ADMA (video sound) emulated; reverb is missing</title></rect>
 <rect x="461.5" y="258.6" width="65.8" height="111.9" fill="url(#rayas)" pointer-events="none"/>
 <text class="badge-v-oscuro" x="494.4" y="318.4" font-size="11" text-anchor="middle" pointer-events="none">SPU2</text>
 <rect class="parcial" x="528.3" y="258.6" width="88" height="55.4"><title>DualShock 2 controller — libpad2 via HLE (first port); controllers read as disconnected on the emulated SIO2</title></rect>

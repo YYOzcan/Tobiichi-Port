@@ -5,30 +5,17 @@
 
 #include <array>
 #include <atomic>
+#include <clocale>
 #include <cstdlib>
 #include <cstdio>
 #include <mutex>
 #include <string_view>
 
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
+// GOW-Port: presentación compartida (PS2X_GS_DIRECT_PRESENT=1): el contexto del GS comparte texturas con el de la
+// ventana y entrega cada cuadro como textura, sin leerlo a la RAM. La parte de los huecos y los fences es común;
+// la captura del contexto de la ventana y la creación del contexto compartido dependen de la plataforma.
 namespace
 {
-    constexpr int kContextMajorVersion = 0x2091;
-    constexpr int kContextMinorVersion = 0x2092;
-    constexpr int kContextFlags = 0x2094;
-    constexpr int kContextProfileMask = 0x9126;
-    constexpr int kContextCoreProfileBit = 0x0001;
-
-    using CreateContextAttribs = HGLRC(WINAPI *)(HDC, HGLRC, const int *);
-
     struct SharedSlot
     {
         GSSharedPresent::Frame frame;
@@ -43,10 +30,6 @@ namespace
     std::mutex s_sharedMutex;
     std::array<SharedSlot, 8> s_sharedSlots;
     GSGL::Api s_hostApi;
-    HGLRC s_hostContext = nullptr;
-    HDC s_hostDc = nullptr;
-    PIXELFORMATDESCRIPTOR s_hostFormat{};
-    int s_hostFormatIndex = 0;
     int s_readingSlot = -1;
     uint64_t s_sharedSequence = 0;
     std::atomic<bool> s_sharedActive{false};
@@ -69,6 +52,36 @@ namespace
         slot.reading = false;
         s_readingSlot = -1;
     }
+}
+
+namespace GSSharedPresent
+{
+    void ShutdownShared();
+}
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+namespace
+{
+    constexpr int kContextMajorVersion = 0x2091;
+    constexpr int kContextMinorVersion = 0x2092;
+    constexpr int kContextFlags = 0x2094;
+    constexpr int kContextProfileMask = 0x9126;
+    constexpr int kContextCoreProfileBit = 0x0001;
+
+    using CreateContextAttribs = HGLRC(WINAPI *)(HDC, HGLRC, const int *);
+
+    HGLRC s_hostContext = nullptr;
+    HDC s_hostDc = nullptr;
+    PIXELFORMATDESCRIPTOR s_hostFormat{};
+    int s_hostFormatIndex = 0;
 
     HMODULE openGlModule()
     {
@@ -141,49 +154,10 @@ namespace GSSharedPresent
             wglMakeCurrent(s_hostDc, s_hostContext);
     }
 
-    bool Active()
-    {
-        return s_sharedActive.load(std::memory_order_acquire);
-    }
-
-    bool Acquire(Frame &frame)
-    {
-        if (!Active())
-            return false;
-        std::lock_guard<std::mutex> lock(s_sharedMutex);
-        int newest = -1;
-        uint64_t sequence = s_readingSlot >= 0 ? s_sharedSlots[s_readingSlot].frame.sequence : 0u;
-        for (int i = 0; i < static_cast<int>(s_sharedSlots.size()); ++i)
-        {
-            const SharedSlot &slot = s_sharedSlots[i];
-            if (!slot.reading && slot.frame.sequence > sequence && slot.produced && completed(s_hostApi, slot.produced))
-            {
-                newest = i;
-                sequence = slot.frame.sequence;
-            }
-        }
-        if (newest >= 0)
-        {
-            releaseReading();
-            SharedSlot &slot = s_sharedSlots[newest];
-            s_hostApi.DeleteSync(slot.produced);
-            slot.produced = nullptr;
-            if (slot.frame.hashValid)
-                slot.frame.contentHash = static_cast<uint64_t>(slot.hash[0]) | (static_cast<uint64_t>(slot.hash[1]) << 32u);
-            slot.reading = true;
-            s_readingSlot = newest;
-        }
-        if (s_readingSlot < 0)
-            return false;
-        frame = s_sharedSlots[s_readingSlot].frame;
-        return true;
-    }
-
     void ShutdownHost()
     {
+        ShutdownShared();
         std::lock_guard<std::mutex> lock(s_sharedMutex);
-        releaseReading();
-        s_sharedActive.store(false, std::memory_order_release);
         s_hostContext = nullptr;
         s_hostDc = nullptr;
     }
@@ -191,129 +165,6 @@ namespace GSSharedPresent
 
 namespace GSGL
 {
-    bool SharedAvailable(const Api &gl)
-    {
-        std::lock_guard<std::mutex> lock(s_sharedMutex);
-        for (const SharedSlot &slot : s_sharedSlots)
-            if (!slot.reading && completed(gl, slot.produced) && completed(gl, slot.consumed))
-                return true;
-        return false;
-    }
-
-    bool PublishShared(const Api &gl, GLuint buffer, uint32_t width, uint32_t height, uint64_t renderSequence,
-                       GLuint hashProgram, GLint hashLocation)
-    {
-        std::lock_guard<std::mutex> lock(s_sharedMutex);
-        if (!s_sharedActive.load(std::memory_order_relaxed))
-            return false;
-        SharedSlot *available = nullptr;
-        for (SharedSlot &slot : s_sharedSlots)
-        {
-            if (slot.reading || !completed(gl, slot.produced) || !completed(gl, slot.consumed))
-                continue;
-            if (!available || slot.frame.sequence < available->frame.sequence)
-                available = &slot;
-        }
-        if (!available)
-            return false;
-        SharedSlot &slot = *available;
-        if (slot.produced)
-            gl.DeleteSync(slot.produced);
-        if (slot.consumed)
-            gl.DeleteSync(slot.consumed);
-        slot.produced = slot.consumed = nullptr;
-        slot.frame.hashValid = false;
-        if (hashProgram)
-        {
-            if (!slot.hashBuffer)
-            {
-                gl.GenBuffers(1, &slot.hashBuffer);
-                gl.BindBuffer(kShaderStorageBuffer, slot.hashBuffer);
-                const GLbitfield flags = kMapReadBit | kMapPersistentBit | kMapCoherentBit;
-                gl.BufferStorage(kShaderStorageBuffer, 8, nullptr, flags);
-                slot.hash = static_cast<const uint32_t *>(gl.MapBufferRange(kShaderStorageBuffer, 0, 8, flags));
-            }
-            if (slot.hash)
-            {
-                static const bool deviceHash = [] {
-                    const char *setting = std::getenv("PS2X_FRAME_HASH_DEVICE");
-                    return !setting || std::string_view(setting) != "0";
-                }();
-                if (deviceHash && !slot.hashDeviceBuffer)
-                {
-                    gl.GenBuffers(1, &slot.hashDeviceBuffer);
-                    gl.BindBuffer(kShaderStorageBuffer, slot.hashDeviceBuffer);
-                    gl.BufferData(kShaderStorageBuffer, 8, nullptr, kDynamicDraw);
-                }
-                const GLuint output = deviceHash ? slot.hashDeviceBuffer : slot.hashBuffer;
-                const uint32_t zero = 0u;
-                gl.BindBuffer(kShaderStorageBuffer, output);
-                gl.ClearBufferData(kShaderStorageBuffer, kR32UI, kRedInteger, kUnsignedInt, &zero);
-                gl.BindBufferBase(kShaderStorageBuffer, 7u, buffer);
-                gl.BindBufferBase(kShaderStorageBuffer, 10u, output);
-                gl.MemBarrier(kAllBarrierBits);
-                gl.UseProgram(hashProgram);
-                gl.Uniform1ui(hashLocation, width * height);
-                gl.DispatchCompute((width * height + 255u) / 256u, 1u, 1u);
-                gl.MemBarrier(kAllBarrierBits);
-                if (deviceHash)
-                {
-                    gl.BindBuffer(kCopyReadBuffer, output);
-                    gl.BindBuffer(kCopyWriteBuffer, slot.hashBuffer);
-                    gl.CopyBufferSubData(kCopyReadBuffer, kCopyWriteBuffer, 0, 0, 8);
-                    gl.MemBarrier(kAllBarrierBits);
-                }
-                slot.frame.hashValid = true;
-            }
-        }
-        gl.BindBuffer(kPixelUnpackBuffer, 0u);
-        if (!slot.frame.texture)
-            gl.GenTextures(1, &slot.frame.texture);
-        gl.BindTexture(kTexture2D, slot.frame.texture);
-        if (slot.frame.width != width || slot.frame.height != height)
-        {
-            gl.TexImage2D(kTexture2D, 0, kRgba8, width, height, 0, kRgba, kUnsignedByte, nullptr);
-            gl.TexParameteri(kTexture2D, kTextureMinFilter, kLinear);
-            gl.TexParameteri(kTexture2D, kTextureMagFilter, kLinear);
-            gl.TexParameteri(kTexture2D, kTextureWrapS, kClampToEdge);
-            gl.TexParameteri(kTexture2D, kTextureWrapT, kClampToEdge);
-        }
-        gl.MemBarrier(kAllBarrierBits);
-        gl.BindBuffer(kPixelUnpackBuffer, buffer);
-        gl.TexSubImage2D(kTexture2D, 0, 0, 0, width, height, kRgba, kUnsignedByte, nullptr);
-        gl.MemBarrier(kAllBarrierBits);
-        gl.BindBuffer(kPixelUnpackBuffer, 0u);
-        gl.BindTexture(kTexture2D, 0u);
-        slot.frame.width = width;
-        slot.frame.height = height;
-        slot.frame.sequence = ++s_sharedSequence;
-        slot.frame.renderSequence = renderSequence;
-        slot.produced = gl.FenceSync(kSyncGpuCommandsComplete, 0u);
-        gl.Flush();
-        return true;
-    }
-
-    void DestroyShared(const Api &gl)
-    {
-        std::lock_guard<std::mutex> lock(s_sharedMutex);
-        s_sharedActive.store(false, std::memory_order_release);
-        for (SharedSlot &slot : s_sharedSlots)
-        {
-            if (slot.produced)
-                gl.DeleteSync(slot.produced);
-            if (slot.consumed)
-                gl.DeleteSync(slot.consumed);
-            if (slot.frame.texture)
-                gl.DeleteTextures(1, &slot.frame.texture);
-            if (slot.hashBuffer)
-                gl.DeleteBuffers(1, &slot.hashBuffer);
-            if (slot.hashDeviceBuffer)
-                gl.DeleteBuffers(1, &slot.hashDeviceBuffer);
-            slot = {};
-        }
-        s_readingSlot = -1;
-    }
-
     Context::~Context()
     {
         Destroy();
@@ -539,11 +390,55 @@ namespace
     }
 }
 
+namespace
+{
+    // GOW-Port: ventana del juego (raylib), cuyo contexto comparte texturas con el del GS.
+    GLFWwindow *s_hostWindow = nullptr;
+}
+
+namespace GSSharedPresent
+{
+    void CaptureHostContext()
+    {
+        const char *value = std::getenv("PS2X_GS_DIRECT_PRESENT");
+        if (!value || *value != '1')
+            return;
+        GLFWwindow *window = glfwGetCurrentContext();
+        if (!window)
+            return;
+        std::string missing;
+        GSGL::Api api;
+        loadGlfw(api.FenceSync, "glFenceSync", missing);
+        loadGlfw(api.ClientWaitSync, "glClientWaitSync", missing);
+        loadGlfw(api.DeleteSync, "glDeleteSync", missing);
+        loadGlfw(api.Flush, "glFlush", missing);
+        if (!missing.empty())
+        {
+            std::fprintf(stderr, "[gs-present] shared presentation unavailable: %s\n", missing.c_str());
+            return;
+        }
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        s_hostApi = api;
+        s_hostWindow = window;
+        std::fprintf(stderr, "[gs-present] contexto de la ventana capturado\n");
+    }
+
+    void RestoreHostContext()
+    {
+        if (s_hostWindow && glfwGetCurrentContext() != s_hostWindow)
+            glfwMakeContextCurrent(s_hostWindow);
+    }
+
+    void ShutdownHost()
+    {
+        ShutdownShared();
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        s_hostWindow = nullptr;
+    }
+}
+
 namespace GSGL
 {
-    bool PublishShared(const Api &, GLuint, uint32_t, uint32_t, uint64_t, GLuint, GLint) { return false; }
-    bool SharedAvailable(const Api &) { return false; }
-    void DestroyShared(const Api &) {}
     Context::~Context() { Destroy(); }
 
     bool Context::Create(std::string &error)
@@ -553,12 +448,21 @@ namespace GSGL
             error = "Failed to initialize GLFW";
             return false;
         }
+        // GOW-Port: glfwInit pone LC_CTYPE del sistema (tr_TR rompe tolower/toupper ASCII de 'I'/'i'); se restaura "C".
+        std::setlocale(LC_CTYPE, "C");
         glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-        GLFWwindow *win = glfwCreateWindow(640, 448, "PS2Recomp GS GL Context", nullptr, nullptr);
+        // GOW-Port: con la ventana capturada (PS2X_GS_DIRECT_PRESENT=1) el contexto comparte sus objetos.
+        GLFWwindow *win = glfwCreateWindow(640, 448, "PS2Recomp GS GL Context", nullptr, s_hostWindow);
+        m_shared = win && s_hostWindow;
+        if (!win && s_hostWindow)
+        {
+            std::fprintf(stderr, "[gs-present] GLX/EGL sharing failed; using RAM presentation\n");
+            win = glfwCreateWindow(640, 448, "PS2Recomp GS GL Context", nullptr, nullptr);
+        }
         if (!win)
         {
             glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -655,6 +559,11 @@ namespace GSGL
             return false;
         }
         std::fprintf(stderr, "[gs-gl-linux] OpenGL 4.6 GPU hardware context successfully initialized via GLFW!\n");
+        if (m_shared)
+        {
+            s_sharedActive.store(true, std::memory_order_release);
+            std::fprintf(stderr, "[gs-present] shared GPU textures active\n");
+        }
         return true;
     }
 
@@ -699,12 +608,179 @@ namespace GSGL
         m_shared = false;
     }
 }
+#endif
+
 namespace GSSharedPresent
 {
-    void CaptureHostContext() {}
-    void RestoreHostContext() {}
-    bool Active() { return false; }
-    bool Acquire(Frame &) { return false; }
-    void ShutdownHost() {}
+    bool Active()
+    {
+        return s_sharedActive.load(std::memory_order_acquire);
+    }
+
+    bool Acquire(Frame &frame)
+    {
+        if (!Active())
+            return false;
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        int newest = -1;
+        uint64_t sequence = s_readingSlot >= 0 ? s_sharedSlots[s_readingSlot].frame.sequence : 0u;
+        for (int i = 0; i < static_cast<int>(s_sharedSlots.size()); ++i)
+        {
+            const SharedSlot &slot = s_sharedSlots[i];
+            if (!slot.reading && slot.frame.sequence > sequence && slot.produced && completed(s_hostApi, slot.produced))
+            {
+                newest = i;
+                sequence = slot.frame.sequence;
+            }
+        }
+        if (newest >= 0)
+        {
+            releaseReading();
+            SharedSlot &slot = s_sharedSlots[newest];
+            s_hostApi.DeleteSync(slot.produced);
+            slot.produced = nullptr;
+            if (slot.frame.hashValid)
+                slot.frame.contentHash = static_cast<uint64_t>(slot.hash[0]) | (static_cast<uint64_t>(slot.hash[1]) << 32u);
+            slot.reading = true;
+            s_readingSlot = newest;
+        }
+        if (s_readingSlot < 0)
+            return false;
+        frame = s_sharedSlots[s_readingSlot].frame;
+        return true;
+    }
+
+    // Parte común del cierre: suelta el cuadro en lectura y desactiva la presentación compartida.
+    void ShutdownShared()
+    {
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        releaseReading();
+        s_sharedActive.store(false, std::memory_order_release);
+    }
 }
-#endif
+
+namespace GSGL
+{
+    bool SharedAvailable(const Api &gl)
+    {
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        for (const SharedSlot &slot : s_sharedSlots)
+            if (!slot.reading && completed(gl, slot.produced) && completed(gl, slot.consumed))
+                return true;
+        return false;
+    }
+
+    bool PublishShared(const Api &gl, GLuint buffer, uint32_t width, uint32_t height, uint64_t renderSequence,
+                       GLuint hashProgram, GLint hashLocation)
+    {
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        if (!s_sharedActive.load(std::memory_order_relaxed))
+            return false;
+        SharedSlot *available = nullptr;
+        for (SharedSlot &slot : s_sharedSlots)
+        {
+            if (slot.reading || !completed(gl, slot.produced) || !completed(gl, slot.consumed))
+                continue;
+            if (!available || slot.frame.sequence < available->frame.sequence)
+                available = &slot;
+        }
+        if (!available)
+            return false;
+        SharedSlot &slot = *available;
+        if (slot.produced)
+            gl.DeleteSync(slot.produced);
+        if (slot.consumed)
+            gl.DeleteSync(slot.consumed);
+        slot.produced = slot.consumed = nullptr;
+        slot.frame.hashValid = false;
+        if (hashProgram)
+        {
+            if (!slot.hashBuffer)
+            {
+                gl.GenBuffers(1, &slot.hashBuffer);
+                gl.BindBuffer(kShaderStorageBuffer, slot.hashBuffer);
+                const GLbitfield flags = kMapReadBit | kMapPersistentBit | kMapCoherentBit;
+                gl.BufferStorage(kShaderStorageBuffer, 8, nullptr, flags);
+                slot.hash = static_cast<const uint32_t *>(gl.MapBufferRange(kShaderStorageBuffer, 0, 8, flags));
+            }
+            if (slot.hash)
+            {
+                static const bool deviceHash = [] {
+                    const char *setting = std::getenv("PS2X_FRAME_HASH_DEVICE");
+                    return !setting || std::string_view(setting) != "0";
+                }();
+                if (deviceHash && !slot.hashDeviceBuffer)
+                {
+                    gl.GenBuffers(1, &slot.hashDeviceBuffer);
+                    gl.BindBuffer(kShaderStorageBuffer, slot.hashDeviceBuffer);
+                    gl.BufferData(kShaderStorageBuffer, 8, nullptr, kDynamicDraw);
+                }
+                const GLuint output = deviceHash ? slot.hashDeviceBuffer : slot.hashBuffer;
+                const uint32_t zero = 0u;
+                gl.BindBuffer(kShaderStorageBuffer, output);
+                gl.ClearBufferData(kShaderStorageBuffer, kR32UI, kRedInteger, kUnsignedInt, &zero);
+                gl.BindBufferBase(kShaderStorageBuffer, 7u, buffer);
+                gl.BindBufferBase(kShaderStorageBuffer, 10u, output);
+                gl.MemBarrier(kAllBarrierBits);
+                gl.UseProgram(hashProgram);
+                gl.Uniform1ui(hashLocation, width * height);
+                gl.DispatchCompute((width * height + 255u) / 256u, 1u, 1u);
+                gl.MemBarrier(kAllBarrierBits);
+                if (deviceHash)
+                {
+                    gl.BindBuffer(kCopyReadBuffer, output);
+                    gl.BindBuffer(kCopyWriteBuffer, slot.hashBuffer);
+                    gl.CopyBufferSubData(kCopyReadBuffer, kCopyWriteBuffer, 0, 0, 8);
+                    gl.MemBarrier(kAllBarrierBits);
+                }
+                slot.frame.hashValid = true;
+            }
+        }
+        gl.BindBuffer(kPixelUnpackBuffer, 0u);
+        if (!slot.frame.texture)
+            gl.GenTextures(1, &slot.frame.texture);
+        gl.BindTexture(kTexture2D, slot.frame.texture);
+        if (slot.frame.width != width || slot.frame.height != height)
+        {
+            gl.TexImage2D(kTexture2D, 0, kRgba8, width, height, 0, kRgba, kUnsignedByte, nullptr);
+            gl.TexParameteri(kTexture2D, kTextureMinFilter, kLinear);
+            gl.TexParameteri(kTexture2D, kTextureMagFilter, kLinear);
+            gl.TexParameteri(kTexture2D, kTextureWrapS, kClampToEdge);
+            gl.TexParameteri(kTexture2D, kTextureWrapT, kClampToEdge);
+        }
+        gl.MemBarrier(kAllBarrierBits);
+        gl.BindBuffer(kPixelUnpackBuffer, buffer);
+        gl.TexSubImage2D(kTexture2D, 0, 0, 0, width, height, kRgba, kUnsignedByte, nullptr);
+        gl.MemBarrier(kAllBarrierBits);
+        gl.BindBuffer(kPixelUnpackBuffer, 0u);
+        gl.BindTexture(kTexture2D, 0u);
+        slot.frame.width = width;
+        slot.frame.height = height;
+        slot.frame.sequence = ++s_sharedSequence;
+        slot.frame.renderSequence = renderSequence;
+        slot.produced = gl.FenceSync(kSyncGpuCommandsComplete, 0u);
+        gl.Flush();
+        return true;
+    }
+
+    void DestroyShared(const Api &gl)
+    {
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        s_sharedActive.store(false, std::memory_order_release);
+        for (SharedSlot &slot : s_sharedSlots)
+        {
+            if (slot.produced)
+                gl.DeleteSync(slot.produced);
+            if (slot.consumed)
+                gl.DeleteSync(slot.consumed);
+            if (slot.frame.texture)
+                gl.DeleteTextures(1, &slot.frame.texture);
+            if (slot.hashBuffer)
+                gl.DeleteBuffers(1, &slot.hashBuffer);
+            if (slot.hashDeviceBuffer)
+                gl.DeleteBuffers(1, &slot.hashDeviceBuffer);
+            slot = {};
+        }
+        s_readingSlot = -1;
+    }
+}

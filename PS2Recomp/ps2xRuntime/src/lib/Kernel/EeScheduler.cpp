@@ -40,6 +40,8 @@ extern std::atomic<uint64_t> g_gowGuestFrames; // GOW-Port: ps2_runtime.cpp (con
 // número...), en cada VBlank y como el parche: aspecto A en 0x32F1B0 y en los dos modos de pantalla
 // (0x2FD930/0x2FD968), indicador del juego 0x29CC90 = 1, 0x304D94 = 2 y vídeos sin modo panorámico; F = 0,75
 // (Hor+: se ve más a los lados) salvo con el fondo del menú (0x29CC50 = 1), donde F = 1/A (recorte vertical).
+void gowTrucosVBlank(uint8_t *rdram); // GOW-Port: gow_trucos.cpp
+
 float gowAspectoPanoramico()
 {
     static const float aspect = []
@@ -2140,6 +2142,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         gowPanoramicoVBlank(m_rdram); // GOW-Port
+        gowTrucosVBlank(m_rdram); // GOW-Port: menú de trucos (gow_trucos.cpp)
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)

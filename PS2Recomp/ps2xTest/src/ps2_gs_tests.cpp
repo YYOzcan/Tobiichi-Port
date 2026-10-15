@@ -812,7 +812,8 @@ void register_ps2_gs_tests()
                      "F=0x80 over black FOGCOL should halve the point RGB and preserve alpha");
             t.Equals(renderFoggedPoint(true, 0x00u), 0x80000000u,
                      "F=0 should replace the point RGB with black FOGCOL");
-            t.Equals(renderFoggedPoint(true, 0x00u, 0x00302010u), 0x802F1F0Fu,
+            // GOW-Port: F=0 conserva FOGCOL exacto; el esperado anterior perdía un nivel por canal.
+            t.Equals(renderFoggedPoint(true, 0x00u, 0x00302010u), 0x80302010u,
                      "F=0 should replace point RGB with the programmed FOGCOL");
         });
 

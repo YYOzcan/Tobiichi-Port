@@ -2738,3 +2738,632 @@ Capturas comprobadas a ojo (menú, menú de mejoras, Kratos, HUD, enemigos y efe
   El lanzador de punta a punta (`--jugar`) encontró los archivos y arrancó el juego a pantalla completa.
 - **No hecho:** resolución interna 2×-4×. El GS se emula a su resolución sobre la VRAM entrelazada; haría falta
   una VRAM supermuestreada (como paraLLEl-GS), y el rasterizado costaría ~4× a 2×.
+
+### Sonido: bucles que vuelven al principio y voces que no se apagan (12 de octubre, tarde)
+
+- **Síntoma:** música, diálogos y efectos "se repiten", no fluyen. La salida al host ya estaba a tempo 1,00, así que
+  el fallo estaba en lo que producía el SPU2.
+- **Diagnóstico nuevo, opcional:**
+  - `GOW_SPU2_DIAG=1`: por segundo de audio emulado imprime voces activas, KON, fin de bloque con/sin repetir, IRQ,
+    ADMA, barridos, NON/PMON, ATTR, MMIX y ADMAS.
+  - `GOW_SPU2_PCM=<archivo>`: guarda la mezcla en s16le estéreo.
+  - En partida: sin IRQ del SPU2 (ATTR sin bit 6), sin ADMA, sin barridos de voz ni NON/PMON. El núcleo 1 tiene la
+    reverb activada (ATTR `c081`), que aún no se emula.
+- **Dos fallos, ambos frente a PCSX2:**
+  1. **KON ponía LSA = SSA.** El driver escribe la dirección de bucle antes de KON (2-12 veces por segundo) y se
+     perdía: los sonidos con bucle volvían a su principio en lugar de a su bucle. KON ahora conserva LSA, como
+     `V_Voice::Start`; la marca de inicio de bucle de los datos sigue mandando mientras no se reescriba el registro.
+  2. **Bajada exponencial del ADSR con división** (redondeo hacia cero). En las tasas lentas el paso se quedaba en 0
+     por debajo de ~0x1000 y la voz no se apagaba nunca: seguía repitiendo su bucle al ~12 %. Ahora es un desplazamiento
+     aritmético, como `V_ADSR::Calculate`, y el sustain que baja a 0 apaga la voz.
+- **También:** una IRQ del SPU2 que llega mientras se atiende otra ya no se pierde. Hoy no influye, el juego no usa
+  la IRQ.
+- **Resultado** (100 s con `GOW_PAD_TEST`, mismas condiciones):
+  - voces activas de media 26,7 → 17,8;
+  - finales de bloque que vuelven al bucle 25,5 → 16,6 por segundo; sonidos que terminan 7,9 → 23,2 por segundo;
+  - segundos con repetición casi exacta de la mezcla (correlación > 0,995 con algo de hasta 0,5 s antes) 7 → 2. Los
+    2 que quedan son el bucle de 350 ms del fuego del menú, a volumen bajo, que también está en el original.
+  - Tempo 1,00 y guarda de imagen sin cambios (capturas 0/6/8 bien; la 10 no existe en 100 s).
+- **Pruebas:**
+  - nuevas: "key on keeps a loop start written before it" y "a slow exponential release reaches silence"; las dos
+    fallan con el código anterior;
+  - "an active voice is mixed into the stereo output" usa ahora la marca de inicio de bucle (0x07): dependía de
+    LSA = SSA;
+  - suite: 564/567, las 3 de siempre.
+- **Pendiente:** reverb del SPU2 (efectos y voces más secos que en la consola), barrido de volumen e interpolación
+  gaussiana.
+- **Causa real de la música "en bucle" (misma tarde): NAX.**
+  - Traza de la voz de la música (`GOW_SPU2_TRAZA=10`, núcleo 1 voz 0: eventos KON/KOFF, LSA/SSA, fin de bloque y
+    lecturas de NAX). El driver de streaming usa un búfer doble por canal (L: 0x2820 y 0x7820; R: +0x800) con marca
+    fin + repetir en el último bloque de cada trozo, y escribe LSA para que la voz salte al otro trozo.
+  - La voz saltaba bien de A a B, pero casi nunca de B a A. Al decodificar el último bloque de B, nuestro NAX ya
+    valía "bloque + 8" (0x8020, el trozo del canal derecho). El driver, que lee NAX sin parar, creía que la voz se
+    había salido, hacía KOFF y relanzaba la música desde A cada ~0,35 s (el bucle que se oía). La marca de fin sí
+    estaba en los datos (cabecera 0x0312).
+  - Arreglo:
+    - el fin de bloque (ENDX, salto a LSA o parada) se resuelve al tocar su última muestra;
+    - NAX se lee como en el hardware: la media palabra en curso dentro del bloque que suena y, terminado el bloque,
+      el siguiente (LSA si había fin) pasada su cabecera;
+    - nunca sale del trozo.
+  - Con el arreglo la voz alterna A ↔ B cada ~7.800 muestras sin KOFF/KON. Lo mismo vale para diálogos y ambiente
+    (mismo driver). El usuario lo confirmó escuchando: la música suena entera.
+  - Prueba nueva "NAX stays inside the playing block until the loop jump" (falla con el código anterior). Suite
+    565/568, las 3 de siempre.
+- **Diagnóstico** (todo opcional):
+  - `GOW_SPU2_DIAG=1`: además de lo anterior, bloques de streaming nuevos/viejos por voz (contador de escrituras
+    DMA por bloque), tono medio aplicado y saltos de bucle.
+  - `GOW_SPU2_TRAZA=<núcleo><voz>`: hasta 700 eventos de una voz.
+
+### Lanzador: controles configurables y L2 (12 de octubre, tarde)
+
+- **Pestaña "Controles" nueva:**
+  - dos teclas o botones del ratón por acción, en grupos (movimiento, combate, poderes, menús, avanzado);
+  - captura a toda la ventana; Escape cancela, clic derecho borra;
+  - conflictos en ámbar, "Teclas por defecto";
+  - esquema del mando (moderno/clásico) aparte.
+- **Esquema por defecto (el del usuario):** WASD mover; Ctrl + WASD esquivar; 1-4 poderes (cruceta); clic izquierdo
+  y derecho ataques; F agarrar; Q L1 (parada); Shift L2 (antes no había L2 en el teclado); Ctrl R2; E R1; V L3 + R3;
+  flechas cruceta; Enter Start; Tab Select.
+- **Juego:** `TOBIICHI_TECLAS` (`ps2_pad.cpp`) para botones y sticks. `ps2_runtime.cpp` envuelve `scePad2Read`
+  (0x27B9F0, `gowPad2Read`) para sustituir sus sticks fijos sin tocar los overrides.
+  - Una tecla que es a la vez el modificador del stick derecho y un botón solo cuenta como botón si no se mueve
+    (Ctrl = R2 y Ctrl + WASD = esquiva).
+  - Sin la variable, el teclado sigue como antes.
+- **Verificado:**
+  - `logs/perf_teclas1`, 75 s con `GOW_PAD_TEST` y el mapa por defecto: envoltorio instalado, partida alcanzada,
+    lecturas del mando normales;
+  - pruebas QML del lanzador 7/7 (`launcher/pruebas/tst_teclas.qml`).
+  - No probado con teclas reales en partida (no hay herramienta de entrada sintética en el sistema).
+- **Pendiente:** remapear el mando (solo hay dos esquemas fijos).
+
+### Rendimiento: carga de VU1, dependencias entre programas y fallo de NVIDIA (12 de octubre, tarde)
+
+- **Fallo** (coredump 10:58, NVIDIA): SIGSEGV en `libnvidia-glcore` desde `rlDrawRenderBatch` ← `EndShaderMode` ←
+  `PS2Runtime::run` (presentación FSR). El binario de entonces ya ponía la pantalla completa con `ToggleFullscreen`;
+  con GLFW_AUTO_ICONIFY la ventana se minimiza al perder el foco y se dibuja con un framebuffer de 0.
+  - Ahora: sin auto-minimizar en pantalla completa (`glfwSetWindowAttrib`) y, con la ventana minimizada o de tamaño
+    0, ni pasos fuera de pantalla ni dibujo.
+  - No se ha podido reproducir el fallo.
+  - Comprobado (`logs/perf_guardas1`, 680M, pantalla completa + FSR + FXAA, 150 s): guarda de imagen OK.
+- **Carga de VU1 en partida** (`GOW_VU1_PERFIL=1`, nuevo; por segundo, ejecuciones, ciclos, cortes y entradas):
+  - ~57.000 ejecuciones/s, unas 1.900 por cuadro, de 3 entradas (0x0018 43 %, 0x0000 35 %, 0x0030 21 %), ~1.800 ciclos de
+    VU de media, sin cortes por presupuesto;
+  - ~102 M ciclos de VU/s a 30 cuadros/s, es decir ~3,4 M ciclos por cuadro;
+  - una VU1 real (150 MHz) tardaría ~22,7 ms en ese trabajo: esas escenas no caben en 60 ni en la consola;
+  - aquí cuestan ~8,2 ns por ciclo de VU (~1,2 veces la consola).
+- **Dependencias** (`GOW_VU1_DEPS=1` con `GOW_VU1_SIN_COMPILAR=1`, nuevo): por ejecución, registros leídos antes de
+  escribirlos (por carriles) y lecturas de memoria de VU escritas por otro programa. La memoria que escribe el VIF se
+  detecta comparando con la del final del programa anterior.
+  - Resultado: prácticamente todas dependen de la ejecución **inmediatamente anterior**:
+    - VF5 en ~92 %, VF4 ~35 %, VF29/15/16, VI9 y Q;
+    - memoria escrita por el programa anterior ~97 %;
+    - distancia a la dependencia más cercana = 1 en >99,9 %.
+  - Los programas son una cadena: repartir VU1 en varios hilos no es viable (tampoco lo hace PCSX2).
+- **Muestreo en partida** (`logs/muestrear_linux`, 680M):
+  - hilo de VU1 ocupado ~88 %: bloques compilados 67 %, `commitReadyPipelines` 5 %, despachador 5 %, VIF 4 %,
+    `commitReadyFlags` 2 %;
+  - hilo del EE ocupado ~64 %: ~33 % esperando y ~27 % en contabilidad del planificador (`accountCycles` 19,5 %,
+    probablemente el bucle de sondeo mientras espera a VU1/GS);
+  - hilo del GS ~49 % (envío, binning y páginas);
+  - frente del GS ~19 %.
+  - Para 60 en esas escenas, VU1 tiene que ir ~1,75 veces más rápido, por encima de la propia consola. Requiere
+    rediseñar el código generado de VU1 (registros en locales a lo largo de los bloques, menos maquinaria por par);
+    los retoques sobre el diseño actual ya se agotaron.
+
+### Menú de trucos (F2) y pestaña "Trucos" del lanzador (12 de octubre, tarde)
+
+Petición: un entrenador con inmortalidad, muerte de un golpe, todas las mejoras y poderes y todo desbloqueado.
+Los códigos CodeBreaker/GameShark que circulan están cifrados, así que las direcciones salen del propio ELF:
+
+- **Variables de la interfaz**: 0x1B5D70 registra ~190 variables con nombre (`HealthMeter_Value`, `PowerOrb_Count`,
+  `Blades_Level`...) dentro del objeto de 0x15B0 bytes apuntado por 0x29CB94. Son la copia de la interfaz.
+  - El estado de verdad está en 0x302CC0: 0x1D6AB8 lo copia a la interfaz al abrir el menú de mejoras, y
+    0x1D6B40 / 0x1D6CD0 lo devuelven al cerrarlo.
+  - Desglose de campos y topes en [`CONTROLES.md`](CONTROLES.md#menú-de-trucos-f2).
+- **Ajustes del jugador** (0x3028E0, registro en 0x1D4410):
+  - `Max Hit Points Level 0-4` = 100, 125, 150, 175, 200;
+  - `Max Magic Level 0-5` = 0, 100, 125, 150, 175, 200;
+  - umbrales del Modo Dios en +0x300 / +0x304;
+  - 6 niveles de arma de 0x50 bytes desde +0x60 (`Allow God Mode`, `God Mode Meter Drain`...).
+- **Vida**:
+  - Kratos es `*(*0x29CD58)`, como comprueba 0x1E0BC0;
+  - el HUD (0x1D6588) lee su vida en +0x178 y la máxima en +0x17C;
+  - todas las escrituras de la vida pasan por 0x1E0A80, salvo 0x1EE860, que pone -2;
+  - 0x1E0A98 resta daño y antes avisa de los umbrales cruzados (lista en +0x1B0).
+- **Extras**: 0x22F4B0 guarda en 0x2A12C8 las partidas terminadas, que salen de la partida guardada:
+  - bits 0-2: fácil, normal y difícil; bit 3: Modo Dios; bit 4: Desafío de los Dioses;
+  - de ahí la interfaz saca `HardMode_Unlocked` y `Costumes_Unlocked`;
+  - las consultas de extras (0x1BA9B8) miran directamente esos bits.
+
+Implementación:
+
+- `src/lib/gow_trucos.cpp`: envoltorios de 0x1E0A80 / 0x1E0A98 instalados con `replaceFunction` tras
+  `applyMatching`, valores fijados en cada VBlank (`EeScheduler`, junto al panorámico) y el menú dibujado con raylib
+  sobre la imagen.
+- El envoltorio de scePad2Read (0x27B9F0) se instala ahora siempre en God of War, no solo con `TOBIICHI_TECLAS`:
+  con el menú abierto deja el paquete en reposo.
+- Lanzador: pestaña "Trucos" (`PaginaTrucos.qml`, ajuste `trucos`), `TOBIICHI_TRUCOS` y `TOBIICHI_IDIOMA`; F2 en
+  la tabla de atajos. Las pestañas miden lo que su texto (con seis, repartidas a partes iguales se solapaban).
+
+Verificado (680M, `GOW_PAD_TEST`, `TOBIICHI_TRUCOS_DIAG=1`):
+
+- `logs/trucos1`, todos los trucos activos:
+  - en partida `kratos=795800 vida=200/200 plausible=1`, magia 200, furia 100, orbes 60000;
+  - niveles vida 4, magia 5, magias 2, espadas 4; objetos 0x017C; terminadas 0x1F;
+  - tablas como arriba.
+- `logs/trucos3`, inmortalidad + un golpe, cuadrado/triángulo forzados con `GOW_FORCE_PAD`, primer combate del
+  barco:
+  - los no muertos (vida 35) reciben 2 de daño → `restar ... -> 36`, `fijar ... -> 0`: mueren al primer golpe;
+  - Kratos recibe 3 → `restar ... (Kratos) ... -> 0`, la vida sigue en 100.
+- `logs/trucos2`: captura del menú abierto (`TOBIICHI_TRUCOS_ABRIR_EN=9`), textos turcos con DejaVu Sans.
+- Lanzador: capturas de la pestaña en tr/en/es (fuera de pantalla), con un ajuste `trucos` guardado entre comillas
+  como lo escribe QSettings.
+- Durante las pruebas el usuario jugó en la ventana (WASD, clics) y la cerró hacia los 40-60 s, así que las capturas
+  de 60 s en adelante no se hicieron.
+- No comprobado en partida: abrir el menú real con F2 y que el ratón funcione en él, los extras desbloqueados
+  vistos desde el menú principal, y la muerte de un golpe en jefes con fases (Hidra, Ares).
+
+### Teclas de las magias y de la Espada de Artemisa (12 de octubre, tarde)
+
+Petición: 1 Ira de Poseidón, 2 Mirada de Medusa, 3 Furia de Zeus, 4 Ejército de Hades, clic central Espada de
+Artemisa. Antes 1-4 eran cruceta arriba/derecha/abajo/izquierda.
+
+- **Qué dirección elige cada magia:**
+  - 0x1D7250 lee los bits "recién pulsados" de la entrada del jugador (+0x10 / +0x14 del objeto de control):
+    0x04000000 → `SelectMagic(3)` Zeus, 0x08000000 → 4 Medusa, 0x20000000 → 5 Poseidón, 0x10000000 → 6 Hades;
+  - esa entrada sale de la tabla de controles 0x29CF38 (entradas de 8 bytes: bit del mando → bit de acción;
+    17B92C la aplica);
+  - en esa tabla, derecha → 26, izquierda → 27, arriba → 28, abajo → 29.
+  - La magia elegida queda en 0x302D3E.
+  - En partida (`logs/dpad1`, con `TOBIICHI_TRUCOS=poderes`): abajo → 5 y derecha → 3. El usuario jugaba en la
+    ventana, así que solo esas dos pulsaciones son atribuibles.
+- **Espada de Artemisa:** no se elige como las magias; los movimientos con requisito 7 solo exigen tenerla
+  (0x2075E8, bit 0x40 de 0x302D42). Según la lista de controles (PSXDataCenter):
+  - sacarla o guardarla: L1 + R1 mantenidos;
+  - sus golpes: L1 + X / Cuadrado / Triángulo / Círculo;
+  - L2 lanza la magia elegida y R2 es la acción o interacción. Las etiquetas del lanzador decían lo contrario y se
+    han corregido.
+- **Cambios:**
+  - `ps2_pad.cpp`: acciones `poseidon medusa zeus hades artemisa`. `kBitAccion` pasa a máscaras: artemisa =
+    L1 | R1, furia = L3 | R3.
+  - Lanzador: `Teclas.js` añade esas acciones; la cruceta pasa al grupo "Menús" con solo las flechas; los mapas
+    antiguos se migran en `leer`.
+  - Prueba nueva `test_mapaAntiguo`; `tst_teclas` 8/8.
+  - Captura de la pestaña con el mapa guardado del usuario: R2 sigue en el botón lateral, 1-4 en las magias y la
+    cruceta solo con flechas.
+- **No comprobado:** pulsar 1-4 y el clic central de verdad en partida (no hay forma de inyectar teclas aquí), y
+  cuánto hay que mantener L1 + R1 para que saque la espada.
+
+### Rendimiento con la RTX 4050: dónde está el límite, medido otra vez (12 de octubre, tarde-noche)
+
+Sin cambios en el binario: las medidas no dejaron ninguna mejora segura que compense. Binario de referencia en
+`~/.cache/tobiichi-sync/ps2EntryRunner.antes_opt_10121700`.
+
+- **Partida** (`scripts/linux_perf_guard.sh base4050`, `TOBIICHI_GPU=nvidia`, barco con lluvia):
+  - flip mediano 30,00;
+  - por cuadro: VU 22 ms, EE 32 ms (incluye la espera), GS ~8 ms;
+  - imagen OK.
+  - Igual que la noche anterior, así que los trucos y las teclas no han tenido coste.
+- **Línea de tiempo por hilo** (muestreador con salida cruda, ~0,8 ms por ronda, 20 s):
+  - VU1 ocupado ~84 %;
+  - el EE espera (ocioso o sondeando en `accountCycles`) el 46 % del tiempo con VU1 ocupado, y trabaja con VU1
+    parado solo el 3,8 %;
+  - los huecos de VU1 duran 1,5-4 ms, uno por cuadro, casi siempre con el EE también parado: es la espera del
+    VBlank, no la latencia de despertar el hilo;
+  - el camino crítico es VU1.
+- **Hilo de VU1 en partida:**
+  - bloques compilados 61 %;
+  - `run()` 4,9 %, `commitReadyPipelines` 4,2 %, `commitReadyFlags` 2,7 %, `advanceTo` 1,2 %;
+  - VIF 3 %, `memcpy` 2 %;
+  - sin pares interpretados.
+- **Coste por ciclo de VU:**
+  - en partida, `GOW_VU1_PERFIL` da ~102 M ciclos/s en ~614 ms, es decir 6,0 ns por ciclo (~20 ms por cuadro);
+  - en la reproducción (`logs/bench_gece2`, 10,9 ms por pasada, huellas `8c71fe9fb9754a73` / `189611644956d250`),
+    6,3 ns;
+  - no hay pérdida por el entorno (frecuencia, cachés compartidas, SMT).
+  - El núcleo de VU1 va a 4,4-4,6 GHz con el perfil de energía "performance" (ya activo).
+- **Contadores de la reproducción** (diferencia entre 61 y 1 pasadas):
+  - por pasada, 183 M instrucciones y 50 M ciclos;
+  - IPC 3,6, paradas frontales 5,6 %, fallos de iTLB despreciables;
+  - es puro número de instrucciones, así que páginas grandes o alineación de código no ayudarían.
+- **Perfil por líneas de la reproducción** (`-g1`): plano.
+  - `upperT` ~20 % de las muestras; `normalize4` ~2,6 % (ya son 6 operaciones simples); commits ~5 %; despachador 3 %.
+  - La comprobación de `m_stopRequested` en cada par solo la activa la propia VU1 (instrucción reservada);
+    quitarla daría ~1-2 %: no compensa regenerar el PGO.
+- **Conclusión:** en esta escena, para 60 cuadros/s VU1 tiene que bajar de ~20-25 ms a ≤ ~14 ms (hay ~3 ms de hueco
+  al empezar el cuadro), ~1,5 veces.
+  - Con la emulación bit a bit actual (~27 ciclos del host por ciclo de VU), eso pide rediseñar el generador:
+    - VF en variables locales a lo largo del bloque;
+    - ciclos y commits estáticos;
+    - normalizar solo los operandos que vienen de memoria.
+  - La otra vía es un modo de VU1 con la precisión de PCSX2 (clamping en lugar de resultado exacto). PCSX2 dibuja
+    bien God of War así, pero la validación sería visual, no por huellas.
+  - Las dos son trabajo de varios días.
+
+### Modo rápido de VU1 con la precisión de PCSX2: 30 → 60 cuadros/s en el barco (12 de octubre, noche)
+
+El usuario eligió la vía 2 (precisión de PCSX2 en vez de la exacta). Opción de CMake `PS2X_VU1_RAPIDO` (por defecto
+OFF: el modo exacto y sus huellas no cambian; en nuestra compilación, ON). Cambios, todos bajo
+`#if PS2X_VU1_RAPIDO`:
+
+- **FMAC del código compilado** (`ps2_vu1_compiled.inl`, `upperT`):
+  - en SSE con el MXCSR de `run()`: redondeo hacia cero, como antes, más DAZ/FTZ, que `run()` pone solo en VU1 y
+    restaura después;
+  - sin normalizar operandos, sin las cribas de rango del camino exacto y sin la ruta escalar exacta;
+  - el resultado se limita a ±máximo (como el clamping "Normal" de PCSX2), así que un operando Inf/NaN no se propaga.
+  - Quedan igual: MAX/MINI, CLIP, ITOF/FTOI/ABS (FTOI sin `normalize4`: DAZ y la saturación ya cubren esos casos),
+    la temporización y los demás pipelines.
+- **Flags:**
+  - El estado no se calcula. En los 990 pares inferiores distintos del código compilado no hay ningún
+    FSAND/FSEQ/FSOR/FSSET; los pares MAC/estado de cada micromemoria se miraron con un escaneo de las 1157 capturas.
+  - MAC perezoso (`ps2_vu1_step.inl`, `Vu1MacRapido`): cada FMAC con flags vivos solo guarda Z/S y el ciclo en que se
+    ven en una cola de 8. FMEQ/FMAND (en línea) y FMEQ/FMAND/FMOR (`execLower`) toman la entrada visible más nueva
+    si es posterior al último MAC confirmado desde `m_flagPipeline` (resto de FMAC: intérprete, ruta escalar).
+  - Con `DeadFlags` no se guarda nada.
+  - `resetScheduler` resuelve y vacía la cola, como hace con las entradas listas de la cola normal; `run()` deja el
+    MAC resuelto al terminar.
+  - Sin U/O ni los bits pegajosos del producto (PCSX2 tampoco).
+- **Reproducción** (`logs/bench_gece2`, sin PGO, mediana de 5):
+  - exacto: 10,9 ms;
+  - FMAC rápida: 9,7 ms;
+  - sin normalizar operandos y sin flags muertos: 8,9 ms;
+  - MAC perezoso: 7,4 ms (1,47 veces).
+  - Imagen del cuadro reproducido (`img_x1_despues.ppm`) idéntica píxel a píxel a la exacta en los tres pasos
+    (`logs/herramientas/comparar_img.py`). Las huellas de VU1 cambian, como se esperaba.
+  - Cota medida antes de hacer el MAC perezoso: sin flags de FMAC en absoluto, 7,6 ms, pero la imagen se rompe (46 %
+    de píxeles distintos): el juego sí lee el MAC.
+  - Ojo: `huellas.sh` imprime el hash de `img_x1_antes.ppm`; para la imagen hay que comparar `img_x1_despues.ppm`.
+- **PGO:** regenerado con el modo rápido (`logs/herramientas/pgo_vu1.sh logs/vu1_gcc_pgo_rapido -DPS2X_VU1_RAPIDO=1`,
+  nuevo). `PS2X_VU1_GCC_PGO_DIR` apunta ahí; el perfil exacto sigue en `logs/vu1_gcc_pgo`.
+- **En partida** (`scripts/linux_perf_guard.sh rapido4050`, RTX 4050, barco con lluvia):
+  - flip mediano 30,00 → 59,93;
+  - VU por cuadro 22 → 13 ms, EE 32 → 16 ms;
+  - todas las ventanas de 5 s a partir de t = 30 s entre 56,2 y 60,1 (antes 30 salvo dos tramos);
+  - guarda de imagen OK.
+  - Durante la prueba el usuario jugó (cuadrado y stick), así que las capturas son de combate y del principio de la
+    Hidra, también correctas.
+- **Binarios:** el exacto en `~/.cache/tobiichi-sync/ps2EntryRunner.antes_opt_10121700`, el rápido en
+  `ps2EntryRunner.rapido_10121836`.
+- **Pendiente:**
+  - comparar más escenas con el modo exacto;
+  - los 80 casos FMAC con operandos extremos y los resultados subnormales dan distinto por diseño;
+  - `tests/vu1_compiled_test` cubre solo el modo exacto.
+
+### Linux: vídeos (FMV) completos y PMULTH de KIexster (13 de octubre)
+
+- **Intro de punta a punta** (`logs/fmv7`, `logs/fmv16`–`fmv20`, RTX 4050): el vídeo se ve entero en la ventana, suena,
+  termina (`sceMpegIsEnd=1` tras 1.383 cuadros) y el juego pasa a la cinemática en el motor y a la partida a 60 Hz.
+  Antes, al acabar el vídeo, pantalla negra con el EE al 96 % y el proceso se cerraba hacia los 113 s.
+- Cinco correcciones, detalladas en [`FMV_Y_AUDIO.md`](FMV_Y_AUDIO.md):
+  - `sceMpegIsEnd` (`0x26FF70`, sin stub) redirigido al HLE; el fin de programa del PSS cuenta como fin.
+  - Retrollamadas de flujo síncronas y cuadro de FFmpeg presentado en la ventana mientras dura el vídeo.
+  - `sceMpegAddStrCallback` sustituye la retrollamada del mismo flujo: el juego registra las suyas dos veces y cada
+    paquete de audio y vídeo llegaba duplicado.
+  - ADMA en el SPU2: el sonido de los vídeos (PCM 48 kHz por `sceSdBlockTrans`, núcleo 1) se rechazaba; ahora se lee
+    por bloques de 1 KB a su ritmo, con BVOL como s16, y el fin de DMA se retrasa hasta leer el último bloque.
+  - Los DMA ADMA que se solapan se encolan (sustituir perdía 1 de cada 8 bloques).
+- **Comprobado:** salida del SPU2 contra el audio que recibe el juego, 8.567 bloques idénticos, sin silencios; un
+  salto de 85 ms. Guardas de imagen no ejecutadas en esta tanda; capturas de ventana revisadas a mano.
+- **Lanzador y `run_gow.sh`:** los vídeos se reproducen por defecto (`saltarVideos=false`, `GOW_SKIP_FMV=0`).
+- **Diagnósticos:** `GOW_FMV_DIAG=1`, `GOW_FMV_AUDIO_REF=<archivo>`, `GOW_AUDIO_VOLCADO=<archivo>` y `GOW_SPU2_DIAG=1`
+  (ahora con DMA ADMA, BVOL/AVOL y pico ADMA).
+- **PMULTH (KIexster #67, `ps2recomp-ee-pmulth.patch`)** integrado con `tools/sync/sincronizar_kiexster.py --parche
+  ee-pmulth`, sin conflictos:
+  - El recompilador sumaba los ocho productos de PMULTH en un escalar; los decodificadores de animación de
+    `sub_00115978`, `sub_00115D00` y `sub_00116280` (cuatro PMULTH) daban matrices erróneas.
+  - En el port de KIexster eso eran los espasmos de Kratos y de los NPC.
+  - Regenerado con el template: solo esos tres archivos cambian respecto a `generated2` (copia anterior en
+    `~/.cache/tobiichi-sync/generated2_antes_pmulth/`).
+  - `ps2_runtime_macros.h` cambia, así que el ejecutable se recompila entero (~15 min con `-j3`).
+- **No integrado aún de KIexster** (de `a42d77f` a `08103d1`, 213 commits): la sincronización completa da 21
+  archivos en conflicto, 17 de ellos en `ps2_vu1_compiled.inl` contra el modo VU1 rápido.
+  - Pendientes con efecto en el juego: `ee-cop0-count` (cambia `ps2_runtime.h` y el recompilador), niebla del GS
+    (`gs-fog-latch`, `gs-fog-math`), `gs-discard-uncovered`, `vu1-block-check-cache` y `vu1-xgkick-bulk`.
+  - El resto es sobre todo el espejo DX11 de PCSX2, la presentación compartida y diagnósticos para Windows.
+- **Pruebas** (`ps2x_tests` en Linux): 571 de 574.
+  - Fallan las mismas tres de antes: dos de UV/STQ del GS por CPU y la de redondeo de div/sqrt de la FPU del EE.
+  - Pasan las nuevas: `sceMpegIsEnd …program end…`, `sceMpegAddStrCallback replaces…`, las dos de ADMA y las dos de
+    PMULTH.
+  - `sceMpegDemuxPssRing dispatches registered video and audio stream callbacks` fallaba desde que las retrollamadas
+    de flujo son síncronas: el stub salta a la retrollamada y la prueba lo llamaba fuera del planificador. Ahora lo
+    llama desde una función invitada (`demuxEnPlanificador`), igual que las pruebas de `sceMpegCbNodata`, y la
+    retrollamada de prueba vuelve a quien la llamó en vez de parar el runtime.
+  - Que las pruebas nuevas fallen sin la corrección se razona por el código; no se ejecutaron contra el binario anterior.
+- **Partida con el ejecutable nuevo** (`logs/pmulth1`, 115 s, RTX 4050), revisado en capturas a mano:
+  - intro con sonido y fin;
+  - cinemática en el motor y combate en la cubierta a 60 Hz;
+  - Kratos y los no muertos con poses normales.
+  - No se ha hecho una comparación aislada antes/después de las animaciones.
+
+### Linux: apertura de los vídeos, audio sin huecos y niebla del GS (13 de octubre, tarde)
+
+- **Queja del usuario:** "salta directamente, Kratos no llega a decir *the gods have abandoned me*; la frase del
+  principio está cortada".
+  - Causa: `GOW_FAST_BOOT=1`, activado por defecto en el lanzador y en `run_gow.sh`.
+  - Tras abrir el vídeo, el juego espera una animación de 13,3 s con el primer cuadro en pantalla y una voz de
+    22,05 kHz (núcleo 1, voces 4/5).
+  - `GOW_FAST_BOOT` da la animación por terminada en cuanto el nivel está cargado.
+  - Ojo: las pruebas anteriores "sin arranque rápido" no lo eran, porque `run_gow.sh` exportaba `GOW_FAST_BOOT=1`
+    de forma fija y pisaba la variable.
+  - Ahora está desactivado por defecto. El lanzador lo desactiva una vez en los ajustes guardados
+    (`versionAjustes=2`) y su descripción avisa de que corta la apertura.
+  - Verificado con el entorno exacto del lanzador y los ajustes del usuario (16:10, trucos), en `logs/lanzador_e2e`:
+    - voz y espera;
+    - vídeo entero con sonido;
+    - partida a 57-60 Hz.
+- **Audio de los vídeos sin huecos:** retrollamada de audio en el host con cola y 30 cuadros decodificados por
+  delante; detalle en [`FMV_Y_AUDIO.md`](FMV_Y_AUDIO.md).
+  - Antes había 85 ms repetidos a los 35 s del vídeo, y el sonido quedaba retrasado desde ahí.
+  - Ahora no hay ningún salto respecto al audio del PSS.
+- **Lo que no era la causa:**
+  - Ningún botón salta la intro: se probaron X, Start, Select, triángulo, círculo, cuadrado, L1/R1 y L2/R2.
+  - Los ajustes del usuario (trucos, 16:10, FSR) no cambian el vídeo.
+  - El flujo de voz posterior (núcleo 1, voz 7) no se corta con KOFF.
+- **KIexster, solo tres parches del GS** (`--parche`), con los conflictos de registro de pruebas resueltos a mano:
+  - `gs-fog-latch`: XYZF actualiza `m_curFog` para el XYZ siguiente.
+  - `gs-fog-math`: mezcla de niebla con pesos que suman 256 y un solo truncamiento, en CPU y en el shader.
+  - `gs-discard-uncovered`: descarte previo al interlock en el raster hardware; `PS2X_GS_HW_DISCARD_UNCOVERED=0`
+    vuelve al shader anterior.
+  - De sus pruebas se trae solo `uncoveredTriangles` (las demás dependen de herramientas de perfil que aquí no
+    hay).
+- **Pruebas:**
+  - Suite: 578 de 581; fallan las mismas tres de siempre.
+  - Con `GOW_GS_GPU_TEST=1` en la RTX 4050 pasa la nueva de triángulos finos.
+  - En modo GPU hay además fallos que salen igual con el descarte activado y desactivado: UV/STQ constante, el
+    mismo problema que en CPU, y otras pruebas no gráficas.
+- **Partida:**
+  - Niebla y lluvia de la cubierta correctas a simple vista.
+  - 57-60 cuadros/s con la caché de shaders llena.
+  - La primera ejecución tras cambiar los shaders compila y baja a 38-58 durante un par de minutos.
+- **No integrado:**
+  - `vu1-block-check-cache`: ya hay caché propia en el despachador.
+  - `vu1-xgkick-bulk`: conflicto con el VU1 rápido.
+  - `ee-cop0-count`: cambia `ps2_runtime.h` y el recompilador, y su efecto no está demostrado.
+- **Otras comprobaciones:**
+  - El CPU de respaldo sin OpenGL 4.6 no se cuelga (simulado con `MESA_GL_VERSION_OVERRIDE=3.3`), pero va a ~3 fps.
+- **Copia de seguridad previa:** `~/.cache/tobiichi-sync/yedek_10131626/` (diff de trabajo, archivos sin seguimiento,
+  ejecutables, `Launcher.conf` y los archivos del GS antes de los parches).
+- **Vídeos con el escalado del juego:** el cuadro del vídeo pasa por el mismo `Presentador` que el juego (FXAA y FSR
+  EASU+RCAS si están activos), a 4:3 con bandas. Antes se ampliaba con un bilineal simple. Comprobado con los ajustes
+  del usuario (`logs/fsr_fmv`): vídeo visible y vuelta a la partida sin problemas.
+- **Motivo de cierre en el registro:** líneas `[cierre]` cuando:
+  - la ventana pide cerrarse;
+  - termina el hilo del juego;
+  - el juego llama a `exit()`;
+  - aparece una función inexistente con la política Stop.
+
+  Una ejecución de prueba se cerró sola a los 92 s y no se reprodujo; con esto, la próxima vez quedará el motivo.
+- **Caché de sombreadores del lanzador** (`~/.cache/Tobiichi/Launcher/sombreadores`): calentada con los shaders nuevos de
+  niebla (199 → 380 archivos), para que la primera partida no compile durante el juego.
+- **Prueba de reinicio desde el último punto de control** (`logs/reinicio`): sin resultado.
+  - La ventana se cerró a los ~100 s por una petición de cierre (`[cierre] la ventana pidió cerrarse`), antes de
+    llegar a la pantalla de muerte.
+  - Lo mismo explica el cierre a los 92 s de `logs/calentar`: el usuario estaba usando el equipo durante las pruebas.
+  - Queda pendiente.
+
+## Resolución interna e imagen nítida (13 de octubre de 2026)
+
+Petición: dibujar a más resolución, con una opción en el lanzador que por defecto siga a la pantalla, y quitar el
+aspecto borroso de la PS2. Detalles técnicos en [`RENDERIZADO.md`](RENDERIZADO.md#resolución-interna-supermuestreo)
+y [`LANZADOR.md`](LANZADOR.md#resolución-de-dibujo-e-imagen-nítida-13-de-octubre-de-2026).
+
+- **Supermuestreo del GS** (`PS2X_GS_ESCALA`, 1..8): un plano de VRAM por posición de muestra. Las lecturas usan el
+  plano nativo.
+  - Los sprites no se desplazan. Antes daban columnas verdes cada 8 píxeles y una imagen doble en los pasos de
+    posprocesado del juego (`logs/escala3b` → `logs/escala3c`).
+- **Imagen nítida** (`PS2X_GS_NITIDO`): sin duplicar las líneas del campo y sin el antiparpadeo de dos circuitos
+  (DBY 1/0, ALP 0x80). Con `PS2X_GS_CRTC_DIAG` (ya retirado) se vio `pmode=8023 smode2=21fed1`, los dos circuitos
+  sobre FBP 208 y DBY 1 y 0.
+  - Comparación a 1×: `logs/escala1b` (antes) frente a `logs/nitido1`.
+- **Rendimiento**, RTX 4050 Laptop, cubierta del barco, `GOW_PERF_DIAG`:
+
+  | Escala | Antes | Ahora |
+  |---|---|---|
+  | 1× | 60 cuadros/s, hilo del GS 2,4 s/5 s | 60 cuadros/s, hilo del GS 1,25 s/5 s |
+  | 2× | 38 | 40-60 |
+  | 3× | 28 sin imagen nítida (17-24 con ella) | 18-24 |
+
+  - Mejora: no se recompone ni se vuelve a leer un cuadro sin cambios, y no se vuelve a copiar ni a subir uno ya
+    entregado.
+  - A 2× y 3× la GPU está al 100 % (`nvidia-smi`); a 1×, al 23 %. Eso es el límite: el GS se emula por software en
+    la GPU, y cada muestra cuesta lo mismo que un píxel nativo.
+  - 8K no es realista en esta GPU. 8× existe (4096×3584), pero solo para GPUs muy grandes.
+- **Presentación**: si la imagen es mayor que la ventana, se reduce por área (`kReducir`) en lugar de EASU. Verificado
+  a 3× en una ventana de 922×1074 (`logs/reducir3b`).
+- **Lanzador**: "Resolución de dibujo" (automática según la altura de la pantalla, o 1×-8×) e "Imagen nítida"
+  (activada).
+  - Con los ajustes guardados del usuario, la próxima partida usará 2× (pantalla de 1200 líneas). Para 60 FPS fijos en
+    este portátil, hay que elegir 1×; la imagen nítida sigue activa.
+- **Configuración regional tr_TR**: GLFW ponía `LC_CTYPE` del sistema y `tolower('I')` dejaba la `I`.
+  - Fallaban las claves de módulos IRX y las búsquedas de archivos con `i`/`I`. Se restaura `"C"` tras inicializar
+    GLFW.
+  - Con `GOW_GS_GPU_TEST=1` desaparecen cinco fallos del IOP.
+- **Pruebas**:
+  - `ps2x_tests`: 579/582 (los 3 fallos conocidos).
+  - Con `GOW_GS_GPU_TEST=1` en la NVIDIA: 591/595.
+    - Los 4 fallos son conocidos: el control de UV/STQ constante, que falla igual en CPU y OpenGL, y la FPU del EE.
+    - En la iGPU fallan además dos comprobaciones de "hardware efectivo", porque no tiene `fragment_shader_interlock`.
+  - Nuevas: `presentation mailbox delivers each frame once` y `OpenGL sharp image shows every buffer line without
+    anti-flicker`.
+- **Pendiente**: quedan uniones tenues entre tiras de posprocesado en la niebla a 2× y 3×; a simple vista son menores.
+  Ideas:
+  - una revisión por tipo de primitiva del coste de GPU;
+  - dibujar los S² planos en una sola pasada en lugar de S² dibujos.
+
+### Resolución dinámica y 2× por defecto (13 de octubre de 2026)
+
+Petición: 60 FPS en cualquier condición y 2× por defecto. Con el GS emulado por software en la GPU, el coste
+crece con S².
+- 8× a 60 FPS en una GPU débil no es posible con esta arquitectura. Haría falta un renderizador por hardware, como
+  el de PCSX2: render targets como texturas nativas, mezcla y profundidad de la GPU y caché de texturas. Es un
+  proyecto aparte y grande.
+- 120 FPS de juego no son posibles sin romperlo: la lógica va ligada al VBlank de 60 Hz. La ventana ya presenta a
+  120 Hz.
+- Hecho:
+  - escala dinámica (`PS2X_GS_ESCALA_DINAMICA`, detalles en `RENDERIZADO.md`);
+  - lanzador con 2× por defecto y la dinámica activada (ajustes v3);
+  - corrección de un desbordamiento al bajar de escala;
+  - textura de presentación a tamaño exacto.
+- Resultado: `logs/dinamica2` y `logs/dinamica4b`, sin cierres; 60 cuadros/s en la batalla de la cubierta a 1× efectivo.
+- Pruebas: 579/582 y, con la GPU NVIDIA, 591/595. Los fallos son los conocidos.
+- Limitación: la Radeon 680M tarda 20-26 ms por cuadro ya a 1×, así que no llega a 60 en las escenas pesadas.
+
+### Renderizador por hardware y escaneo progresivo (13 de octubre de 2026)
+
+- **Renderizador por hardware de triángulos** (`PS2X_GS_HW`; en el lanzador, "Renderizador por hardware
+  (experimental)", activado): ver `RENDERIZADO.md`.
+  - Medido en la RTX 4050 Laptop: 2× a 60 FPS con la GPU al 49 % (antes 40 FPS, GPU al 100 %) y 3× a 47-57 FPS
+    (antes 18-24).
+  - Corregido además un SIGSEGV al cerrar la ventana.
+- **Escaneo progresivo siempre activado** (`gow_video.cpp`, `GOW_PROGRESIVO=0` lo desactiva). El usuario comprobó
+  que la opción "Progressive Scan" del menú de pausa quita el desenfoque.
+  - El ajuste vive en 0x29CC94 (registro de ajustes de `func_1B5D70`: WideScreen 0x29CC90, ProgressiveScan
+    0x29CC94, DeFlicker 0x29CC98).
+  - `func_21FDA0` lo aplica cada cuadro con `func_1830D8` (descriptor 0x2FD938 = 480p).
+  - Se escribe 1 al entrar en `func_21FDA0`. El juego cambia de modo por su camino y la imagen pasa a 640×448.
+  - La opción del menú queda sin efecto pero sigue visible. Quitarla exige modificar el menú, que es un archivo
+    tipo Flash dentro de los datos del juego: las variables `_level0/:ProgressiveScan_State` y
+    `EnableProgressiveButton` y el botón de confirmación con temporizador de 480p.
+
+### 60 FPS en iGPU con ahorro de energía (13 de octubre de 2026)
+
+Detalle en `RENDIMIENTO.md` ("Portátil en ahorro de energía con la iGPU"). Radeon 680M, perfil `power-saver`,
+vídeos desactivados por petición del usuario (`GOW_SKIP_FMV=1` por defecto en `run_gow.sh` y en el lanzador, ajustes
+v5; se retomarán después).
+
+- **Espera del cuadro del EE sin girar** (`gow_espera.cpp`): 28-31 → 51-60 cuadros/s en la cubierta. Audio y ritmo
+  sin cambios.
+- **Escala dinámica:** también baja si el juego cae de 55 cuadros/s; en APU la resolución quita potencia a la CPU.
+- **Fijar objetivo:** Alt cuenta al soltarse, si se pulsó solo y con la ventana activa. Hubo una fijación sin
+  ninguna pulsación en una prueba desatendida.
+- **Pendiente:** el combate más cargado queda en 45-50, limitado por VU1 (~20 ms de CPU por cuadro a ese reloj).
+- **Herramientas nuevas:**
+  - `GOW_MUESTREO` (perfil por muestreo);
+  - `GOW_ESPERA_DIAG` (espera del EE y llegada/duración de los envíos de VU1);
+  - `GOW_AFINIDAD`.
+- **Pruebas:** 579/582. Con `GOW_GS_GPU_TEST=1` en la 680M, 590/596; los fallos son conocidos, más los dos de
+  "hardware efectivo" que esa GPU no tiene.
+- La NVIDIA no aparecía (`nvidia-smi`: "No devices found") con el perfil de ahorro de energía.
+
+### Parches de GS de KIexster hasta `80f4214` (14 de octubre)
+
+Con `tools/sync/sincronizar_kiexster.py --parche`, uno a uno y en su orden, se revisaron los parches de GS de
+KIexster. La mayoría ya estaban (fusión sin cambios). Tienen código nuevo en el runtime:
+
+- `gs-bilinear-stq`: el filtro bilinear también convierte STQ a 16.16 antes del medio texel (CPU y GLSL).
+- `gs-coordinate-alias`: el lote de la GPU se parte cuando el mismo color o Z se repite por el ancho de fila o por la
+  vuelta de la VRAM.
+- `gs-zte`: con ZTE=0 no hay prueba ni escritura de Z (CPU y GLSL). Aplicado también en el renderizador por hardware
+  propio (`gs_hw_render.cpp`, `admite` y `dibujar`).
+- `gs-cpu-colclamp`: con COLCLAMP=0 la mezcla en CPU se desborda a 8 bits en lugar de saturar.
+- `gs-texa-depth`: TEXA también al muestrear alias de profundidad (Z24/Z16/Z16S). El renderizador por hardware no
+  acepta texturas Z, así que esas texturas van por la ruta software.
+
+Pruebas:
+
+- Las pruebas de estos parches se añadieron a mano en `ps2_gs_backend_tests.cpp`, porque nuestro archivo es
+  distinto. A la de alias se le quitó `SetFeedbackSnapshotEnabled`, que no existe aquí. También se añadieron
+  `ps2_gs_zte_tests.cpp`, `ps2_gs_cpu_colclamp_tests.cpp` y `ps2_gs_texa_depth_tests.cpp`.
+- `GOW_GS_GPU_TEST=1` en la Radeon 680M: 603 de 613.
+  - Las 3 de siempre fallan: triángulos CPU UV/STQ y redondeo FPU del EE.
+  - Fallan otras 6 de "hardware". Lo único que no cumplen es la condición de que se observe el rasterizado por
+    hardware: la 680M no tiene fragment interlock. Los píxeles coinciden.
+  - Falla además la variante con control de triángulos UV/STQ, el mismo fallo de los triángulos CPU.
+- RTX 4050: no se pudo probar, porque con el perfil de ahorro de energía `nvidia-smi` responde "No devices found".
+- En partida (680M, 2× dinámica, renderizador por hardware y de cómputo): las capturas del combate de la cubierta
+  son correctas.
+
+`.kiexster-sync` no cambia: los parches que no son de GS (`vu1-thread`, `gs-front-thread`, `upload-ring`...) siguen
+sin integrar o integrados a mano, como antes.
+
+### Combate ágil: cancelación de animaciones de Kratos (14 de octubre)
+
+Petición: cortar los ataques para hacer, por ejemplo, un bloqueo o una parada en mitad del combo.
+
+- **Medido:** el juego ya lo hace. L1 o la evasión cortan cualquier ataque en uno o dos cuadros: primer cuadrado a
+  los 0,11 s, triángulo, cuarto cuadrado y remate del combo.
+- **Lo que obligaba a esperar:**
+  - Atacar desde una evasión: 0,61 s.
+  - La pulsación perdida al soltar L1 y atacar en el mismo cuadro.
+  - Los golpes recibidos.
+- **Cómo funciona el juego** (detalle en `docs/CONTROLES.md`, "Cancelar animaciones"):
+  - Las pulsaciones encolan transiciones `{transición, umbral}` en el controlador de movimientos (`*(Kratos+0x324)`,
+    +0x1C0).
+  - `0x2048F8` las empieza con `0x2088E8` cuando el avance del movimiento actual llega al umbral.
+- **Nuevo** (`gow_cancelar.cpp`, activado por defecto, opción "Combate ágil" del lanzador):
+  - En una evasión, el umbral máximo es 0,2: el ataque sale a los 0,29 s en lugar de 0,61 s.
+  - Búfer de entrada: la pulsación perdida al soltar L1 da el ataque a los 0,08 s.
+  - Factor del combo opcional (`GOW_CANCELAR_COMBO`, 1 por defecto). Con 0,6 salen 5 golpes en 0,9 s en lugar
+    de 3. No se comprobó que no se pierdan impactos: el contador de golpes (+0x64 del objeto de control) depende de
+    dónde estén los enemigos.
+  - Los golpes recibidos no se tocan: no encolan transiciones.
+- **Comprobado** en partida (`logs/cancelar_final`, cubierta, 680M en ahorro de energía, 2× dinámica):
+  - Evasión → ataque a los 0,29 s, dos veces.
+  - Bloqueo → soltar L1 + cuadrado → ataque a los 0,08 s.
+  - □□□△ con su remate.
+  - 59,2-60 FPS y sin fallos.
+- **Descartado:** escribir la máscara +0x70. `0x207EF8` la recalcula en cada cuadro y no es la puerta.
+- **Herramientas nuevas:**
+  - `GOW_CANCELAR_VIGILAR`: vigilancia de escrituras con mprotect y un paso con TF; da la función recompilada que
+    escribe una dirección de la RAM del EE.
+  - `GOW_CANCELAR_TRAMO`.
+  - `GOW_CANCELAR_DIAG`.
+  - `tools/perfil/linea_cancelar.py`.
+  - Desensamblado del ELF con `llvm-objdump --triple=mipsel-unknown-linux --mcpu=mips3`.
+- **Fallo visto una vez** (`logs/cancelar14`, no se repitió en cuatro intentos con y sin los diagnósticos):
+  - Tras un combo de cinco cuadrados, el hilo del EE saltó a 0x0 (`JALR` en `0x149390`).
+  - Esa función recorre una lista de objetos (a0+0x20, entradas de 8 bytes) y llama a su método +0xC; un objeto
+    era nulo.
+  - Pendiente, por si vuelve a aparecer.
+- **Pruebas sin mando:** con la ventana enfocada, el clic del ratón llega como cuadrado y se mezcla con
+  `GOW_FORCE_PAD`. En esta sesión aparecieron pulsaciones que no estaban en el guion.
+
+### Iconos de botones según el dispositivo (14 de octubre)
+
+**Petición:** que los iconos de PlayStation pasen a ser la tecla asignada con teclado y ratón, o el botón del mando
+Xbox, en los menús, los textos y los minijuegos, con un diseño fiel al del juego.
+
+- **Investigación.**
+  1. Las texturas del GS: los iconos no son texturas. Se escribieron `GOW_TEXTURAS` y `texturas_gs` para ver las
+     texturas de cada cuadro.
+  2. Los textos guardan `[XButton]`, `[L1Button]`... La película de Flash del HUD tiene esos símbolos.
+  3. El reproductor de Flash del juego: estructura de la película, símbolos y funciones de dibujo (`GOW_SONDEO` sobre
+     0x13C000-0x150000, ocultar formas y comparar capturas). Las formas son mallas vectoriales para VU1.
+- **Hecho** (`gow_iconos.cpp`):
+  - El juego no dibuja la forma del símbolo del botón. La ventana pone encima el icono del dispositivo, en el centro y
+    con el tamaño de la caja de la malla del fondo, con su oscurecido y transparencia.
+  - Teclas: la del lanzador. Xbox: según el esquema DMC5 o el clásico.
+  - Opción "Iconos de botones" en el lanzador: automático, teclado, Xbox o PlayStation.
+- **Detalles en** `docs/CONTROLES.md`, "Iconos de botones según el dispositivo": formato de la película, reglas para
+  reconocer cada botón y lo comprobado.
+- **Pendiente:**
+  - Comprobar los avisos de los minijuegos (marco griego, giros del stick).
+  - El círculo 3D sobre los enemigos (modelo `goMiniGameCircle`): es una textura del mundo, no Flash.
+
+### Rendimiento a 3× y 4× con la GPU integrada (15 de octubre)
+
+**Petición:** 60 FPS a 3× y 4× con la Radeon 680M, también en modo de bajo consumo.
+
+**Resultado** (modo rendimiento, partida): 1× 60 FPS (antes 53-56); 3× de 17 a 31-32 FPS; 4× de 10 a 18-19 FPS.
+No llega a 60.
+
+**Hecho:**
+
+- Sprites y posprocesado de GoW en el renderizador por hardware: movimientos de canales CT16, DATE, mezcla con Ad,
+  lecturas Z16, copias entre objetivos.
+- Modo exacto de triángulos.
+- Cargas parciales y volcados por páginas sucias.
+- Presentación compartida sin lectura a la RAM (por defecto en Linux).
+
+**Detalles, medidas y pendientes** en `docs/RENDERIZADO.md`, "Sprites por hardware, canales de GoW y presentación
+compartida".
+
+**Pruebas nuevas:**
+
+- `OpenGL hardware sprites match the software path at 1x and 3x`.
+- `OpenGL hardware channel shuffles match the software path at 1x and 3x`.
+
+**Comprobado en capturas:** imagen correcta a 3× en la cubierta del barco (`logs/bench_fix3`).
+
+**Fallo encontrado y corregido:** antes de esa captura salía una niebla verde, porque los sprites que leen su propio
+objetivo solo copiaban la zona del primero del lote.

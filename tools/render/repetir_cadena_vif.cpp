@@ -8,6 +8,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -39,8 +40,11 @@ namespace
     }
 }
 
+void ps2MuestreoIniciar(); // GOW-Port: ps2_muestreo.cpp (GOW_MUESTREO="inicio:duración")
+
 int main(int argc, char **argv)
 {
+    ps2MuestreoIniciar();
     if (argc < 3)
     {
         std::cerr << "Uso: repetir_cadena_vif <carpeta> <prefijo de salida> [fbp=0 fbw=8 psm=0 ancho=512 alto=448]\n";
@@ -86,8 +90,17 @@ int main(int argc, char **argv)
     GS gs;
     gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
     GifArbiter arbiter;
+    // GOW-Port: GOW_REPETIR_SIN_GS=1 descarta los paquetes GIF: mide solo VIF1/VU1 (en el juego el GS va en otro hilo).
+    const bool sinGs = std::getenv("GOW_REPETIR_SIN_GS") != nullptr;
+    // GOW-Port: huella de todo lo que sale hacia el GS (para comparar dos ejecuciones sin dibujar).
+    uint64_t salidaHash = 1469598103934665603ull, salidaBytes = 0u;
     arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *packet, uint32_t size)
-                                   { gs.processGIFPacket(packet, size, path); });
+                                   {
+        salidaHash = (salidaHash ^ static_cast<uint8_t>(path)) * 1099511628211ull;
+        for (uint32_t i = 0; i < size; ++i)
+            salidaHash = (salidaHash ^ packet[i]) * 1099511628211ull;
+        salidaBytes += size;
+        if (!sinGs) gs.processGIFPacket(packet, size, path); });
     mem.setGifArbiter(&arbiter);
 
     // Igual que PS2Runtime::syncCoreSubsystems, sin los bits D/T del EE.
@@ -146,18 +159,73 @@ int main(int argc, char **argv)
                      static_cast<unsigned long long>(parts[1]), static_cast<unsigned long long>(parts[2]),
                      static_cast<unsigned long long>(parts[3]), static_cast<unsigned long long>(parts[4]));
     };
+    // GOW-Port: GOW_REPETIR_PERTURBAR=<clases> llena con basura, antes de cada MSCAL, los registros de esas clases:
+    // "vf", "vi", "acc", "qpi" (Q, P, I), "flags" (MAC, status, clip), "todo", o uno solo ("vf5", "vi3"). Si la
+    // salida hacia el GS no cambia, ningún programa depende de lo que dejó el anterior en esos registros.
+    const char *perturbarTexto = std::getenv("GOW_REPETIR_PERTURBAR");
+    const std::string clases = perturbarTexto ? perturbarTexto : "";
+    const auto tiene = [&](const char *c) { return clases == "todo" || clases.find(c) != std::string::npos; };
+    int soloVf = -1, soloVi = -1;
+    if (clases.rfind("vf", 0) == 0 && clases.size() > 2 && std::isdigit(static_cast<unsigned char>(clases[2])))
+        soloVf = std::atoi(clases.c_str() + 2);
+    if (clases.rfind("vi", 0) == 0 && clases.size() > 2 && std::isdigit(static_cast<unsigned char>(clases[2])))
+        soloVi = std::atoi(clases.c_str() + 2);
+    const bool perturbar = !clases.empty();
+    uint64_t mscal = 0u, mscnt = 0u, semilla = 0x9E3779B97F4A7C15ull;
+    const auto basura = [&] { semilla ^= semilla << 13; semilla ^= semilla >> 7; semilla ^= semilla << 17; return semilla; };
+    const auto basuraF = [&] { return static_cast<float>(static_cast<int32_t>(basura() & 0xFFFFu) - 32768) * 0.37f; };
+    // GOW-Port: GOW_REPETIR_TRAZA_VI=<archivo>: por lanzamiento, pc y VI11/VI13 antes y después.
+    // GOW_REPETIR_BORRAR_ESCRITO=1: tras cada lanzamiento, basura en todo lo que escribió el programa en la memoria de
+    // datos; si la salida no cambia, ningún lanzamiento lee lo que escribió el programa de otro.
+    std::FILE *trazaVi = nullptr;
+    if (const char *t = std::getenv("GOW_REPETIR_TRAZA_VI"))
+        trazaVi = std::fopen(t, "w");
+    const bool borrarEscrito = std::getenv("GOW_REPETIR_BORRAR_ESCRITO") != nullptr;
+    std::vector<uint8_t> antesDatos(PS2_VU1_DATA_SIZE);
     mem.setVu1MscalCallback([&](uint32_t pc, uint32_t top, uint32_t itop)
                             {
         ++launches;
+        ++mscal;
+        const int32_t vi11 = vu1.state().vi[11], vi13 = vu1.state().vi[13];
+        if (borrarEscrito)
+            std::memcpy(antesDatos.data(), mem.getVU1Data(), PS2_VU1_DATA_SIZE);
+        if (perturbar)
+        {
+            VU1State &st = vu1.state();
+            if (soloVf > 0)
+                for (int l = 0; l < 4; ++l) st.vf[soloVf][l] = basuraF();
+            else if (soloVi > 0)
+                st.vi[soloVi] = static_cast<int16_t>(basura());
+            else
+            {
+                if (tiene("vf")) for (int r = 1; r < 32; ++r) for (int l = 0; l < 4; ++l) st.vf[r][l] = basuraF();
+                if (tiene("vi")) for (int r = 1; r < 16; ++r) st.vi[r] = static_cast<int16_t>(basura());
+                if (tiene("acc")) for (int l = 0; l < 4; ++l) st.acc[l] = basuraF();
+                if (tiene("qpi")) { st.q = basuraF(); st.p = basuraF(); st.i = basuraF(); }
+                if (tiene("flags")) { st.mac = static_cast<uint32_t>(basura()) & 0xFFFFu; st.status = static_cast<uint32_t>(basura()) & 0xFFFu; st.clip = static_cast<uint32_t>(basura()) & 0xFFFFFFu; }
+            }
+        }
         vu1.execute(mem.getVU1Code(), PS2_VU1_CODE_SIZE, mem.getVU1Data(), PS2_VU1_DATA_SIZE, gs, &mem, pc, top, itop, 65536);
+        if (trazaVi)
+            std::fprintf(trazaVi, "%llu pc=%04x top=%04x itop=%04x vi11 %d->%d vi13 %d->%d\n", static_cast<unsigned long long>(launches), pc, top,
+                         itop, vi11, vu1.state().vi[11], vi13, vu1.state().vi[13]);
+        if (borrarEscrito)
+        {
+            uint8_t *d = mem.getVU1Data();
+            for (uint32_t b = 0; b < PS2_VU1_DATA_SIZE; ++b)
+                if (d[b] != antesDatos[b])
+                    d[b] = static_cast<uint8_t>(basura());
+        }
         fingerprint(pc); });
     mem.setVu1MscntCallback([&](uint32_t top, uint32_t itop)
                             {
         ++launches;
+        ++mscnt;
         vu1.resume(mem.getVU1Code(), PS2_VU1_CODE_SIZE, mem.getVU1Data(), PS2_VU1_DATA_SIZE, gs, &mem, top, itop, 65536);
         fingerprint(0xFFFF); });
 
-    ppm(gs, prefix + "_antes.ppm", fbp, fbw, psm, width, height);
+    if (!sinGs) // sin GS no hay imagen que comparar (y leerla píxel a píxel ensuciaría el perfil)
+        ppm(gs, prefix + "_antes.ppm", fbp, fbw, psm, width, height);
     // GOW_REPETIR_VECES=N repite la cadena N veces y mide el tiempo (banco de pruebas de VIF1/VU1).
     const char *timesText = std::getenv("GOW_REPETIR_VECES");
     const uint32_t times = timesText ? std::max<uint32_t>(1u, uint32_t(std::strtoul(timesText, nullptr, 10))) : 1u;
@@ -170,8 +238,12 @@ int main(int argc, char **argv)
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
     if (times > 1u)
         std::printf("[repetir-vif] %u pasadas en %.3f s (%.1f ms por cuadro)\n", times, elapsed, 1000.0 * elapsed / times);
-    ppm(gs, prefix + "_despues.ppm", fbp, fbw, psm, width, height);
+    if (!sinGs)
+        ppm(gs, prefix + "_despues.ppm", fbp, fbw, psm, width, height);
     std::printf("[repetir-vif] bytes=%zu lanzamientos_vu1=%llu fbp=%u fbw=%u psm=%u\n", stream.size(),
                 static_cast<unsigned long long>(launches), fbp, fbw, psm);
+    std::printf("[repetir-vif] MSCAL=%llu MSCNT=%llu salida al GS: %llu bytes, huella %016llx\n",
+                static_cast<unsigned long long>(mscal), static_cast<unsigned long long>(mscnt),
+                static_cast<unsigned long long>(salidaBytes), static_cast<unsigned long long>(salidaHash));
     return 0;
 }

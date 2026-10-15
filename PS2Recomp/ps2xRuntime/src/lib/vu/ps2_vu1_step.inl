@@ -27,6 +27,40 @@
 #define VU1_STEP_INLINE inline __attribute__((always_inline))
 #endif
 
+// GOW-Port: modo rápido de VU1 (PS2X_VU1_RAPIDO, ver ps2_vu1_compiled.inl): MAC perezoso. Las FMAC compiladas no
+// encolan sus flags en m_flagPipeline (40 bytes por entrada y confirmación en orden): guardan el MAC (Z y S) y el
+// ciclo en que se ve en esta cola. Quien lee el MAC (FMEQ, FMAND, FMOR) toma la entrada más nueva ya visible, si es
+// posterior al último MAC confirmado desde m_flagPipeline (otras FMAC: intérprete, ruta escalar). Como una FMAC
+// emite como mucho una por ciclo y el MAC se ve 4 ciclos después, entre las 8 últimas siempre hay una visible.
+// Un solo VU1: el estado es global (solo lo toca el hilo que ejecuta VU1).
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+struct Vu1MacRapido
+{
+    static constexpr uint32_t kN = 8u;
+    uint64_t listo[kN] = {};
+    uint32_t mac[kN] = {};
+    uint32_t n = 0u;                // escrituras hechas (la última está en (n - 1) % kN)
+    uint64_t listoPrincipal = 0u;   // ciclo "listo" del último MAC confirmado desde m_flagPipeline
+};
+extern Vu1MacRapido g_vu1MacRapido;
+
+VU1_STEP_INLINE void vu1RapidoResolverMacT(uint32_t &mac, uint64_t ciclo)
+{
+    const Vu1MacRapido &cola = g_vu1MacRapido;
+    const uint32_t hay = cola.n < Vu1MacRapido::kN ? cola.n : Vu1MacRapido::kN;
+    for (uint32_t k = 0; k < hay; ++k)
+    {
+        const uint32_t i = (cola.n - 1u - k) & (Vu1MacRapido::kN - 1u);
+        if (cola.listo[i] <= ciclo)
+        {
+            if (cola.listo[i] > cola.listoPrincipal)
+                mac = cola.mac[i];
+            return;
+        }
+    }
+}
+#endif
+
 static constexpr uint8_t vu1StepLane(uint32_t component)
 {
     return static_cast<uint8_t>(1u << (3u - component));

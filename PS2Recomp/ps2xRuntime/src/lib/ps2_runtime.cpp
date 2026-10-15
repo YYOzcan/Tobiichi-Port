@@ -6,6 +6,9 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_shared_present.h"
+#include "runtime/gs/gs_threaded_backend.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -31,6 +34,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstdio>
+#include <clocale>
 #include "rlgl.h" // GOW-Port: rlGetShaderIdDefault (sombreadores de presentación)
 
 #if !defined(PLATFORM_VITA)
@@ -61,8 +65,12 @@ namespace
             {
                 int16_t chunk[2048u * 2u];
                 size_t drained = 0u;
+                // GOW-Port: GOW_AUDIO_VOLCADO=<archivo>: PCM 48 kHz estéreo s16 tal como sale del SPU2 (diagnóstico).
+                static std::FILE *volcado = [] { const char *v = std::getenv("GOW_AUDIO_VOLCADO"); return v ? std::fopen(v, "wb") : nullptr; }();
                 while ((drained = source->drainAudio(chunk, 2048u)) != 0u)
                 {
+                    if (volcado)
+                        std::fwrite(chunk, sizeof(int16_t) * 2u, drained, volcado);
                     g_spu2Stretch.push(chunk, drained);
                     g_spu2DiagArrived.fetch_add(drained, std::memory_order_relaxed);
                 }
@@ -205,6 +213,60 @@ static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
 #endif
 
 float gowAspectoPanoramico(); // GOW-Port: Kernel/EeScheduler.cpp (0 = sin TOBIICHI_PANORAMICO)
+bool tobiichiSticksTeclado(uint8_t (&sticks)[4]); // GOW-Port: ps2_pad.cpp (teclado configurable)
+// GOW-Port: menú de trucos de God of War (gow_trucos.cpp).
+void gowTrucosInstalar(PS2Runtime &runtime, const std::string &elfPath);
+void gowPeliculasInstalar(PS2Runtime &runtime, const std::string &elfPath); // GOW-Port: gow_peliculas.cpp
+void gowVideoInstalar(PS2Runtime &runtime, const std::string &elfPath);     // GOW-Port: gow_video.cpp
+void gowFijarInstalar(PS2Runtime &runtime, const std::string &elfPath);     // GOW-Port: gow_fijar.cpp
+void gowCancelarInstalar(PS2Runtime &runtime, const std::string &elfPath);  // GOW-Port: gow_cancelar.cpp
+void gowCapturaGsInstalar(PS2Runtime &runtime);                             // GOW-Port: gow_captura_gs.cpp
+void gowSondeoInstalar(PS2Runtime &runtime);                                // GOW-Port: gow_sondeo.cpp
+void gowIconosInstalar(PS2Runtime &runtime, const std::string &elfPath);    // GOW-Port: gow_iconos.cpp
+void ps2MuestreoIniciar();                                                 // GOW-Port: ps2_muestreo.cpp (GOW_MUESTREO)
+void gowEsperaInstalar(PS2Runtime &runtime, const std::string &elfPath);    // GOW-Port: gow_espera.cpp
+void gowFijarEntrada();                                                    // GOW-Port: gow_fijar.cpp (Alt y ratón)
+void gowFijarDibujar(float x, float y, float w, float h);                    // GOW-Port: marca del objetivo fijado
+void gowIconosDibujar(float x, float y, float w, float h);                   // GOW-Port: iconos de botones (gow_iconos.cpp)
+bool gowPeliculaEnPantalla(const uint8_t *rdram); // GOW-Port: gow_peliculas.cpp
+bool ps2MpegCuadroPantalla(std::vector<uint8_t> &rgba, int &width, int &height, uint64_t &serial); // Kernel/Stubs/MPEG.cpp
+uint64_t ps2MpegSerieCuadroPantalla(); // Kernel/Stubs/MPEG.cpp
+bool gowTrucosEntradaBloqueada();
+void gowTrucosMenuEntrada(bool escCierraJuego);
+void gowTrucosMenuDibujar();
+// GOW-Port: GLFW va enlazado dentro de raylib; solo hace falta esta función (sin sus cabeceras).
+#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
+extern "C" void glfwSetWindowAttrib(void *window, int attrib, int value);
+#endif
+
+namespace
+{
+    // GOW-Port: con TOBIICHI_TECLAS (lanzador), los sticks del teclado salen del mapa configurable. La lectura del
+    // mando de God of War (scePad2Read, 0x27B9F0, gowPad2Read en los overrides) escribe sus propios sticks fijos
+    // (WASD / Ctrl + WASD); este envoltorio la llama y luego pone los del mapa en el paquete (RX, RY, LX, LY).
+    // Con el menú de trucos abierto el paquete queda en reposo (botones sueltos, sticks centrados, sin presión).
+    constexpr uint32_t kGowPad2Read = 0x0027B9F0u;
+    PS2Runtime::RecompiledFunction g_gowPad2Read = nullptr;
+
+    void tobiichiPad2Read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t buffer = GPR_U32(ctx, 5) & 0x01FFFFFFu;
+        g_gowPad2Read(rdram, ctx, runtime);
+        if (GPR_U32(ctx, 2) != 18u || buffer + 18u > PS2_RAM_SIZE)
+            return;
+        if (gowTrucosEntradaBloqueada())
+        {
+            uint8_t *paquete = rdram + buffer;
+            paquete[0] = paquete[1] = 0xFFu;
+            std::memset(paquete + 2u, 0x80, 4u);
+            std::memset(paquete + 6u, 0, 12u);
+            return;
+        }
+        uint8_t sticks[4];
+        if (tobiichiSticksTeclado(sticks))
+            std::memcpy(rdram + buffer + 2u, sticks, sizeof(sticks));
+    }
+}
 
 // GOW-Port: ventana y presentación configurables (God of War: Tobiichi Launcher). Sin estas variables todo
 // queda como antes.
@@ -330,6 +392,30 @@ vec3 muestra(vec2 uv)
 
     constexpr const char *kCopia = R"(
 void main() { finalColor = vec4(muestra(fragTexCoord), 1.0); }
+)";
+
+    // GOW-Port: reducción por área (resolución interna mayor que la ventana): cada píxel de salida promedia los texeles
+    // que cubre, ponderados por la superficie. Es la resolución correcta del supermuestreo; EASU solo sirve para ampliar.
+    constexpr const char *kReducir = R"(
+void main()
+{
+    vec2 tam = vec2(textureSize(texture0, 0));
+    vec2 paso = max(abs(vec2(dFdx(fragTexCoord.x), dFdy(fragTexCoord.y))) * tam, vec2(1.0));
+    vec2 centro = fragTexCoord * tam;
+    vec2 a = centro - 0.5 * paso, b = centro + 0.5 * paso;
+    ivec2 i0 = ivec2(floor(a)), i1 = min(ivec2(ceil(b)) - 1, i0 + 9);
+    vec3 suma = vec3(0.0);
+    float peso = 0.0;
+    for (int y = i0.y; y <= i1.y; ++y)
+        for (int x = i0.x; x <= i1.x; ++x)
+        {
+            vec2 lo = max(a, vec2(x, y)), hi = min(b, vec2(x + 1, y + 1));
+            float w = max(hi.x - lo.x, 0.0) * max(hi.y - lo.y, 0.0);
+            suma += tap(ivec2(x, y)) * w;
+            peso += w;
+        }
+    finalColor = vec4(suma / max(peso, 1e-6), 1.0);
+}
 )";
 
     // FXAA (Timothy Lottes, versión compacta "FXAA PC simple"), a la resolución del juego.
@@ -481,6 +567,7 @@ void main()
                 return shader;
             };
             m_copy = load(kCopia);
+            m_reducir = load(kReducir);
             if (c.fxaa)
                 m_fxaa = load(kFxaa);
             if (c.filtro == Filtro::Fsr)
@@ -488,7 +575,7 @@ void main()
                 m_easu = load(kEasu);
                 m_rcas = load(kRcas);
             }
-            m_ready = m_copy.id != 0u && (!c.fxaa || m_fxaa.id != 0u) &&
+            m_ready = m_copy.id != 0u && m_reducir.id != 0u && (!c.fxaa || m_fxaa.id != 0u) &&
                       (c.filtro != Filtro::Fsr || (m_easu.id != 0u && m_rcas.id != 0u));
             if (!m_ready)
                 std::cerr << "[presentacion] sombreadores no disponibles: se usa el escalado de antes" << std::endl;
@@ -497,7 +584,8 @@ void main()
         // Pasos fuera de la pantalla (FXAA y EASU), antes de BeginDrawing.
         void prepare(Texture2D &frame, uint32_t srcWidth, uint32_t srcHeight, bool newFrame, const Rectangle &dst)
         {
-            m_active = m_ready;
+            m_active = m_ready && !IsWindowMinimized() && GetRenderWidth() > 0 && GetRenderHeight() > 0 &&
+                       dst.width >= 1.0f && dst.height >= 1.0f && srcWidth != 0u && srcHeight != 0u;
             if (!m_active)
                 return;
             const Config &c = config();
@@ -518,6 +606,16 @@ void main()
             m_input = frame;
             m_inputSrc = Rectangle{0.0f, 0.0f, static_cast<float>(srcWidth), static_cast<float>(srcHeight)};
             m_inputValid = Vector2{static_cast<float>(srcWidth), static_cast<float>(srcHeight)};
+            // GOW-Port: imagen mayor que el destino (resolución interna): se reduce por área a la salida, sin FXAA (el
+            // supermuestreo ya suaviza los bordes) ni EASU; RCAS afila después como siempre.
+            m_reducido = c.filtro != Filtro::Pixel && (srcWidth > static_cast<uint32_t>(width) || srcHeight > static_cast<uint32_t>(height));
+            if (m_reducido)
+            {
+                ensureTarget(m_easuTarget, width, height);
+                runPass(m_easuTarget, m_reducir, m_input, m_inputSrc, m_inputValid);
+                m_prepared = true;
+                return;
+            }
             if (c.fxaa)
             {
                 ensureTarget(m_fxaaTarget, static_cast<int>(srcWidth), static_cast<int>(srcHeight));
@@ -551,6 +649,15 @@ void main()
                 EndShaderMode();
                 return true;
             }
+            if (m_reducido)
+            {
+                const Vector2 size{static_cast<float>(m_easuTarget.texture.width), static_cast<float>(m_easuTarget.texture.height)};
+                BeginShaderMode(m_copy);
+                setVec2(m_copy, "fuente", size);
+                DrawTexturePro(m_easuTarget.texture, Rectangle{0.0f, 0.0f, size.x, -size.y}, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+                EndShaderMode();
+                return true;
+            }
             if (c.filtro == Filtro::Pixel)
             {
                 // Solo con FXAA: la entrada ya es el resultado del suavizado, sin filtrar al ampliar.
@@ -566,7 +673,7 @@ void main()
 
         void unload()
         {
-            for (Shader *shader : {&m_copy, &m_fxaa, &m_easu, &m_rcas})
+            for (Shader *shader : {&m_copy, &m_reducir, &m_fxaa, &m_easu, &m_rcas})
                 if (shader->id != 0u)
                     UnloadShader(*shader);
             for (RenderTexture2D *target : {&m_fxaaTarget, &m_easuTarget})
@@ -602,7 +709,7 @@ void main()
             EndTextureMode();
         }
 
-        Shader m_copy{}, m_fxaa{}, m_easu{}, m_rcas{};
+        Shader m_copy{}, m_reducir{}, m_fxaa{}, m_easu{}, m_rcas{};
         RenderTexture2D m_fxaaTarget{}, m_easuTarget{};
         Texture2D m_input{};
         Rectangle m_inputSrc{};
@@ -610,7 +717,7 @@ void main()
         uint32_t m_srcWidth = 0u, m_srcHeight = 0u;
         int m_dstWidth = 0, m_dstHeight = 0;
         int m_frameFilter = 0;
-        bool m_ready = false, m_active = false, m_prepared = false;
+        bool m_ready = false, m_active = false, m_prepared = false, m_reducido = false;
     };
 #endif
 
@@ -674,8 +781,9 @@ void main()
     }
 
     // Pruebas: TOBIICHI_CAPTURAS=40,70 guarda la ventana (ventana_40.png...) en la carpeta de trabajo a esos
-    // segundos desde que se abre.
-    void capturas()
+    // segundos desde que se abre. Con TOBIICHI_CAPTURAS_JUEGO=1 guarda también la imagen del juego a su tamaño
+    // (juego_40.png...), sin el escalado de la ventana.
+    void capturas(const Texture2D *juego = nullptr, uint32_t juegoAncho = 0u, uint32_t juegoAlto = 0u)
     {
         static std::vector<int> pendientes = []
         {
@@ -697,6 +805,14 @@ void main()
         pendientes.erase(pendientes.begin());
         rlDrawRenderBatchActive();
         TakeScreenshot(TextFormat("ventana_%d.png", seconds));
+        static const bool conJuego = [] { const char *v = std::getenv("TOBIICHI_CAPTURAS_JUEGO"); return v && v[0] == '1'; }();
+        if (conJuego && juego && juego->id != 0u && juegoAncho != 0u && juegoAlto != 0u)
+        {
+            Image imagen = LoadImageFromTexture(*juego);
+            ImageCrop(&imagen, Rectangle{0.0f, 0.0f, static_cast<float>(juegoAncho), static_cast<float>(juegoAlto)});
+            ExportImage(imagen, TextFormat("juego_%d.png", seconds));
+            UnloadImage(imagen);
+        }
     }
 
     void applyCursor()
@@ -719,6 +835,11 @@ void main()
             previousHeight = GetScreenHeight();
             const int monitor = GetCurrentMonitor();
             SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
+#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
+            // Sin minimizar al perder el foco (GLFW_AUTO_ICONIFY): con la ventana minimizada el framebuffer mide 0 y
+            // el controlador de NVIDIA llegó a fallar dibujando en ella (SIGSEGV en rlDrawRenderBatch).
+            glfwSetWindowAttrib(GetWindowHandle(), 0x00020006 /* GLFW_AUTO_ICONIFY */, 0 /* GLFW_FALSE */);
+#endif
             ToggleFullscreen();
         }
         else
@@ -1059,9 +1180,44 @@ namespace
     }
 }
 
+bool gowGsPresentMailboxActive();       // GOW-Port: gs_threaded_backend.cpp
+uint64_t gowGsPresentMailboxDelivered(); // GOW-Port: gs_threaded_backend.cpp
+
+// GOW-Port: presentación compartida (PS2X_GS_DIRECT_PRESENT=1): la textura del cuadro es del contexto del GS. La
+// textura propia de la ventana se guarda para liberarla al cerrar.
+static bool s_texturaCompartida = false;
+static Texture2D s_texturaPropia{};
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight, bool &outNewFrame)
 {
     outNewFrame = false; // GOW-Port: la presentación (FXAA/FSR) solo se rehace con un cuadro nuevo
+    if (GSSharedPresent::Active())
+    {
+        // El GS compone y publica el cuadro en la GPU; aquí solo se pide y se toma el último terminado.
+        static uint64_t s_tick = std::numeric_limits<uint64_t>::max();
+        static uint64_t s_secuencia = 0u;
+        const uint64_t tick = rt->eeScheduler().currentVSyncTick();
+        if (tick != s_tick)
+        {
+            rt->gs().latchHostPresentationFrame();
+            s_tick = tick;
+        }
+        GSSharedPresent::Frame f;
+        if (GSSharedPresent::Acquire(f) && f.texture && f.width && f.height)
+        {
+            if (!s_texturaCompartida)
+            {
+                s_texturaPropia = tex;
+                s_texturaCompartida = true;
+            }
+            tex = Texture2D{f.texture, static_cast<int>(f.width), static_cast<int>(f.height), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+            outNewFrame = f.sequence != s_secuencia;
+            s_secuencia = f.sequence;
+        }
+        outWidth = static_cast<uint32_t>(tex.width);
+        outHeight = static_cast<uint32_t>(tex.height);
+        return;
+    }
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
@@ -1080,6 +1236,16 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
+        // GOW-Port: con el buzón, si el GS no entregó un cuadro nuevo la textura ya lo tiene: no se copia ni se sube.
+        static uint64_t s_uploadedSequence = 0u;
+        const uint64_t sequence = gowGsPresentMailboxActive() ? gowGsPresentMailboxDelivered() : 0u;
+        if (sequence != 0u && sequence == s_uploadedSequence && s_hasUploadedFrame)
+        {
+            outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
+            outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+            return;
+        }
+        s_uploadedSequence = sequence;
     }
     else if (s_hasUploadedFrame)
     {
@@ -1101,7 +1267,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        Image blank = GenImageColor(tex.width, tex.height, MAGENTA); // GOW-Port: del tamaño actual de la textura
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outNewFrame = true;
@@ -1138,13 +1304,41 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
-    std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
+    // GOW-Port: la textura toma el tamaño del cuadro (resolución interna, también dinámica). Con una textura mayor
+    // que el cuadro había que borrarla y subirla entera en cada cuadro (2048x1792 tras bajar de 4x a 1x).
+    if (width != 0u && height != 0u && s_scratch.size() == static_cast<size_t>(width) * height * 4u &&
+        (width != static_cast<uint32_t>(tex.width) || height != static_cast<uint32_t>(tex.height)))
+    {
+        const int w = static_cast<int>(width);
+        const int h = static_cast<int>(height);
+        Image blank = GenImageColor(w, h, BLANK);
+        UnloadTexture(tex);
+        tex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+        SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+        std::fprintf(stderr, "[presentacion] imagen del juego %ux%u\n", width, height);
+    }
+    const size_t texBytes = static_cast<size_t>(tex.width) * static_cast<size_t>(tex.height) * 4u;
+    if (width == static_cast<uint32_t>(tex.width) && height == static_cast<uint32_t>(tex.height) && s_scratch.size() == texBytes)
+    {
+        // El cuadro ocupa toda la textura: se sube sin copia intermedia.
+        UpdateTexture(tex, s_scratch.data());
+        outNewFrame = true;
+        outWidth = width;
+        outHeight = height;
+        s_hasUploadedFrame = true;
+        return;
+    }
+    if (s_uploadBuffer.size() != texBytes)
+        s_uploadBuffer.assign(texBytes, 0u);
+    else
+        std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
+        const uint32_t copyWidth = std::min<uint32_t>(width, static_cast<uint32_t>(tex.width));
+        const uint32_t copyHeight = std::min<uint32_t>(height, static_cast<uint32_t>(tex.height));
         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        const size_t dstRowBytes = static_cast<size_t>(tex.width) * 4u;
         const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
         for (uint32_t y = 0; y < copyHeight; ++y)
         {
@@ -1458,8 +1652,11 @@ bool PS2Runtime::syncCoreSubsystems()
     return true;
 }
 
+void ps2AfinidadReservar(); // GOW-Port: ps2_afinidad.cpp
+
 bool PS2Runtime::initialize(const char *title)
 {
+    ps2AfinidadReservar(); // GOW-Port: un núcleo físico para el hilo de VU1
     try
     {
         if (!m_memory.initialize())
@@ -1481,6 +1678,17 @@ bool PS2Runtime::initialize(const char *title)
         SetConfigFlags(FLAG_WINDOW_RESIZABLE | (ventana.vsync ? FLAG_VSYNC_HINT : 0u));
         const char *customTitle = std::getenv("TOBIICHI_TITULO");
         InitWindow(ventana.width, ventana.height, customTitle && *customTitle ? customTitle : title);
+        // GOW-Port: GLFW pone LC_CTYPE del sistema. Con tr_TR, tolower('I') es 'I' y toupper('i') es 'i': fallaban las
+        // comparaciones ASCII de nombres (módulos IRX, archivos del disco). El juego no usa entrada de texto.
+        std::setlocale(LC_CTYPE, "C");
+        // GOW-Port: presentación compartida (PS2X_GS_DIRECT_PRESENT=1). El GS crea su contexto al construirse, antes que
+        // la ventana: tras capturar el de la ventana se vuelve a crear el backend, ahora con un contexto compartido.
+        GSSharedPresent::CaptureHostContext();
+        if (const char *directo = std::getenv("PS2X_GS_DIRECT_PRESENT"); directo && directo[0] == '1')
+        {
+            m_gs.setRasterBackend(GSThreadedBackend::MakeDefault());
+            GSSharedPresent::RestoreHostContext(); // en Windows la captura suelta el contexto de la ventana
+        }
         SetWindowMinSize(320, 224);
         if (const char *icon = std::getenv("TOBIICHI_ICONO"); icon && *icon)
         {
@@ -1778,6 +1986,29 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
                                       m_cpuContext.pc,
                                       elfCrc32,
                                       elfCrc32Valid);
+
+    // GOW-Port: teclado configurable y bloqueo del mando con el menú de trucos (ver tobiichiPad2Read). Solo God of War.
+    if (std::filesystem::path(elfPath).filename() == "SCUS_973.99" && hasFunction(kGowPad2Read))
+    {
+        const RecompiledFunction actual = lookupFunction(kGowPad2Read);
+        if (actual != &tobiichiPad2Read)
+        {
+            g_gowPad2Read = actual;
+            replaceFunction(kGowPad2Read, &tobiichiPad2Read);
+            if (std::getenv("TOBIICHI_TECLAS"))
+                std::cerr << "[teclado] mapa configurable activo (TOBIICHI_TECLAS); sticks del teclado desde el mapa" << std::endl;
+        }
+    }
+    gowTrucosInstalar(*this, elfPath); // GOW-Port
+    gowPeliculasInstalar(*this, elfPath); // GOW-Port
+    gowVideoInstalar(*this, elfPath);     // GOW-Port: escaneo progresivo siempre activado
+    gowFijarInstalar(*this, elfPath);     // GOW-Port: fijar objetivo (envuelve la lectura del mando)
+    gowCancelarInstalar(*this, elfPath);  // GOW-Port: cancelar ataques (después de fijar: encadena su envoltorio)
+    gowCapturaGsInstalar(*this);          // GOW-Port: GOW_GS_REPLAY_TRACE (diagnóstico)
+    gowSondeoInstalar(*this);             // GOW-Port: GOW_SONDEO (diagnóstico)
+    gowIconosInstalar(*this, elfPath);    // GOW-Port: iconos de botones según el dispositivo
+    ps2MuestreoIniciar();                 // GOW-Port: perfil por muestreo opcional
+    gowEsperaInstalar(*this, elfPath);    // GOW-Port: el EE duerme mientras espera el cuadro
 
     RUNTIME_LOG("ELF file loaded successfully. Entry point: 0x" << std::hex << m_cpuContext.pc << std::dec);
     return true;
@@ -2108,6 +2339,7 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
 
     if (policy == MissingFunctionPolicy::Stop)
     {
+        std::fprintf(stderr, "[cierre] función inexistente 0x%x con la política Stop\n", targetPc); // GOW-Port
         requestStop();
     }
 }
@@ -3201,6 +3433,9 @@ void PS2Runtime::run()
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
             m_eeScheduler->run();
             uint32_t pc = m_debugPc.load(std::memory_order_relaxed);
+            // GOW-Port: el motivo de cada cierre queda en el registro (también en Release).
+            std::fprintf(stderr, "[cierre] el hilo del juego terminó (pc=0x%x, parada pedida=%d)\n", pc,
+                         isStopRequested() ? 1 : 0);
             RUNTIME_LOG("Game thread returned. PC=0x" << std::hex << pc
                       << " RA=0x" << static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)) << std::dec << std::endl);
         }
@@ -3278,6 +3513,9 @@ void PS2Runtime::run()
         // GOW-Port: F11 alterna la pantalla completa.
         if (IsKeyPressed(KEY_F11))
             presentacion::alternarPantallaCompleta();
+        static const bool escCierraJuego = presentacion::ventana().escExits;
+        gowTrucosMenuEntrada(escCierraJuego); // GOW-Port: F2, menú de trucos
+        gowFijarEntrada();                    // GOW-Port: Alt fija el objetivo, el ratón lo cambia
         if (IsWindowResized())
             std::cerr << "[presentacion] ventana " << GetScreenWidth() << "x" << GetScreenHeight()
                       << (IsWindowFullscreen() ? " (pantalla completa)" : "") << std::endl;
@@ -3286,23 +3524,110 @@ void PS2Runtime::run()
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         // GOW-Port: proporción (TOBIICHI_ASPECTO / panorámico) y escalado (TOBIICHI_FILTRO, TOBIICHI_FXAA).
         const Rectangle dstRect = presentacion::destino(srcWidth, srcHeight, m_memory.getRDRAM());
+        // GOW-Port: vídeos (FMV). God of War los muestra con un truco de la memoria del GS (relee la imagen RGB32 como
+        // PSMZ16 y la redibuja en franjas) que nuestro GS no reproduce. Mientras el juego reproduce un vídeo, la
+        // ventana muestra el cuadro que decodifica FFmpeg (el mismo que recibe el juego), con su proporción.
+        static Texture2D fmvTex{};
+        static uint64_t fmvSerie = 0u, fmvSerieInicio = 0u;
+        static bool fmvAntes = false;
+        static std::vector<uint8_t> fmvPixeles;
+        const bool fmvActivo = gowPeliculaEnPantalla(m_memory.getRDRAM());
+        if (fmvActivo && !fmvAntes)
+            fmvSerieInicio = ps2MpegSerieCuadroPantalla(); // no mostrar el último cuadro de un vídeo anterior
+        fmvAntes = fmvActivo;
+        bool fmvListo = false;
+        if (fmvActivo)
+        {
+            int w = 0, h = 0;
+            if (ps2MpegCuadroPantalla(fmvPixeles, w, h, fmvSerie) && w > 0 && h > 0)
+            {
+                if (fmvTex.id == 0 || fmvTex.width != w || fmvTex.height != h)
+                {
+                    if (fmvTex.id != 0)
+                        UnloadTexture(fmvTex);
+                    Image img{fmvPixeles.data(), w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                    fmvTex = LoadTextureFromImage(img);
+                    SetTextureFilter(fmvTex, TEXTURE_FILTER_BILINEAR);
+                }
+                else
+                    UpdateTexture(fmvTex, fmvPixeles.data());
+            }
+            fmvListo = fmvTex.id != 0 && fmvSerie > fmvSerieInicio;
+        }
+        {
+            // GOW-Port: GOW_FMV_DIAG=1: cada ~2 s, estado del vídeo en la ventana (cuadro y brillo medio).
+            static const bool fmvDiag = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
+            static unsigned fmvDiagTick = 0;
+            if (fmvDiag && (fmvActivo || fmvAntes) && ++fmvDiagTick % 240u == 0u)
+            {
+                uint64_t brillo = 0u;
+                for (size_t i = 0; i + 3u < fmvPixeles.size(); i += 4u * 97u)
+                    brillo += fmvPixeles[i] + fmvPixeles[i + 1u] + fmvPixeles[i + 2u];
+                const size_t muestras = fmvPixeles.size() / (4u * 97u);
+                std::fprintf(stderr, "[fmv-ventana] activo=%d listo=%d serie=%llu inicio=%llu brillo=%.1f\n", fmvActivo ? 1 : 0,
+                             fmvListo ? 1 : 0, static_cast<unsigned long long>(fmvSerie),
+                             static_cast<unsigned long long>(fmvSerieInicio), muestras ? brillo / (3.0 * muestras) : 0.0);
+            }
+        }
+
+        // GOW-Port: el vídeo, a su proporción y con el mismo escalado que el juego (FSR/FXAA si están activos).
+        Rectangle fmvDst{};
+        if (fmvListo)
+        {
+            const float sw = static_cast<float>(GetScreenWidth()), sh = static_cast<float>(GetScreenHeight());
+            const float escala = std::min(sw / static_cast<float>(fmvTex.width), sh / static_cast<float>(fmvTex.height));
+            const float dw = std::max(1.0f, std::floor(fmvTex.width * escala)), dh = std::max(1.0f, std::floor(fmvTex.height * escala));
+            fmvDst = Rectangle{std::floor((sw - dw) * 0.5f), std::floor((sh - dh) * 0.5f), dw, dh};
+        }
 #if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
-        presentador.prepare(frameTex, presentWidth, presentHeight, newFrame, dstRect);
+        {
+            static bool fuenteFmv = false; // la fuente cambió: hay que volver a preparar aunque no haya cuadro nuevo
+            static uint64_t fmvSeriePreparada = 0u;
+            if (fmvListo)
+            {
+                const bool nuevo = !fuenteFmv || fmvSerie != fmvSeriePreparada;
+                presentador.prepare(fmvTex, static_cast<uint32_t>(fmvTex.width), static_cast<uint32_t>(fmvTex.height), nuevo, fmvDst);
+                fmvSeriePreparada = fmvSerie;
+            }
+            else
+                presentador.prepare(frameTex, presentWidth, presentHeight, newFrame || fuenteFmv, dstRect);
+            fuenteFmv = fmvListo;
+        }
 #endif
 
         BeginDrawing();
         ClearBackground(BLACK);
+        // GOW-Port: minimizada (framebuffer de 0) no se dibuja; solo se atienden la entrada y el ritmo.
+        const bool dibujar = !IsWindowMinimized() && GetRenderWidth() > 0 && GetRenderHeight() > 0;
+        if (dibujar && fmvListo)
+        {
 #if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
-        if (!presentador.draw(dstRect))
+            if (!presentador.draw(fmvDst))
+#endif
+                DrawTexturePro(fmvTex, Rectangle{0.0f, 0.0f, static_cast<float>(fmvTex.width), static_cast<float>(fmvTex.height)},
+                               fmvDst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        }
+        else
+#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
+        if (dibujar && !presentador.draw(dstRect))
+#else
+        if (dibujar)
 #endif
             DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        if (presentacion::config().fps)
+        if (dibujar && !fmvListo)
+        {
+            gowFijarDibujar(dstRect.x, dstRect.y, dstRect.width, dstRect.height); // GOW-Port
+            gowIconosDibujar(dstRect.x, dstRect.y, dstRect.width, dstRect.height); // GOW-Port
+        }
+        if (dibujar && presentacion::config().fps)
             presentacion::drawFps(dstRect);
+        if (dibujar)
+            gowTrucosMenuDibujar(); // GOW-Port
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
-        presentacion::capturas(); // GOW-Port
+        presentacion::capturas(&frameTex, presentWidth, presentHeight); // GOW-Port
         {
             ps2_perf::Scope perf(ps2_perf::Bucket::HostWait);
             EndDrawing();
@@ -3310,8 +3635,11 @@ void PS2Runtime::run()
         if (ps2_perf::countFrames()) ps2_perf::hostFrames.fetch_add(1, std::memory_order_relaxed);
         ps2_perf::report();
 
-        if (WindowShouldClose())
+        // GOW-Port: pruebas: TOBIICHI_CERRAR_TRAS=N cierra como el botón de la ventana a los N segundos.
+        static const double cerrarTras = [] { const char *v = std::getenv("TOBIICHI_CERRAR_TRAS"); return v ? std::atof(v) : 0.0; }();
+        if (WindowShouldClose() || (cerrarTras > 0.0 && GetTime() >= cerrarTras))
         {
+            std::fprintf(stderr, "[cierre] la ventana pidió cerrarse (botón de cerrar o tecla de salida)\n"); // GOW-Port
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
             requestStop();
             break;
@@ -3329,10 +3657,14 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+    // GOW-Port: el contexto GL del GS cuelga de GLFW y CloseWindow (glfwTerminate) lo destruye. Antes se vacía la cola
+    // del GS y su backend OpenGL se destruye en su propio hilo, cambiando a un backend CPU (la VRAM pasa por copia).
+    // Sin esto el hilo del GS podía seguir dibujando con el contexto ya destruido (SIGSEGV al cerrar).
+    m_gs.setRasterBackend(std::make_unique<GSCpuBackend>());
 #if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
     presentador.unload();
 #endif
-    UnloadTexture(frameTex);
+    UnloadTexture(s_texturaCompartida ? s_texturaPropia : frameTex); // GOW-Port: la compartida es del GS
     CloseWindow();
 
     RUNTIME_LOG("[run] exiting loop");

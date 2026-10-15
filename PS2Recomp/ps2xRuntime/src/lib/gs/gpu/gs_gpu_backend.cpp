@@ -9,6 +9,7 @@
 #include "../gs_triangle_rules.h"
 #include "gs_gl.h"
 #include "gs_gpu_shaders.h"
+#include "gs_hw_render.h"
 #include "ThreadNaming.h"
 #include "ThreadPriority.h"
 
@@ -17,6 +18,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cmath>
+#include <string>
+#include <unordered_map>
 #include <cstdio>
 #include <cstring>
 #include <condition_variable>
@@ -32,6 +35,9 @@
 
 using namespace GSGL;
 using namespace GSCpuInternal;
+
+bool gowGsPresentMailboxActive(); // GOW-Port: gs_threaded_backend.cpp
+extern std::atomic<uint64_t> g_gowGuestFrames; // GOW-Port: ps2_runtime.cpp (cuadros del juego; 0 sin GOW_PERF_FRAME_PC)
 
 namespace
 {
@@ -51,18 +57,30 @@ namespace
                 _mm_setcsr((_mm_getcsr() & ~_MM_ROUND_MASK) | rounding);
         }
     };
-    // GOW-Port: el frontend existente consume filas de 640 píxeles, incluso con CRTC menor.
-    PresentationFrame gowPresentationRows(PresentationFrame frame)
+    // GOW-Port: el frontend existente consume filas de 640 píxeles (640 * S con resolución interna S), incluso con
+    // CRTC menor.
+    PresentationFrame gowPresentationRows(PresentationFrame frame, uint32_t rowWidth = 640u)
     {
-        if (frame.pixels.empty() || frame.width == 640u)
+        // GOW-Port: un cuadro más ancho (resolución interna, también uno leído antes de un cambio de escala dinámica)
+        // va sin relleno: el frontend lo reconoce por su tamaño.
+        if (frame.pixels.empty() || frame.width >= rowWidth ||
+            frame.pixels.size() != static_cast<size_t>(frame.width) * frame.height * 4u)
             return frame;
-        std::vector<uint8_t> rows(static_cast<size_t>(640u) * frame.height * 4u);
+        std::vector<uint8_t> rows(static_cast<size_t>(rowWidth) * frame.height * 4u);
         const size_t bytes = static_cast<size_t>(frame.width) * 4u;
         for (uint32_t y = 0; y < frame.height; ++y)
-            std::memcpy(rows.data() + static_cast<size_t>(y) * 640u * 4u,
+            std::memcpy(rows.data() + static_cast<size_t>(y) * rowWidth * 4u,
                         frame.pixels.data() + static_cast<size_t>(y) * bytes, bytes);
         frame.pixels = std::move(rows);
         return frame;
+    }
+
+    // GOW-Port: resolución interna. PS2X_GS_ESCALA = S (1..8) multiplica por S el ancho y el alto de la imagen.
+    uint32_t escalaPedida()
+    {
+        const char *value = std::getenv("PS2X_GS_ESCALA");
+        const unsigned long s = value ? std::strtoul(value, nullptr, 10) : 1ul;
+        return static_cast<uint32_t>(std::clamp<unsigned long>(s, 1ul, 8ul));
     }
     constexpr uint32_t kPrimWords = 40u;
     constexpr uint32_t kStateWords = 32u;
@@ -220,6 +238,21 @@ namespace
         return c;
     }
 
+    // GOW-Port: fuera del ancho de fila, o tras 512 paginas logicas, XY deja
+    // de identificar un pixel unico de VRAM. La base alineada puede volver
+    // por 4 MiB sin alias si las coordenadas siguen dentro de ese dominio.
+    bool targetCoordinatesMayAlias(uint32_t psm, uint32_t bw, int x1, int y1)
+    {
+        const GSSwizzle::Format &f = GSSwizzle::GetFormat(psm);
+        if (f.kind == GSSwizzle::Kind::Invalid)
+            return false;
+        const uint32_t x = static_cast<uint32_t>(std::max(x1, 0));
+        const uint32_t y = static_cast<uint32_t>(std::max(y1, 0));
+        const uint32_t pagesPerRow = (bw * 64u) >> f.pageShiftX;
+        return x >= bw * 64u || (pagesPerRow == 0u && (y >> f.pageShiftY) != 0u) ||
+               (y >> f.pageShiftY) * pagesPerRow + (x >> f.pageShiftX) >= kPages;
+    }
+
     void markPages(std::bitset<kPages> &pages, uint32_t psm, uint32_t base, uint32_t bw, int x0, int y0, int x1, int y1)
     {
         const GSSwizzle::Format &format = GSSwizzle::GetFormat(psm);
@@ -258,6 +291,44 @@ struct GSGpuBackend::Impl
     uint32_t hostVramSize = 0u;
 
     GLuint vramBuffer = 0;
+    // GOW-Port: resolución interna (PS2X_GS_ESCALA = S). Hay S×S planos de VRAM (con su zona de páginas sombra); el
+    // plano k = j*S + i muestrea cada píxel desplazado (i/S, j/S) de píxel. Todos reciben las mismas subidas, copias y
+    // borrados y se dibujan por separado; la presentación intercala sus píxeles en una imagen S veces mayor. El plano
+    // 0 es exactamente el GS original: de él salen las lecturas del EE y las CLUT. Con S = 1 no cambia nada.
+    uint32_t escala = 1u;
+    uint32_t planos = 1u;
+    size_t planoBytes = 0u;
+    // GOW-Port: escala dinámica (PS2X_GS_ESCALA_DINAMICA=1). PS2X_GS_ESCALA es el tope (planos reservados); la escala
+    // activa baja cuando la GPU no llega a tiempo (el hilo del GS espera en throttleGpuFrames) y vuelve a subir, a
+    // prueba, tras un rato sin esperas. Si al subir se satura enseguida, el siguiente intento espera el doble.
+    struct EscalaDinamica
+    {
+        bool activa = false;
+        uint32_t tope = 1u;
+        std::chrono::steady_clock::time_point ventana{}, ultimoCambio{};
+        std::chrono::steady_clock::duration espera{};
+        uint64_t cuadros = 0u; // g_gowGuestFrames al empezar la ventana
+        double fpsSuave = 60.0; // media exponencial de los cuadros del juego por segundo
+        uint32_t ventanasLibres = 0u;
+        double bloqueoSubida = 20.0; // segundos
+        bool probando = false;
+    } dinamica;
+    // GOW-Port: renderizador por hardware de triángulos (PS2X_GS_HW=1, gs_hw_render.cpp).
+    std::unique_ptr<GSHw::Renderizador> hwRender;
+    GSHw::Vram hwVram() const { return {vramBuffer, planoBytes, escala}; }
+    void hwVolcarTodo(uint32_t origen)
+    {
+        if (hwRender)
+            hwRender->volcarTodo(hwVram(), origen);
+    }
+    void hwAntes(const std::bitset<kPages> &toca, const std::bitset<kPages> *escribe, uint32_t origen)
+    {
+        if (!hwRender)
+            return;
+        hwRender->antesDeSoftware(toca, hwVram(), origen);
+        if (escribe)
+            hwRender->escrito(*escribe);
+    }
     GLuint swizzleBuffer = 0;
     GLuint clutBuffer = 0;
     GLuint primBuffer = 0;
@@ -344,6 +415,9 @@ struct GSGpuBackend::Impl
     // GOW-Port: color y profundidad pueden compartir VRAM con swizzles distintos.
     std::bitset<kPages> colorPages;
     std::bitset<kPages> depthAccessPages;
+    // GOW-Port: riesgo acumulado por destino; solo separa paginas solapadas.
+    bool colorCoordinatesAlias = false;
+    bool depthCoordinatesAlias = false;
     std::bitset<kPages> batchClutPages;
     bool deferUploads = true;
     std::vector<uint32_t> pageMaps;
@@ -380,6 +454,7 @@ struct GSGpuBackend::Impl
     uint64_t readbackSequence = 0u;
     uint64_t lastFrameSequence = 0u;
     PresentationFrame lastFrame;
+    uint64_t lastReturnedSequence = 0u; // GOW-Port: último cuadro asíncrono devuelto (buzón)
     uint64_t contentRevision = 1u;
     uint64_t presentedRevision = 0u;
     // GOW-Port: incluir la fuente preferida en la clave de presentación compartida.
@@ -631,6 +706,116 @@ struct GSGpuBackend::Impl
         gl().BufferData(kShaderStorageBuffer, static_cast<GLsizeiptr>(size), data, kDynamicDraw);
         gl().BindBufferBase(kShaderStorageBuffer, binding, buffer);
         return buffer;
+    }
+
+    // GOW-Port: el binding 0 (VRAM) apunta al plano k; fuera de los bucles por planos queda siempre en el plano 0.
+    void bindPlano(uint32_t k)
+    {
+        gl().BindBufferRange(kShaderStorageBuffer, 0u, vramBuffer, static_cast<GLintptr>(static_cast<size_t>(k) * planoBytes),
+                             static_cast<GLsizeiptr>(planoBytes));
+    }
+
+    // GOW-Port: cambia la escala activa (entre 1 y el tope reservado). Los planos que entran copian el plano 0, que
+    // siempre tiene la VRAM nativa completa; el juego los vuelve a dibujar en el cuadro siguiente.
+    void cambiarEscala(uint32_t nueva, double esperaPct)
+    {
+        nueva = std::clamp<uint32_t>(nueva, 1u, dinamica.tope);
+        if (nueva == escala)
+            return;
+        flushBatch();
+        if (hwRender)
+        {
+            hwRender->volcarTodo(hwVram(), 10u);
+            hwRender->descartarTodo();
+        }
+        barrier();
+        const uint32_t nuevosPlanos = nueva * nueva;
+        if (nuevosPlanos > planos)
+        {
+            gl().BindBuffer(kCopyReadBuffer, vramBuffer);
+            gl().BindBuffer(kCopyWriteBuffer, vramBuffer);
+            for (uint32_t k = planos; k < nuevosPlanos; ++k)
+                gl().CopyBufferSubData(kCopyReadBuffer, kCopyWriteBuffer, 0, static_cast<GLintptr>(static_cast<size_t>(k) * planoBytes),
+                                       static_cast<GLsizeiptr>(planoBytes));
+            barrier();
+        }
+        std::fprintf(stderr, "[gs-gpu] escala dinámica x%u -> x%u (espera de GPU %.0f%%)\n", escala, nueva, esperaPct);
+        std::fflush(stderr);
+        escala = nueva;
+        planos = nuevosPlanos;
+        bindPlano(0u);
+        ++contentRevision;
+    }
+
+    // GOW-Port: decide la escala cada medio segundo según la fracción de tiempo esperando a la GPU.
+    void ajustarEscala()
+    {
+        EscalaDinamica &e = dinamica;
+        if (!e.activa)
+            return;
+        const auto ahora = std::chrono::steady_clock::now();
+        const double ventana = std::chrono::duration<double>(ahora - e.ventana).count();
+        if (ventana < 0.5)
+            return;
+        const double espera = std::chrono::duration<double>(e.espera).count() / ventana;
+        // Cuadros del juego por segundo (0 si no se cuentan). En un APU la GPU y la CPU comparten la potencia: más
+        // resolución puede bajar el reloj de la CPU y el juego cae por debajo de 60 sin que el GS espere a la GPU.
+        const uint64_t cuadros = g_gowGuestFrames.load(std::memory_order_relaxed);
+        const double fps = e.cuadros != 0u && cuadros > e.cuadros ? static_cast<double>(cuadros - e.cuadros) / ventana : 0.0;
+        e.cuadros = cuadros;
+        if (fps > 5.0)
+            e.fpsSuave = e.fpsSuave * 0.6 + fps * 0.4;
+        const bool lento = fps > 5.0 && e.fpsSuave < 55.0;
+        const bool sobrado = fps == 0.0 || e.fpsSuave >= 59.0;
+        e.ventana = ahora;
+        e.espera = {};
+        const double desdeCambio = std::chrono::duration<double>(ahora - e.ultimoCambio).count();
+        if ((espera > 0.10 || lento) && escala > 1u)
+        {
+            // Saturada: se baja ya. Si fue una subida de prueba reciente, se tarda el doble en volver a probar.
+            if (e.probando && desdeCambio < 5.0)
+                e.bloqueoSubida = std::min(e.bloqueoSubida * 2.0, 600.0);
+            e.probando = false;
+            e.ventanasLibres = 0u;
+            cambiarEscala(escala - 1u, espera * 100.0);
+            if (lento)
+                std::fprintf(stderr, "[gs-gpu] (el juego iba a %.1f cuadros/s)\n", e.fpsSuave);
+            e.ultimoCambio = ahora;
+            return;
+        }
+        if (e.probando && desdeCambio >= 5.0)
+        {
+            e.probando = false; // la subida aguantó
+            e.bloqueoSubida = 20.0;
+        }
+        e.ventanasLibres = espera < 0.02 && sobrado ? e.ventanasLibres + 1u : 0u;
+        if (escala < e.tope && e.ventanasLibres >= 10u && desdeCambio >= e.bloqueoSubida)
+        {
+            e.ventanasLibres = 0u;
+            e.probando = true;
+            cambiarEscala(escala + 1u, espera * 100.0);
+            e.ultimoCambio = ahora;
+        }
+    }
+
+    // Desplazamiento del plano k en 1/16 de píxel (x, y).
+    uint32_t desplX(uint32_t k) const { return (k % escala) * 16u / escala; }
+    uint32_t desplY(uint32_t k) const { return (k / escala) * 16u / escala; }
+
+    template <typename F>
+    void porPlano(F &&f)
+    {
+        if (planos == 1u)
+        {
+            f(0u);
+            return;
+        }
+        for (uint32_t k = 0; k < planos; ++k)
+        {
+            bindPlano(k);
+            f(k);
+        }
+        bindPlano(0u);
     }
 
     size_t ringPut(const void *data, size_t size)
@@ -1286,6 +1471,10 @@ struct GSGpuBackend::Impl
         }
 
         hwFragmentHead = version + "#extension GL_ARB_fragment_shader_interlock : require\n";
+        // GOW-Port: conservar la variante anterior para comparaciones de imagen y rendimiento.
+        const char *discardSetting = std::getenv("PS2X_GS_HW_DISCARD_UNCOVERED");
+        if (discardSetting && *discardSetting == '0')
+            hwFragmentHead += "#define GOW_HW_KEEP_UNCOVERED\n";
         std::string common = GSGpuShaders::kCommon;
         const std::string vramDeclaration = "layout(std430, binding = 0) buffer VramBuffer";
         if (common.find(vramDeclaration) == std::string::npos)
@@ -1351,7 +1540,35 @@ struct GSGpuBackend::Impl
         std::string common = GSGpuShaders::kCommon;
         (void)common;
 
-        vramBuffer = makeBuffer(GSSwizzle::kMemorySize + static_cast<size_t>(kShadowPages) * 8192u, nullptr, 0u);
+        planoBytes = GSSwizzle::kMemorySize + static_cast<size_t>(kShadowPages) * 8192u;
+        escala = escalaPedida();
+        for (;;)
+        {
+            planos = escala * escala;
+            while (gl().GetError() != 0u)
+            {
+            }
+            vramBuffer = makeBuffer(planoBytes * planos, nullptr, 0u);
+            if (escala == 1u || gl().GetError() == 0u)
+                break;
+            // GOW-Port: sin memoria para tantos planos: se prueba una escala menor.
+            std::fprintf(stderr, "[gs-gpu] sin memoria para la resolución interna x%u\n", escala);
+            gl().DeleteBuffers(1, &vramBuffer);
+            --escala;
+        }
+        bindPlano(0u);
+        {
+            const char *valor = std::getenv("PS2X_GS_ESCALA_DINAMICA");
+            dinamica.activa = escala > 1u && valor && valor[0] == '1';
+            dinamica.tope = escala;
+            dinamica.ventana = dinamica.ultimoCambio = std::chrono::steady_clock::now();
+        }
+        if (escala > 1u)
+        {
+            std::fprintf(stderr, "[gs-gpu] resolución interna x%u (%u planos, %zu MB de VRAM)%s\n", escala, planos,
+                         planoBytes * planos >> 20u, dinamica.activa ? ", dinámica" : "");
+            std::fflush(stderr);
+        }
         swizzleBuffer = makeBuffer(swizzle.size() * sizeof(uint16_t), swizzle.data(), 1u);
         std::vector<uint32_t> zeros(kClutSlots * 256u, 0u);
         clutBuffer = makeBuffer(zeros.size() * sizeof(uint32_t), zeros.data(), 2u);
@@ -1385,6 +1602,13 @@ struct GSGpuBackend::Impl
             return false;
         }
         hwEnabled = setupHardwareRaster(prefix);
+        if (const char *valor = std::getenv("PS2X_GS_HW"); valor && valor[0] == '1')
+        {
+            hwRender = std::make_unique<GSHw::Renderizador>();
+            if (!hwRender->iniciar(gl(), prefix))
+                hwRender.reset();
+            bindPlano(0u);
+        }
         const char *hashValue = std::getenv("PS2X_FRAME_HASH");
         if (context.Shared() && hashValue && *hashValue == '1')
         {
@@ -1409,11 +1633,21 @@ struct GSGpuBackend::Impl
 
     void uploadHostVram()
     {
+        if (hwRender)
+        {
+            // GOW-Port: toda la VRAM se reemplaza.
+            hwRender->descartarTodo();
+            std::bitset<kPages> todas;
+            todas.set();
+            hwRender->escrito(todas);
+        }
         clutKeyValid = false;
         if (!hostVram)
             return;
         gl().BindBuffer(kShaderStorageBuffer, vramBuffer);
-        gl().BufferSubData(kShaderStorageBuffer, 0, static_cast<GLsizeiptr>(std::min<uint32_t>(hostVramSize, GSSwizzle::kMemorySize)), hostVram);
+        for (uint32_t k = 0; k < planos; ++k) // GOW-Port: todos los planos de la resolución interna
+            gl().BufferSubData(kShaderStorageBuffer, static_cast<GLintptr>(static_cast<size_t>(k) * planoBytes),
+                               static_cast<GLsizeiptr>(std::min<uint32_t>(hostVramSize, GSSwizzle::kMemorySize)), hostVram);
     }
 
     void downloadVram(uint8_t *out, size_t size)
@@ -1442,6 +1676,8 @@ struct GSGpuBackend::Impl
         writePages.reset();
         colorPages.reset();
         depthAccessPages.reset();
+        colorCoordinatesAlias = false;
+        depthCoordinatesAlias = false;
         readPages.reset();
         batchClutPages.reset();
         hasTarget = false;
@@ -1495,7 +1731,7 @@ struct GSGpuBackend::Impl
             uploadData(copyPairs.data(), copyPairs.size() * sizeof(uint32_t));
             gl().UseProgram(pageCopy.id);
             const GLuint profCopy = profBegin();
-            gl().DispatchCompute(static_cast<GLuint>(copyPairs.size()), 1u, 1u);
+            porPlano([&](uint32_t) { gl().DispatchCompute(static_cast<GLuint>(copyPairs.size()), 1u, 1u); });
             profEnd(3u, profCopy);
             barrier();
             copyPairs.clear();
@@ -1513,7 +1749,7 @@ struct GSGpuBackend::Impl
             gl().UseProgram(upload.id);
             gl().Uniform4ui(upload.loc[0], mapOffset, 0u, 0u, 0u);
             const GLuint profUpload = profBegin();
-            gl().DispatchCompute(static_cast<GLuint>(uploadGroups.size()), 1u, 1u);
+            porPlano([&](uint32_t) { gl().DispatchCompute(static_cast<GLuint>(uploadGroups.size()), 1u, 1u); });
             profEnd(2u, profUpload);
             barrier();
             uploadWords.clear();
@@ -1627,13 +1863,16 @@ struct GSGpuBackend::Impl
                 g.Viewport(0, 0, 2048, 2048);
                 g.BindVertexArray(hwVertexArray);
                 const GLuint profRaster = profBegin();
-                for (const HwRun &run : hwRuns)
-                {
-                    g.UseProgram(run.program->id);
-                    g.Uniform4ui(run.program->loc[0], epoch, 0u, 0u, 0u);
-                    g.Uniform4ui(run.program->loc[1], hwConservative ? 1u : 0u, 0u, 0u, 0u);
-                    g.DrawArrays(kTriangles, static_cast<GLint>(run.first * 6u), static_cast<GLsizei>((run.last - run.first) * 6u));
-                }
+                porPlano([&](uint32_t k) {
+                    const uint32_t dx = desplX(k), dy = desplY(k);
+                    for (const HwRun &run : hwRuns)
+                    {
+                        g.UseProgram(run.program->id);
+                        g.Uniform4ui(run.program->loc[0], epoch, 0u, dx, dy);
+                        g.Uniform4ui(run.program->loc[1], hwConservative ? 1u : 0u, dx, dy, 0u);
+                        g.DrawArrays(kTriangles, static_cast<GLint>(run.first * 6u), static_cast<GLsizei>((run.last - run.first) * 6u));
+                    }
+                });
                 profEnd(0u, profRaster);
                 if (prof.enabled)
                     prof.prims += primCount;
@@ -1703,12 +1942,14 @@ struct GSGpuBackend::Impl
             const GLuint profRaster = profBegin();
             // GOW-Port: como mucho 65535 grupos por dispatch (mínimo de GL); con tiles de 8x8 un destino de 2048x2048
             // tiene 65536. Los trozos se ejecutan en orden y cada tile está en uno solo: mismo resultado.
-            for (size_t first = 0u; first < touched.size(); first += 65535u)
-            {
-                const size_t count = std::min<size_t>(65535u, touched.size() - first);
-                g.Uniform4ui(raster.loc[0], epoch, static_cast<GLuint>(first), 0u, 0u);
-                g.DispatchCompute(static_cast<GLuint>(count), 1u, 1u);
-            }
+            porPlano([&](uint32_t k) {
+                for (size_t first = 0u; first < touched.size(); first += 65535u)
+                {
+                    const size_t count = std::min<size_t>(65535u, touched.size() - first);
+                    g.Uniform4ui(raster.loc[0], epoch, static_cast<GLuint>(first), desplX(k), desplY(k));
+                    g.DispatchCompute(static_cast<GLuint>(count), 1u, 1u);
+                }
+            });
             profEnd(0u, profRaster);
             if (prof.enabled)
             {
@@ -1796,10 +2037,17 @@ struct GSGpuBackend::Impl
         const uint32_t ztest = static_cast<uint32_t>((ctx.test >> 17) & 3u);
         if (!ctx.zbuf.zmask || ztest >= 2u)
             markPages(depth, ctx.zbuf.psm, ctx.zbuf.zbp << 5u, fbw, x0, y0, x1, y1);
+        const bool colorAlias = targetCoordinatesMayAlias(ctx.frame.psm, fbw, x1, y1);
+        const bool depthAlias = depth.any() && targetCoordinatesMayAlias(ctx.zbuf.psm, fbw, x1, y1);
         // GOW-Port: orden entre primitivas cuando color y Z reinterpretan las mismas
         // paginas. El orden por pixel del shader no protege alias entre otros pixels.
         // Es conservador por pagina; no resuelve alias internos de una sola primitiva.
-        if ((color & depthAccessPages).any() || (depth & colorPages).any())
+        // GOW-Port: el orden por XY tampoco protege dos direcciones del mismo
+        // color/Z que coinciden por stride o wrap. Conservar el lote habitual
+        // y el caso fuera de ancho pero con paginas fisicas disjuntas.
+        if ((color & depthAccessPages).any() || (depth & colorPages).any() ||
+            ((colorAlias || colorCoordinatesAlias) && (color & colorPages).any()) ||
+            ((depthAlias || depthCoordinatesAlias) && (depth & depthAccessPages).any()))
         {
             ++stats.flushTarget;
             flushFor(0u);
@@ -1838,6 +2086,12 @@ struct GSGpuBackend::Impl
                 texturePagesValid = true;
             }
         }
+        if (hwRender)
+        {
+            // GOW-Port: la ruta software lee y escribe estas páginas: antes, los cambios del renderizador por hardware.
+            hwRender->antesDeSoftware(write | read, hwVram(), 1u);
+            hwRender->escrito(write);
+        }
         if ((read & writePages).any() || (write & readPages).any())
         {
             ++stats.flushTexture;
@@ -1848,6 +2102,8 @@ struct GSGpuBackend::Impl
         writePages |= write;
         colorPages |= color;
         depthAccessPages |= depth;
+        colorCoordinatesAlias |= colorAlias;
+        depthCoordinatesAlias |= depthAlias;
         readPages |= read;
         targetKey = key;
         hasTarget = true;
@@ -1858,6 +2114,12 @@ struct GSGpuBackend::Impl
     {
         if (hwEnabled)
             return;
+        // GOW-Port: con resolución interna las muestras van hasta 15/16 de píxel a la derecha y abajo: un triángulo
+        // puede cubrir el píxel anterior a su caja.
+        const int margen = escala > 1u ? 1 : 0;
+        const int64_t extra = escala > 1u ? 15 : 0;
+        x0 -= margen;
+        y0 -= margen;
         const int tile = static_cast<int>(kTileSize);
         const int tx0 = x0 / tile;
         const int tx1 = x1 / tile;
@@ -1871,11 +2133,11 @@ struct GSGpuBackend::Impl
         for (int ty = ty0; ty <= ty1; ++ty)
         {
             const int64_t py0 = static_cast<int64_t>(std::max(y0, ty * tile)) * 16;
-            const int64_t py1 = static_cast<int64_t>(std::min(y1, ty * tile + tile - 1)) * 16;
+            const int64_t py1 = static_cast<int64_t>(std::min(y1, ty * tile + tile - 1)) * 16 + extra;
             for (int tx = tx0; tx <= tx1; ++tx)
             {
                 const int64_t px0 = static_cast<int64_t>(std::max(x0, tx * tile)) * 16;
-                const int64_t px1 = static_cast<int64_t>(std::min(x1, tx * tile + tile - 1)) * 16;
+                const int64_t px1 = static_cast<int64_t>(std::min(x1, tx * tile + tile - 1)) * 16 + extra;
                 bool outside = false;
                 for (int i = 0; i < 3 && !outside; ++i)
                 {
@@ -2142,6 +2404,8 @@ struct GSGpuBackend::Impl
             const int x0 = static_cast<int>(texclut.cou) * 16;
             markPages(source, tex0.cpsm, tex0.cbp, width, x0, texclut.cov, x0 + 255, texclut.cov);
         }
+        if (hwRender)
+            hwRender->antesDeSoftware(source, hwVram(), 2u); // GOW-Port: la CLUT puede salir de un objetivo por hardware
         if ((source & writePages).any() || batchClutLoads + 2u >= kClutSlots)
         {
             ++stats.flushTexture;
@@ -2188,6 +2452,13 @@ struct GSGpuBackend::Impl
         op.cov = texclut.cov;
         op.epoch = epoch;
         clutOps.push_back(op);
+        if (hwRender)
+        {
+            uint64_t claveClut = 0x9E3779B97F4A7C15ull;
+            for (uint32_t parte : key)
+                claveClut = (claveClut ^ parte) * 1099511628211ull;
+            hwRender->cargaClut(claveClut, source, isFourBitIndexedPsm(tex0.psm) || sixteenBit || tex0.csa != 0u);
+        }
         ++batchClutLoads;
         batchClutPages |= source;
     }
@@ -2236,13 +2507,15 @@ struct GSGpuBackend::Impl
             return;
         }
         const GSBitBltBuf &b = transfer.bitbltbuf;
-        copyRegion(b.spsm, b.sbp, std::max<uint32_t>(b.sbw, 1u), transfer.trxpos.ssax, transfer.trxpos.ssay, rrw, rrh, transfer.trxpos.dir);
         clutKeyValid = false;
-        gl().UseProgram(copyWrite.id);
-        gl().Uniform4ui(copyWrite.loc[0], b.dbp, std::max<uint32_t>(b.dbw, 1u), b.dpsm,
-                        static_cast<uint32_t>(transfer.trxpos.dsax) | (static_cast<uint32_t>(transfer.trxpos.dsay) << 16u));
-        gl().Uniform4ui(copyWrite.loc[1], rrw, rrh, transfer.trxpos.dir, 0u);
-        dispatchLinear(total, 4u);
+        porPlano([&](uint32_t) { // GOW-Port: cada plano copia dentro de sí mismo
+            copyRegion(b.spsm, b.sbp, std::max<uint32_t>(b.sbw, 1u), transfer.trxpos.ssax, transfer.trxpos.ssay, rrw, rrh, transfer.trxpos.dir);
+            gl().UseProgram(copyWrite.id);
+            gl().Uniform4ui(copyWrite.loc[0], b.dbp, std::max<uint32_t>(b.dbw, 1u), b.dpsm,
+                            static_cast<uint32_t>(transfer.trxpos.dsax) | (static_cast<uint32_t>(transfer.trxpos.dsay) << 16u));
+            gl().Uniform4ui(copyWrite.loc[1], rrw, rrh, transfer.trxpos.dir, 0u);
+            dispatchLinear(total, 4u);
+        });
         transferState.copiedPixels = total;
         transferState.direction = 3u;
     }
@@ -2494,7 +2767,9 @@ struct GSGpuBackend::Impl
         GLsync &oldest = frameFences[frameFenceNext];
         if (oldest)
         {
+            const auto inicio = std::chrono::steady_clock::now();
             gl().ClientWaitSync(oldest, kSyncFlushCommandsBit, 100000000ull); // 100 ms como mucho
+            dinamica.espera += std::chrono::steady_clock::now() - inicio; // GOW-Port: escala dinámica
             gl().DeleteSync(oldest);
         }
         oldest = gl().FenceSync(kSyncGpuCommandsComplete, 0u);
@@ -2613,6 +2888,7 @@ void GSGpuBackend::Reset()
 {
     Impl &d = *m_impl;
     ++d.contentRevision;
+    d.hwVolcarTodo(6u);
     d.flushBatch();
     d.clutCbp.fill(0u);
     d.transfer = {};
@@ -2629,13 +2905,171 @@ void GSGpuBackend::Reset()
     }
 }
 
+// GOW-Port: censo de dibujos (PS2X_GS_CENSO=1), para elegir qué pasa primero al renderizador por hardware. Agrupa las
+// primitivas por tipo, textura, mezcla, Z, formatos y si la textura sale del propio destino, y suma su superficie
+// (píxeles nativos recortados al scissor). Cada 5 s imprime los grupos de más superficie.
+namespace
+{
+    struct CensoGrupo
+    {
+        uint64_t prims = 0u;
+        double area = 0.0;
+    };
+
+    void censarDibujo(const GSPrimitiveBatch &batch)
+    {
+        static const bool on = [] { const char *v = std::getenv("PS2X_GS_CENSO"); return v && v[0] == '1'; }();
+        if (!on)
+            return;
+        static std::unordered_map<std::string, CensoGrupo> grupos;
+        static auto inicio = std::chrono::steady_clock::now();
+        static double total = 0.0;
+        const GSDrawState &st = batch.state;
+        const GSContext &c = st.context;
+        const float ox = c.xyoffset.ofx / 16.0f, oy = c.xyoffset.ofy / 16.0f;
+        const float sx0 = c.scissor.x0, sy0 = c.scissor.y0, sx1 = c.scissor.x1 + 1.0f, sy1 = c.scissor.y1 + 1.0f;
+        double area = 0.0;
+        const char *tipo = "otro";
+        const auto rect = [&](float x0, float y0, float x1, float y1) {
+            const float w = std::min(std::max(x0, x1), sx1) - std::max(std::min(x0, x1), sx0);
+            const float h = std::min(std::max(y0, y1), sy1) - std::max(std::min(y0, y1), sy0);
+            return w > 0.0f && h > 0.0f ? static_cast<double>(w) * h : 0.0;
+        };
+        const GSVertex *v = batch.vertices.data();
+        switch (st.prim.type)
+        {
+        case GS_PRIM_SPRITE:
+            tipo = "sprite";
+            area = rect(v[0].x - ox, v[0].y - oy, v[1].x - ox, v[1].y - oy);
+            break;
+        case GS_PRIM_TRIANGLE:
+        case GS_PRIM_TRISTRIP:
+        case GS_PRIM_TRIFAN:
+        {
+            tipo = "tri";
+            const double cruz = std::abs((static_cast<double>(v[1].x) - v[0].x) * (static_cast<double>(v[2].y) - v[0].y) -
+                                         (static_cast<double>(v[2].x) - v[0].x) * (static_cast<double>(v[1].y) - v[0].y)) * 0.5;
+            const float minX = std::min({v[0].x, v[1].x, v[2].x}) - ox, maxX = std::max({v[0].x, v[1].x, v[2].x}) - ox;
+            const float minY = std::min({v[0].y, v[1].y, v[2].y}) - oy, maxY = std::max({v[0].y, v[1].y, v[2].y}) - oy;
+            area = std::min(cruz, rect(minX, minY, maxX, maxY));
+            break;
+        }
+        case GS_PRIM_LINE:
+        case GS_PRIM_LINESTRIP:
+            tipo = "linea";
+            area = std::hypot(v[1].x - v[0].x, v[1].y - v[0].y);
+            break;
+        default:
+            tipo = "punto";
+            area = 1.0;
+            break;
+        }
+        const uint64_t test = c.test;
+        const bool zte = ((test >> 16) & 1u) != 0u;
+        const uint32_t ztst = static_cast<uint32_t>((test >> 17) & 3u);
+        const bool ate = (test & 1u) != 0u;
+        const bool date = ((test >> 14) & 1u) != 0u;
+        // Textura dentro de las páginas del destino (lectura del propio framebuffer: posprocesado).
+        const uint32_t fbBloque = c.frame.fbp * 32u;
+        const uint32_t fbFin = fbBloque + std::max<uint32_t>(c.frame.fbw, 1u) * 32u * 16u; // 512 líneas
+        const bool propio = st.prim.tme && c.tex0.tbp0 >= fbBloque && c.tex0.tbp0 < fbFin;
+        char clave[160];
+        std::snprintf(clave, sizeof(clave), "%s%s%s z%u%s%s%s fb%02x@%x%s%s alpha=%llx", tipo,
+                      st.prim.tme ? " tex" : "", st.prim.abe ? " mezcla" : "", zte ? ztst : 9u,
+                      ate ? " at" : "", date ? " date" : "", c.zbuf.zmask ? " zm" : "",
+                      c.frame.psm, c.frame.fbp, st.prim.tme ? (std::string(" t") + std::to_string(c.tex0.psm)).c_str() : "",
+                      propio ? " propio" : "", static_cast<unsigned long long>(st.prim.abe ? c.alpha : 0ull));
+        CensoGrupo &g = grupos[clave];
+        ++g.prims;
+        g.area += area;
+        total += area;
+        const auto ahora = std::chrono::steady_clock::now();
+        const double seg = std::chrono::duration<double>(ahora - inicio).count();
+        if (seg < 5.0)
+            return;
+        std::vector<std::pair<std::string, CensoGrupo>> lista(grupos.begin(), grupos.end());
+        std::sort(lista.begin(), lista.end(), [](const auto &a, const auto &b) { return a.second.area > b.second.area; });
+        std::fprintf(stderr, "[gs-censo] %.1f Mpix/s nativos en %zu grupos\n", total / seg / 1e6, lista.size());
+        for (size_t i = 0; i < std::min<size_t>(lista.size(), 14u); ++i)
+            std::fprintf(stderr, "[gs-censo]  %5.1f%% %8.2f Mpix/s %8.0f prims/s  %s\n", 100.0 * lista[i].second.area / total,
+                         lista[i].second.area / seg / 1e6, lista[i].second.prims / seg, lista[i].first.c_str());
+        std::fflush(stderr);
+        grupos.clear();
+        total = 0.0;
+        inicio = ahora;
+    }
+}
+
 void GSGpuBackend::Submit(const GSPrimitiveBatch &batch)
 {
     Impl &d = *m_impl;
     if (batch.vertexCount == 0u || !d.ensure())
         return;
+    censarDibujo(batch);
+    {
+        // GOW-Port: diagnóstico PS2X_GS_OMITIR=tri|sprite: no dibuja esa clase, para medir su coste de GPU.
+        static const int omitir = [] {
+            const char *v = std::getenv("PS2X_GS_OMITIR");
+            return !v ? 0 : (std::strcmp(v, "tri") == 0 ? 1 : (std::strcmp(v, "sprite") == 0 ? 2 : 0));
+        }();
+        const GSPrimType t = batch.state.prim.type;
+        const bool tri = t == GS_PRIM_TRIANGLE || t == GS_PRIM_TRISTRIP || t == GS_PRIM_TRIFAN;
+        if ((omitir == 1 && tri) || (omitir == 2 && t == GS_PRIM_SPRITE))
+            return;
+    }
     const GSGpuRoundingScope rounding;
     ++d.contentRevision;
+    {
+        // GOW-Port: PS2X_GS_TRAZA="t:n": a partir de t segundos, los n dibujos siguientes con sus registros (diagnóstico).
+        static double t0 = -1.0;
+        static long restantes = 0;
+        static const auto inicio = std::chrono::steady_clock::now();
+        if (t0 < 0.0)
+        {
+            const char *v = std::getenv("PS2X_GS_TRAZA");
+            t0 = 1e30;
+            if (v)
+                std::sscanf(v, "%lf:%ld", &t0, &restantes);
+        }
+        // Solo sprites: los triángulos se cuentan entre uno y otro.
+        static long triangulos = 0;
+        if (restantes > 0 && batch.state.prim.type != GS_PRIM_SPRITE)
+            ++triangulos;
+        else if (restantes > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - inicio).count() >= t0)
+        {
+            --restantes;
+            const GSDrawState &st = batch.state;
+            const GSContext &c = st.context;
+            const GSVertex &a = batch.vertices[0], &b = batch.vertices[1];
+            if (triangulos)
+                std::fprintf(stderr, "[gs-traza] (%ld triángulos)\n", triangulos);
+            triangulos = 0;
+            std::fprintf(stderr,
+                         "[gs-traza] t%d n%u fb %x/%u/%x msk %08x z %x/%x zm%d test %llx | tme%d fst%d lin%d tex %x/%u/%x tw%u th%u tfx%u tcc%u clamp %llx | "
+                         "abe%d alpha %llx | xy %.2f,%.2f %.2f,%.2f uv %.2f,%.2f %.2f,%.2f stq %.4f,%.4f,%.3f %.4f,%.4f,%.3f rgba %u,%u,%u,%u ofs %u,%u\n",
+                         int(st.prim.type), batch.vertexCount, c.frame.fbp << 5u, c.frame.fbw, c.frame.psm, c.frame.fbmsk, c.zbuf.zbp << 5u, c.zbuf.psm,
+                         int(c.zbuf.zmask), static_cast<unsigned long long>(c.test), int(st.prim.tme), int(st.prim.fst), int(st.linearFilter), c.tex0.tbp0,
+                         c.tex0.tbw, c.tex0.psm, st.textureWidth, st.textureHeight, unsigned(c.tex0.tfx), unsigned(c.tex0.tcc),
+                         static_cast<unsigned long long>(c.clamp), int(st.prim.abe), static_cast<unsigned long long>(c.alpha), a.x, a.y, b.x, b.y,
+                         a.u / 16.0f, a.v / 16.0f, b.u / 16.0f, b.v / 16.0f, a.s, a.t, a.q, b.s, b.t, b.q, b.r, b.g, b.b, b.a, c.xyoffset.ofx,
+                         c.xyoffset.ofy);
+        }
+    }
+    if (d.hwRender)
+    {
+        // GOW-Port: triángulos por hardware; lo pendiente de la ruta software (dibujos, CLUT, transferencias) va antes.
+        const uint32_t motivo = d.hwRender->admite(batch);
+        if (motivo == 0u)
+        {
+            if (d.primCount != 0u || !d.clutOps.empty() || !d.copyPairs.empty() || !d.uploadWords.empty())
+                d.flushBatch();
+            d.hwRender->dibujar(batch, d.hwVram(), d.clutSlot);
+            d.hwRender->informe();
+            return;
+        }
+        d.hwRender->rechazadoDetalle(motivo, batch);
+        d.hwRender->informe();
+    }
     switch (batch.state.prim.type)
     {
     case GS_PRIM_SPRITE:
@@ -2677,6 +3111,20 @@ void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
         ++d.contentRevision;
     if (!d.ensure())
         return;
+    if (d.hwRender)
+    {
+        // GOW-Port: páginas que lee y escribe la transferencia.
+        const GSBitBltBuf &b = command.bitbltbuf;
+        const int w = static_cast<int>(command.trxreg.rrw), h = static_cast<int>(command.trxreg.rrh);
+        std::bitset<kPages> lee, escribe;
+        if (command.direction == 1u || command.direction == 2u)
+            markPages(lee, b.spsm, b.sbp, std::max<uint32_t>(b.sbw, 1u), command.trxpos.ssax, command.trxpos.ssay,
+                      command.trxpos.ssax + w - 1, command.trxpos.ssay + h - 1);
+        if (command.direction == 0u || command.direction == 2u)
+            markPages(escribe, b.dpsm, b.dbp, std::max<uint32_t>(b.dbw, 1u), command.trxpos.dsax, command.trxpos.dsay,
+                      command.trxpos.dsax + w - 1, command.trxpos.dsay + h - 1);
+        d.hwAntes(lee | escribe, &escribe, 3u);
+    }
     bool flush = true;
     d.transferPages.reset();
     d.transferQueued = false;
@@ -2733,6 +3181,8 @@ void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 
 void GSGpuBackend::Flush()
 {
+    if (m_impl->hwRender)
+        m_impl->hwAntes({}, nullptr, 0u); // GOW-Port: emite los dibujos por hardware acumulados
     m_impl->flushFor(4u);
 }
 
@@ -2745,6 +3195,12 @@ void GSGpuBackend::Sync(GSSyncReason reason)
     Impl &d = *m_impl;
     if (!d.hostVram || !d.hostVramSize || !d.ensure())
         return;
+    // GOW-Port: FINISH no lee VRAM (las lecturas del EE pasan por transferencias o ReadVram, que vuelcan lo suyo):
+    // solo se emiten los dibujos por hardware. Las lecturas de depuración y el reinicio vuelcan todo.
+    if (reason == GSSyncReason::DebugReadback || reason == GSSyncReason::Reset)
+        d.hwVolcarTodo(7u);
+    else
+        d.hwAntes({}, nullptr, 7u);
     d.flushFor(5u);
     // GOW-Port: FINISH informa al EE solo tras completar el rasterizado en GL.
     static const bool finishAsync = [] { const char *v = std::getenv("GOW_GS_FINISH_ASINCRONO"); return v && v[0] == '1'; }();
@@ -2761,9 +3217,40 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     if (!d.ensure())
         return result;
     d.flushBatch();
+    if (d.hwRender)
+    {
+        // GOW-Port: la presentación lee los planos, pero solo los búferes de los circuitos y de la fuente preferida: los
+        // demás objetivos del renderizador por hardware (la Z, los búferes intermedios) no se vuelcan en cada cuadro.
+        std::bitset<kPages> leidas;
+        const bool mitad = (request.smode2 & 0x3ull) == 0x3ull;
+        int altoMax = 0;
+        const std::pair<uint64_t, uint64_t> circuitos[2] = {{request.dispfb1, request.display1}, {request.dispfb2, request.display2}};
+        for (int i = 0; i < 2; ++i)
+        {
+            const CrtcCircuit c = decodeCircuit((request.pmode & (1ull << i)) != 0ull, circuitos[i].first, circuitos[i].second, mitad);
+            if (!c.enabled)
+                continue;
+            const int w = (c.dw + c.hdiv - 1) / c.hdiv, h = (c.dh + c.vdiv - 1) / c.vdiv;
+            altoMax = std::max(altoMax, h);
+            markPages(leidas, c.psm, c.fbp * 32u, c.fbw, static_cast<int>(c.dbx), static_cast<int>(c.dby), static_cast<int>(c.dbx) + w,
+                      static_cast<int>(c.dby) + h);
+        }
+        if (request.hasPreferredSource)
+        {
+            const auto &f = request.preferredSource;
+            const uint32_t bw = f.fbw ? f.fbw : 10u;
+            markPages(leidas, f.psm, f.fbp, bw, 0, 0, static_cast<int>(bw) * 64 - 1, std::max(altoMax, 1));
+        }
+        d.hwAntes(leidas, nullptr, 8u);
+    }
+    d.ajustarEscala(); // GOW-Port: escala dinámica
     const bool shared = d.context.Shared() && GSSharedPresent::Active();
+    // GOW-Port: imagen nítida (PS2X_GS_NITIDO=1, como "PCRTC Anti-Blur" de PCSX2): sin duplicar las filas del campo en
+    // modo cuadro (el búfer tiene la imagen entera) y sin el filtro antiparpadeo de dos circuitos (abajo).
+    const char *nitidoValor = std::getenv("PS2X_GS_NITIDO");
+    const bool nitido = nitidoValor && nitidoValor[0] == '1';
     // GOW-Port: paridad real del GS en modo de campos; el modo progresivo no alterna.
-    const uint32_t fieldFlags = (request.smode2 & 3u) == 1u
+    const uint32_t fieldFlags = (request.smode2 & 3u) == 1u && !nitido
         ? 1u | (static_cast<uint32_t>(request.vsyncTick & 1u) << 1u) : 0u;
     const std::array<uint64_t, 11> crtc = {request.pmode, request.smode2, request.dispfb1, request.display1,
         request.dispfb2, request.display2, request.bgcolor,
@@ -2776,6 +3263,18 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
         if (d.presentStats.enabled)
             d.reportPresentStats();
         return result;
+    }
+    // GOW-Port: con el buzón (gs_threaded_backend.cpp) un cuadro vacío deja el anterior. Si la VRAM y el CRTC no
+    // cambiaron desde la última composición, no se compone ni se lee otra vez; solo se entrega una lectura pendiente.
+    const bool buzon = !shared && gowGsPresentMailboxActive() && s_asyncPresent.load(std::memory_order_relaxed);
+    if (buzon && d.presentedRevision == d.contentRevision && d.presentedCrtc == crtc)
+    {
+        for (Readback &slot : d.readbacks)
+            d.harvest(slot);
+        if (d.lastFrameSequence <= d.lastReturnedSequence)
+            return {};
+        d.lastReturnedSequence = d.lastFrameSequence;
+        return d.escala == 1u ? gowPresentationRows(PresentationFrame(d.lastFrame)) : d.lastFrame;
     }
     if (shared && !SharedAvailable(d.gl()))
     {
@@ -2790,8 +3289,19 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     const bool slbg = ((request.pmode >> 7) & 0x1ull) != 0ull;
     const uint32_t alp = static_cast<uint32_t>((request.pmode >> 8) & 0xFFull);
     const bool halfHeightBuffer = (request.smode2 & 0x3ull) == 0x3ull;
-    const CrtcCircuit circuits[2] = {decodeCircuit(enable1, request.dispfb1, request.display1, halfHeightBuffer),
-                                     decodeCircuit(enable2, request.dispfb2, request.display2, halfHeightBuffer)};
+    CrtcCircuit circuits[2] = {decodeCircuit(enable1, request.dispfb1, request.display1, halfHeightBuffer),
+                               decodeCircuit(enable2, request.dispfb2, request.display2, halfHeightBuffer)};
+    if (nitido && circuits[0].enabled && circuits[1].enabled)
+    {
+        // Antiparpadeo: los dos circuitos leen el mismo búfer con una fila de diferencia y se mezclan. Se queda el de
+        // la fila de arriba, sin mezcla (God of War: DBY 1 y 0, ALP 0x80).
+        const CrtcCircuit &a = circuits[0], &b = circuits[1];
+        const bool mismaImagen = a.fbp == b.fbp && a.fbw == b.fbw && a.psm == b.psm && a.dbx == b.dbx && a.dx == b.dx &&
+                                 a.dy == b.dy && a.dw == b.dw && a.hdiv == b.hdiv && a.vdiv == b.vdiv;
+        const uint32_t distancia = a.dby > b.dby ? a.dby - b.dby : b.dby - a.dby;
+        if (mismaImagen && distancia == 1u)
+            circuits[a.dby > b.dby ? 0 : 1].enabled = false;
+    }
     if (!circuits[0].enabled && !circuits[1].enabled && !shared)
         return result;
     int32_t x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
@@ -2815,8 +3325,9 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     }
     const uint32_t width = std::min<uint32_t>(kMaxPresentationWidth, static_cast<uint32_t>((x1 - x0 + hstep - 1) / hstep));
     const uint32_t height = std::min<uint32_t>(kMaxPresentationHeight, static_cast<uint32_t>((y1 - y0 + vstep - 1) / vstep));
-    result.width = width;
-    result.height = height;
+    const uint32_t S = d.escala; // GOW-Port: resolución interna
+    result.width = width * S;
+    result.height = height * S;
     auto pack = [](const CrtcCircuit &c, std::array<uint32_t, 12> &out)
     {
         // GOW-Port: convertir las páginas DISPFB una sola vez; el shader recibe bloques.
@@ -2846,22 +3357,27 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
         result.sourceFbp = source.fbp;
         result.usedPreferred = true;
     }
-    d.reserveData(static_cast<size_t>(width) * height * 4u);
+    d.reserveData(static_cast<size_t>(width) * height * 4u * d.planos);
     const Api &gl = d.gl();
     gl.UseProgram(d.present.id);
-    gl.Uniform4ui(d.present.loc[0], width, height, static_cast<uint32_t>(x0 & 0xFFFF) | (static_cast<uint32_t>(y0) << 16u),
-                  static_cast<uint32_t>(hstep) | (static_cast<uint32_t>(vstep) << 16u));
     gl.Uniform1uiv(d.present.loc[1], 12, c1.data());
     gl.Uniform1uiv(d.present.loc[2], 12, c2.data());
     gl.Uniform4ui(d.present.loc[3], static_cast<uint32_t>(request.bgcolor & 0xFFFFFFu), (slbg ? 1u : 0u) | (mmod ? 2u : 0u), alp, fieldFlags);
     const GLuint profPresent = d.profBegin();
-    gl.DispatchCompute((width + 15u) / 16u, (height + 15u) / 16u, 1u);
+    // GOW-Port: cada plano escribe sus píxeles intercalados (x*S+i, y*S+j); uOut lleva i, j y S-1 en los bits altos.
+    d.porPlano([&](uint32_t k) {
+        const uint32_t i = k % S, j = k / S;
+        gl.Uniform4ui(d.present.loc[0], width | (i << 16u) | ((S - 1u) << 24u), height | (j << 16u),
+                      static_cast<uint32_t>(x0 & 0xFFFF) | (static_cast<uint32_t>(y0) << 16u),
+                      static_cast<uint32_t>(hstep) | (static_cast<uint32_t>(vstep) << 16u));
+        gl.DispatchCompute((width + 15u) / 16u, (height + 15u) / 16u, 1u);
+    });
     ++d.presentStats.composites;
     d.profEnd(5u, profPresent);
     d.profFrame();
     if (shared)
     {
-        if (PublishShared(gl, d.dataBuffer, width, height, d.renderedSequence + 1u, d.presentHash.id, d.presentHash.loc[0]))
+        if (PublishShared(gl, d.dataBuffer, width * S, height * S, d.renderedSequence + 1u, d.presentHash.id, d.presentHash.loc[0]))
         {
             ++d.renderedSequence;
             d.presentedRevision = d.contentRevision;
@@ -2873,11 +3389,23 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
             d.reportPresentStats();
         return {};
     }
+    // GOW-Port: con resolución interna las filas van sin relleno (el frontend toma el ancho del cuadro).
     if (s_asyncPresent.load(std::memory_order_relaxed))
-        return gowPresentationRows(d.presentAsync(width, height, result.displayFbp, result.sourceFbp, result.usedPreferred));
-    result.pixels.resize(static_cast<size_t>(width) * height * 4u);
+    {
+        PresentationFrame frame = d.presentAsync(width * S, height * S, result.displayFbp, result.sourceFbp, result.usedPreferred);
+        if (buzon)
+        {
+            d.presentedRevision = d.contentRevision;
+            d.presentedCrtc = crtc;
+            if (d.lastFrameSequence <= d.lastReturnedSequence)
+                return {}; // la lectura aún no llegó y el cuadro anterior ya se entregó
+            d.lastReturnedSequence = d.lastFrameSequence;
+        }
+        return S == 1u ? gowPresentationRows(std::move(frame)) : frame;
+    }
+    result.pixels.resize(static_cast<size_t>(result.width) * result.height * 4u);
     d.readData(result.pixels.data(), result.pixels.size());
-    return gowPresentationRows(std::move(result));
+    return S == 1u ? gowPresentationRows(std::move(result)) : result;
 }
 
 bool GSGpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
@@ -2891,6 +3419,13 @@ bool GSGpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     const bool half = psm == GS_PSM_CT16 || psm == GS_PSM_CT16S;
     if (!full && !half)
         return false;
+    if (d.hwRender)
+    {
+        std::bitset<kPages> paginas;
+        markPages(paginas, psm, context.frame.fbp << 5u, std::max<uint32_t>(context.frame.fbw, 1u), context.scissor.x0,
+                  context.scissor.y0, context.scissor.x1, context.scissor.y1);
+        d.hwAntes(paginas, &paginas, 4u);
+    }
     d.flushBatch();
     uint8_t r = static_cast<uint8_t>(rgba);
     uint8_t g = static_cast<uint8_t>(rgba >> 8u);
@@ -2916,7 +3451,7 @@ bool GSGpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     gl.UseProgram(d.clear.id);
     gl.Uniform4ui(d.clear.loc[0], context.frame.fbp << 5u, std::max<uint32_t>(context.frame.fbw, 1u) | (static_cast<uint32_t>(psm) << 16u), mask, source);
     gl.Uniform4ui(d.clear.loc[1], x0, y0, x1, y1);
-    gl.DispatchCompute((x1 - x0 + 16u) / 16u, (y1 - y0 + 16u) / 16u, 1u);
+    d.porPlano([&](uint32_t) { gl.DispatchCompute((x1 - x0 + 16u) / 16u, (y1 - y0 + 16u) / 16u, 1u); });
     d.barrier();
     return true;
 }
@@ -2938,6 +3473,7 @@ uint32_t GSGpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
     Impl &d = *m_impl;
     if (!d.ensure())
         return 0u;
+    d.hwVolcarTodo(6u);
     d.flushBatch();
     d.reserveData(16u);
     const Api &gl = d.gl();
@@ -2957,13 +3493,20 @@ void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t 
     ++d.contentRevision;
     if (!d.ensure())
         return;
+    if (d.hwRender)
+    {
+        std::bitset<kPages> pagina;
+        markPages(pagina, psm, base, std::max<uint32_t>(bw, 1u), static_cast<int>(x), static_cast<int>(y), static_cast<int>(x),
+                  static_cast<int>(y));
+        d.hwAntes(pagina, &pagina, 5u);
+    }
     d.flushBatch();
     const Api &gl = d.gl();
     d.clutKeyValid = false;
     gl.UseProgram(d.poke.id);
     gl.Uniform4ui(d.poke.loc[0], psm, base, bw, (x & 0xFFFFu) | (y << 16u));
     gl.Uniform4ui(d.poke.loc[1], value, 1u, 0u, 0u);
-    gl.DispatchCompute(1u, 1u, 1u);
+    d.porPlano([&](uint32_t) { gl.DispatchCompute(1u, 1u, 1u); });
     d.barrier();
 }
 
@@ -2975,6 +3518,7 @@ void GSGpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
         out.clear();
         return;
     }
+    d.hwVolcarTodo(6u);
     d.flushBatch();
     out.resize(GSSwizzle::kMemorySize);
     d.downloadVram(out.data(), out.size());
@@ -2993,6 +3537,7 @@ bool GSGpuBackend::ExportState(GSBackendState &out)
     Impl &d = *m_impl;
     if (!d.ensure())
         return false;
+    d.hwVolcarTodo(6u);
     d.flushBatch();
     d.readClut(out.clut);
     out.clutCbp = d.clutCbp;
@@ -3010,6 +3555,7 @@ bool GSGpuBackend::ImportState(const GSBackendState &state)
 {
     Impl &d = *m_impl;
     if (state.upload24.size >= 3u) return false; // GOW-Port: solo hay uno o dos bytes pendientes.
+    ++d.contentRevision;
     if (!d.ensure())
         return false;
     d.flushBatch();

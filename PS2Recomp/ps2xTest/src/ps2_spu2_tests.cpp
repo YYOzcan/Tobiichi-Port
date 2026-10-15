@@ -40,6 +40,43 @@ namespace
         }
     }
 
+    // GOW-Port: bloque ADMA de 1 KB en la RAM del IOP: 256 muestras izquierdas iguales y luego 256 derechas.
+    void writeAdmaBlock(IopMemory &memory, uint32_t address, int16_t left, int16_t right)
+    {
+        uint8_t block[1024];
+        for (uint32_t i = 0; i < 256u; ++i)
+        {
+            block[i * 2u] = static_cast<uint8_t>(left);
+            block[i * 2u + 1u] = static_cast<uint8_t>(static_cast<uint16_t>(left) >> 8u);
+            block[512u + i * 2u] = static_cast<uint8_t>(right);
+            block[512u + i * 2u + 1u] = static_cast<uint8_t>(static_cast<uint16_t>(right) >> 8u);
+        }
+        memory.writeRam(address, block, sizeof(block));
+    }
+
+    // GOW-Port: núcleo 1 en ADMA como lo deja libsd para los vídeos de God of War: entrada a la mezcla seca (MMIX
+    // 0xC0), BVOL 0x7FFF (s16, 1,0) y volúmenes maestros al máximo.
+    void setupAdmaCore1(IopMemory &memory)
+    {
+        memory.write16(kBase + 0x400u + Spu2::RegMmix, 0x00C0u);
+        memory.write16(kBase + Spu2::RegMvolBase + Spu2::RegMvolStride + 0xCu, 0x7FFFu);
+        memory.write16(kBase + Spu2::RegMvolBase + Spu2::RegMvolStride + 0xEu, 0x7FFFu);
+        for (uint32_t core = 0; core < 2u; ++core)
+        {
+            memory.write16(kBase + Spu2::RegMvolBase + core * Spu2::RegMvolStride, 0x3FFFu);
+            memory.write16(kBase + Spu2::RegMvolBase + core * Spu2::RegMvolStride + 2u, 0x3FFFu);
+        }
+        memory.write16(kBase + 0x400u + Spu2::RegAdmas, 0x0002u);
+    }
+
+    // DMA del canal 7 (núcleo 1) de `bytes` bytes desde `madr`, en bloques de 16 palabras como libsd.
+    void startCore1Dma(IopMemory &memory, uint32_t madr, uint32_t bytes)
+    {
+        memory.write32(0x1F801500u, madr);
+        memory.write32(0x1F801504u, ((bytes / 64u) << 16u) | 16u);
+        memory.write32(0x1F801508u, 0x01000201u);
+    }
+
     // Voz 0 del nucleo 0: SSA, tono 48 kHz, ataque instantaneo y sostenido al maximo, mezclada a ambos lados.
     void setupVoice0(Spu2 &spu, uint32_t ssa)
     {
@@ -217,10 +254,67 @@ void register_ps2_spu2_tests()
             t.IsFalse(spu.voice(0u, 0u).active, "the voice should be off after its release");
         });
 
+        // GOW-Port: el driver escribe LSA antes de KON; KON no debe sustituirla por SSA (fallaba: volvia a 0x5000).
+        tc.Run("key on keeps a loop start written before it", [](TestCase &t)
+        {
+            Spu2 spu;
+            writeBlock(spu, 0x5000u, 0u, 0u, 0x00u, {1u}); // introduccion sin marcas
+            writeBlock(spu, 0x5008u, 0u, 0u, 0x03u, {1u}); // fin + repetir, sin marca de inicio de bucle
+            setupVoice0(spu, 0x5000u);
+            setAddr(spu, Spu2::RegVoiceAddr + 4u, 0x5008u); // LSA de la voz 0
+            spu.write16(kBase + Spu2::RegKon, 0x0001u);
+            for (int i = 0; i < 60; ++i)
+                spu.step();
+            t.IsTrue(spu.voice(0u, 0u).active, "the looping voice should keep playing");
+            t.Equals(spu.voice(0u, 0u).lsa, 0x5008u, "the loop start should be the one written before KON");
+            t.Equals(spu.voice(0u, 0u).nax, 0x5010u, "after the loop end the voice should continue from its loop start");
+        });
+
+        // GOW-Port: el driver de streaming lee NAX para saber en qué trozo de su búfer doble está la voz. Mientras suena
+        // el último bloque de un trozo, NAX debe seguir dentro de él (antes ya valía "bloque + 8" = fuera del trozo, y
+        // el driver paraba y relanzaba la música); tras la marca de fin, NAX va a LSA.
+        tc.Run("NAX stays inside the playing block until the loop jump", [](TestCase &t)
+        {
+            Spu2 spu;
+            writeBlock(spu, 0x7000u, 0u, 0u, 0x00u, {1u});
+            writeBlock(spu, 0x7008u, 0u, 0u, 0x03u, {1u}); // fin + repetir
+            setupVoice0(spu, 0x7000u);
+            setAddr(spu, Spu2::RegVoiceAddr + 4u, 0x7000u); // LSA
+            spu.write16(kBase + Spu2::RegKon, 0x0001u);
+            for (int i = 0; i < 40; ++i) // a mitad del segundo bloque
+                spu.step();
+            const uint16_t middle = spu.read16(kBase + Spu2::RegVoiceAddr + 10u);
+            t.IsTrue(middle > 0x7008u && middle < 0x7010u, "NAX should point inside the block being played");
+            for (int i = 40; i < 56; ++i) // última muestra del bloque con la marca de fin
+                spu.step();
+            t.Equals(spu.read16(kBase + Spu2::RegVoiceAddr + 10u), static_cast<uint16_t>(0x7001u),
+                     "after the loop end NAX should be at the loop start, past its header");
+        });
+
+        // GOW-Port: liberacion exponencial lenta (tasa 11): con la division hacia cero el nivel se quedaba en ~0x0FFF
+        // y la voz no se apagaba nunca.
+        tc.Run("a slow exponential release reaches silence", [](TestCase &t)
+        {
+            Spu2 spu;
+            writeBlock(spu, 0x6000u, 0u, 0u, 0x03u, {7u, 7u, 7u, 7u});
+            setupVoice0(spu, 0x6000u);
+            spu.write16(kBase + 0x8u, 0x002Bu); // liberacion exponencial (bit 5), tasa 11
+            spu.write16(kBase + Spu2::RegKon, 0x0001u);
+            for (int i = 0; i < 3; ++i)
+                spu.step();
+            spu.write16(kBase + Spu2::RegKoff, 0x0001u);
+            for (int i = 0; i < 30000; ++i)
+                spu.step();
+            t.Equals(spu.read16(kBase + 0xAu), static_cast<uint16_t>(0u), "ENVX should reach zero");
+            t.IsFalse(spu.voice(0u, 0u).active, "the voice should be off after its release");
+        });
+
         tc.Run("an active voice is mixed into the stereo output", [](TestCase &t)
         {
             Spu2 spu;
-            writeBlock(spu, 0x5000u, 0u, 0u, 0x03u, std::vector<uint8_t>(28u, 3u));
+            // GOW-Port: inicio de bucle + fin + repetir (0x07). Antes bastaba 0x03 porque KON ponía LSA = SSA; ahora KON
+            // conserva la LSA anterior (como el hardware) y un bucle sin marca de inicio volvería a otra dirección.
+            writeBlock(spu, 0x5000u, 0u, 0u, 0x07u, std::vector<uint8_t>(28u, 3u));
             setupVoice0(spu, 0x5000u);
             spu.write16(kBase + 0x2u, 0x4000u); // VOLR = -1.0
             spu.write16(kBase + Spu2::RegKon, 0x0001u);
@@ -231,6 +325,48 @@ void register_ps2_spu2_tests()
             t.IsTrue(out[126] > 0, "left output should follow the positive samples");
             t.IsTrue(out[127] < 0, "right output should follow the negative voice volume");
             t.Equals(spu.pendingFrames(), static_cast<size_t>(0u), "drained frames should be removed");
+        });
+
+        // GOW-Port: el sonido de los vídeos de God of War llega por ADMA (sceSdBlockTrans) al núcleo 1. Antes el DMA se
+        // rechazaba en modo ADMA y los vídeos sonaban en silencio.
+        tc.Run("ADMA input is read in 1 KB left/right blocks at 48 kHz and mixed with BVOL", [](TestCase &t)
+        {
+            IopMemory memory;
+            writeAdmaBlock(memory, 0x80000u, 1000, -2000);
+            writeAdmaBlock(memory, 0x80400u, 3000, 4000);
+            setupAdmaCore1(memory);
+            startCore1Dma(memory, 0x80000u, 2048u);
+            const auto start = memory.takeDmaStart();
+            t.IsTrue(start.has_value() && start->irq == 0x28, "the core 1 DMA interrupt should be scheduled");
+            t.Equals(start ? start->delayCycles : 0u, static_cast<uint64_t>(256u * Spu2::CyclesPerSample),
+                     "the ADMA DMA should end when its last block is read, one block (256 frames) later");
+            memory.spu2().advanceTo(Spu2::CyclesPerSample * 512u);
+            std::vector<int16_t> out(1024u);
+            t.Equals(memory.spu2().drainOutput(out.data(), 512u), static_cast<size_t>(512u), "512 frames should drain");
+            const auto near = [](int value, int expected) { return value >= expected - 8 && value <= expected + 8; };
+            t.IsTrue(near(out[0], 1000) && near(out[1], -2000), "first block: left and right samples, full volume");
+            t.IsTrue(near(out[255 * 2], 1000) && near(out[255 * 2 + 1], -2000), "a block lasts 256 frames");
+            t.IsTrue(near(out[256 * 2], 3000) && near(out[256 * 2 + 1], 4000), "then the second block");
+        });
+
+        tc.Run("an ADMA DMA started before the previous one is read is queued behind it", [](TestCase &t)
+        {
+            IopMemory memory;
+            writeAdmaBlock(memory, 0x80000u, 100, 100);
+            writeAdmaBlock(memory, 0x81000u, 200, 200);
+            setupAdmaCore1(memory);
+            startCore1Dma(memory, 0x80000u, 1024u);
+            (void)memory.takeDmaStart();
+            startCore1Dma(memory, 0x81000u, 1024u);
+            const auto second = memory.takeDmaStart();
+            t.Equals(second ? second->delayCycles : 0u, static_cast<uint64_t>(256u * Spu2::CyclesPerSample),
+                     "the second DMA ends when its block is read, after the whole first block");
+            memory.spu2().advanceTo(Spu2::CyclesPerSample * 600u);
+            std::vector<int16_t> out(1200u);
+            t.Equals(memory.spu2().drainOutput(out.data(), 600u), static_cast<size_t>(600u), "600 frames should drain");
+            t.IsTrue(out[100 * 2] > 90 && out[100 * 2] < 110, "the first DMA plays first");
+            t.IsTrue(out[300 * 2] > 190 && out[300 * 2] < 210, "the second DMA is not dropped and follows it");
+            t.Equals(static_cast<int>(out[550 * 2]), 0, "nothing more queued: silence");
         });
 
         tc.Run("draining with a latency limit drops the oldest frames", [](TestCase &t)

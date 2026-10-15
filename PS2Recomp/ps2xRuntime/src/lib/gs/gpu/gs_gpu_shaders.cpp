@@ -340,9 +340,10 @@ uint applyTexa(uint s, uint psm, uint texel)
     uint ta1 = (texa >> 16u) & 0xFFu;
     bool rgbZero = (texel & 0x00FFFFFFu) == 0u;
     uint a = texel >> 24u;
-    if (psm == 1u)
+    // GOW-Port: TEXA comparte semántica en las texturas color y sus alias depth.
+    if (psm == 1u || psm == 0x31u)
         a = (aem && rgbZero) ? 0u : ta0;
-    else if (psm == 2u || psm == 10u)
+    else if (psm == 2u || psm == 10u || psm == 0x32u || psm == 0x3Au)
     {
         if ((a & 0x80u) != 0u)
             a = ta1;
@@ -474,16 +475,16 @@ uint sampleTexture(uint s, float ss, float tt, float q, uint u, uint v)
         texUf = ss * invQ * texW;
         texVf = tt * invQ * texH;
     }
+    // GOW-Port: conversion 16.16 antes del medio texel, tambien para bilinear STQ.
+    precise float fixedU = trunc(texUf * 65536.0);
+    precise float fixedV = trunc(texVf * 65536.0);
     if ((flags & F_LINEAR) == 0u)
     {
-        // GOW-Port: conversion 16.16 y eleccion signed del texel, igual que CPU.
-        precise float fixedU = trunc(texUf * 65536.0);
-        precise float fixedV = trunc(texVf * 65536.0);
         return samplePoint(s, int(floor(fixedU / 65536.0)), int(floor(fixedV / 65536.0)));
     }
 
-    precise float sampleU = texUf - 0.5;
-    precise float sampleV = texVf - 0.5;
+    precise float sampleU = fixedU / 65536.0 - 0.5;
+    precise float sampleV = fixedV / 65536.0 - 0.5;
     int u0 = int(floor(sampleU));
     int v0 = int(floor(sampleV));
     precise float fx = sampleU - float(u0);
@@ -548,10 +549,11 @@ void writePixel(uint s, int x, int y, uint z, uvec4 c, uint fog)
     if ((flags & F_FGE) != 0u)
     {
         uint fogColor = st(s, S_FOGCOL);
-        uint inverseFog = 255u - fog;
-        r = int(((fog * uint(r)) >> 8u) + ((inverseFog * (fogColor & 0xFFu)) >> 8u)) & 0xFF;
-        g = int(((fog * uint(g)) >> 8u) + ((inverseFog * ((fogColor >> 8u) & 0xFFu)) >> 8u)) & 0xFF;
-        b = int(((fog * uint(b)) >> 8u) + ((inverseFog * ((fogColor >> 16u) & 0xFFu)) >> 8u)) & 0xFF;
+        // GOW-Port: pesos suman 256 y se trunca una sola vez, igual que la referencia GS.
+        uint inverseFog = 256u - fog;
+        r = int((fog * uint(r) + inverseFog * (fogColor & 0xFFu)) >> 8u) & 0xFF;
+        g = int((fog * uint(g) + inverseFog * ((fogColor >> 8u) & 0xFFu)) >> 8u) & 0xFF;
+        b = int((fog * uint(b) + inverseFog * ((fogColor >> 16u) & 0xFFu)) >> 8u) & 0xFF;
     }
 
     uint fbp = st(s, S_FBP);
@@ -570,7 +572,9 @@ void writePixel(uint s, int x, int y, uint z, uvec4 c, uint fog)
     if (!writesFramebuffer && !writeDepth)
         return;
 
-    uint ztestMethod = (test >> 17u) & 3u;
+    // GOW-Port: ZTE=0 dibuja sin prueba Z ni escritura Z, igual que la referencia GS.
+    bool ztestEnabled = (test & 0x10000u) != 0u;
+    uint ztestMethod = ztestEnabled ? ((test >> 17u) & 3u) : 1u;
     bool abe = (flags & F_ABE) != 0u;
     bool preserveDestinationAlpha = writeRgb && !writeAlpha && fpsm == 0u;
     bool destinationAlphaTestNeedsRead = ((test >> 14u) & 1u) != 0u && (fpsm == 0u || fpsm == 2u || fpsm == 10u);
@@ -642,7 +646,7 @@ void writePixel(uint s, int x, int y, uint z, uvec4 c, uint fog)
             pixel = rgba8888To5551(pixel);
         writePixelRaw(fpsm, fbp, fbw, uint(x), uint(y), pixel);
     }
-    if (writeDepth && st(s, S_ZMASK) == 0u)
+    if (writeDepth && ztestEnabled && st(s, S_ZMASK) == 0u)
         writePixelRaw(zpsm, zbp, fbw, uint(x), uint(y), z);
 }
 
@@ -685,6 +689,9 @@ void drawSprite(uint p, uint s, int x, int y)
     float v0f = pf(p, 8u);
     float u1f = pf(p, 9u);
     float v1f = pf(p, 10u);
+    // GOW-Port: resolución interna: los sprites no desplazan la textura. Son blits 2D (HUD, copias del cuadro, mezclas
+    // de canales por tiras de 8 píxeles); cada plano lee el mismo texel de su propio plano. Desplazarlos cambiaba de
+    // texel en los bordes de tira (columnas verdes) y movía un píxel las copias (imagen doble).
     precise float ty = (float(y) - oy) * scaleY;
     precise float texVf = v0f + (v1f - v0f) * ty;
     precise float tx = (float(x) - ox) * scaleX;
@@ -709,7 +716,9 @@ void drawTriangle(uint p, uint s, int x, int y)
 {
     uint xr = pw(p, 1u);
     uint yr = pw(p, 2u);
-    if (x < int(xr & 0xFFFFu) || x > int(xr >> 16u) || y < int(yr & 0xFFFFu) || y > int(yr >> 16u))
+    // GOW-Port: con desplazamiento la muestra del píxel anterior a la caja puede caer dentro.
+    if (x < int(xr & 0xFFFFu) - int(uRaster.z != 0u) || x > int(xr >> 16u) ||
+        y < int(yr & 0xFFFFu) - int(uRaster.w != 0u) || y > int(yr >> 16u))
         return;
     int vx[3];
     int vy[3];
@@ -720,8 +729,8 @@ void drawTriangle(uint p, uint s, int x, int y)
     }
     int sgn = int(pw(p, 9u));
     double invArea = pd(p, 33u);
-    int sx = x * 16;
-    int sy = y * 16;
+    int sx = x * 16 + int(uRaster.z);
+    int sy = y * 16 + int(uRaster.w);
     double e[3];
     for (uint i = 0u; i < 3u; ++i)
     {
@@ -811,13 +820,16 @@ bool coversPixel(uint p, int x, int y)
     uint yr = pw(p, 2u);
     if (type == 0u)
         return x == int(xr) && y == int(yr);
-    if (x < int(xr & 0xFFFFu) || x > int(xr >> 16u) || y < int(yr & 0xFFFFu) || y > int(yr >> 16u))
+    // GOW-Port: resolución interna, como en drawTriangle (solo los triángulos tienen margen).
+    int margenX = type == 2u ? int(uRaster.z != 0u) : 0;
+    int margenY = type == 2u ? int(uRaster.w != 0u) : 0;
+    if (x < int(xr & 0xFFFFu) - margenX || x > int(xr >> 16u) || y < int(yr & 0xFFFFu) - margenY || y > int(yr >> 16u))
         return false;
     if (type != 2u)
         return true;
     int sgn = int(pw(p, 9u));
-    int sx = x * 16;
-    int sy = y * 16;
+    int sx = x * 16 + int(uRaster.z);
+    int sy = y * 16 + int(uRaster.w);
     for (uint i = 0u; i < 3u; ++i)
     {
         uint a = (i + 1u) % 3u;
@@ -1135,8 +1147,12 @@ void main()
 {
     uint ox = gl_GlobalInvocationID.x;
     uint oy = gl_GlobalInvocationID.y;
-    uint width = uOut.x;
-    uint height = uOut.y;
+    // GOW-Port: resolución interna: uOut.x = ancho | i << 16 | (S-1) << 24, uOut.y = alto | j << 16.
+    uint width = uOut.x & 0xFFFFu;
+    uint height = uOut.y & 0xFFFFu;
+    uint planoI = (uOut.x >> 16u) & 0xFFu;
+    uint planoJ = uOut.y >> 16u;
+    uint escala = (uOut.x >> 24u) + 1u;
     if (ox >= width || oy >= height)
         return;
     int x0 = int(uOut.z & 0xFFFFu);
@@ -1190,7 +1206,7 @@ void main()
         }
         outPixel = r | (g << 8u) | (b << 16u) | 0xFF000000u;
     }
-    data[oy * width + ox] = outPixel;
+    data[(oy * escala + planoJ) * (width * escala) + ox * escala + planoI] = outPixel;
 }
 )GLSL";
 
@@ -1209,7 +1225,7 @@ void main()
     {
         vec2 v[3];
         for (uint i = 0u; i < 3u; ++i)
-            v[i] = vec2(float(int(prims[p * 40u + 3u + i * 2u])), float(int(prims[p * 40u + 4u + i * 2u]))) / 16.0 + 0.5;
+            v[i] = vec2(float(int(prims[p * 40u + 3u + i * 2u])) - float(uHw.y), float(int(prims[p * 40u + 4u + i * 2u])) - float(uHw.z)) / 16.0 + 0.5;
         vec2 e0 = v[1] - v[0];
         vec2 e1 = v[2] - v[0];
         float orient = e0.x * e1.y - e0.y * e1.x >= 0.0 ? 1.0 : -1.0;
@@ -1253,9 +1269,10 @@ void main()
     }
     else
     {
-        x0 = float(xr & 0xFFFFu);
+        // GOW-Port: resolución interna: un píxel más arriba y a la izquierda para las muestras desplazadas.
+        x0 = float(xr & 0xFFFFu) - (uHw.y != 0u ? 1.0 : 0.0);
         x1 = float(xr >> 16u) + 1.0;
-        y0 = float(yr & 0xFFFFu);
+        y0 = float(yr & 0xFFFFu) - (uHw.z != 0u ? 1.0 : 0.0);
         y1 = float(yr >> 16u) + 1.0;
     }
     bool right = c == 1u || c == 3u || c == 4u;
@@ -1278,6 +1295,11 @@ void main()
     uvec4 c;
     uint fog;
     bool shaded = coversPixel(vPrim, x, y) && shadePrim(vPrim, x, y, s, z, c, fog);
+    // GOW-Port: ARB permite discard antes del interlock; conservar begin/end fuera de ramas.
+#ifndef GOW_HW_KEEP_UNCOVERED
+    if (!shaded)
+        discard;
+#endif
     beginInvocationInterlockARB();
     if (shaded)
         writePixel(s, x, y, z, c, fog);

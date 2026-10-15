@@ -491,3 +491,124 @@ Un fallo privado que cambia siete por seis ciclos falla en el primer caso, con
 bloques como pares reales; la CLI exige que aparezca el control DIV completo.
 Se reproduce con `scripts\probar_vu1_compilada.cmd` en Windows o en la CI.
 Pasar estas pruebas confirma paridad semántica en esos casos; no mide una ganancia de FPS.
+
+## Portátil en ahorro de energía con la iGPU (13 de octubre de 2026)
+
+Objetivo: 60 cuadros/s también en GPU integradas. Banco: Radeon 680M (Mesa radeonsi, sin
+`fragment_shader_interlock`), perfil `power-saver` (amd-pstate EPP `power`, media ~1,8 GHz) y `GOW_SKIP_FMV=1`.
+Escena: la cubierta del barco con legionarios.
+
+**Punto de partida: 28-31 cuadros/s**, con el renderizador por hardware o sin él.
+
+**Diagnóstico:**
+
+- La GPU estaba al 42 % (`gpu_busy_percent`).
+- Sin dibujar triángulos (`PS2X_GS_OMITIR=tri`) seguía a 30. El límite era la CPU.
+- `GOW_MUESTREO` (perfil por muestreo dentro del proceso, nuevo, `ps2_muestreo.cpp` +
+  `tools/perfil/resumir_muestreo.py`): el hilo del EE pasaba el 31 % en `EeScheduler::accountCycles`.
+  - Era la espera del cuadro de `func_17A2A0`: `while (*0x29C7D0 == 1) for (v0 = 20000; v0; --v0);`.
+  - Cada vuelta del retardo pasaba por `eeCheckpointDue`.
+  - En un APU limitado por potencia, ese núcleo girando le quitaba reloj y su hermano SMT al hilo de VU1.
+
+**Espera del EE sin girar** (`gow_espera.cpp`, `GOW_ESPERA_EE=0` la desactiva):
+
+- Al reanudarse en el bucle de retardo (0x17A328/0x17A32C, puntos de reanudación registrados) con la bandera a 1,
+  duerme en pasos de 100 µs.
+- Cobra el tiempo dormido como ciclos (294,912 MHz) con `eeCheckpointDue`, así que el VBlank, los temporizadores y
+  el IOP siguen el reloj real.
+- Al haber un punto de control vuelve al planificador en 0x17A328 con `$v0 = 1`. El retardo acaba en una vuelta y
+  la bandera se vuelve a leer tras entregar la interrupción.
+- **Resultado:** 28-31 → **51-60** cuadros/s; VU1 baja de ~18 a ~9 ms por cuadro en esa ventana.
+- **Audio** (`GOW_AUDIO_DIAG`): salida y llegada ~48.000/s, tempo 1,00, sin vaciados.
+- **Ritmo** (`GOW_FRAME_DIAG`): 60 cuadros/s, un VBlank por cuadro, 4,92 M ciclos por cuadro.
+
+**Lo que queda en el combate más cargado** (45-50 cuadros/s; `GOW_ESPERA_DIAG=1`):
+
+- Por cuadro, el EE trabaja ~11-12 ms y espera ~8-9 ms la bandera.
+- La bandera la baja `func_182DD8` (interrupción del GS) cuando llega FINISH. FINISH viene por PATH3, ordenado
+  detrás de la salida de VU1.
+- VIF1 manda dos envíos por cuadro:
+  - uno de 1 KB al empezar;
+  - el grande (2,5-2,9 MB) a ~1,8 ms, que VU1 tarda **~20 ms de CPU** en procesar.
+- El cuadro dura 1,8 + 20 ≈ 21,6 ms. Es CPU pura: reloj de pared y `CLOCK_THREAD_CPUTIME_ID` coinciden.
+- **Sin efecto:**
+  - la ventana a 60 o a 120 Hz;
+  - fijar VU1 a un núcleo físico (`GOW_AFINIDAD=1`, 20,1 → 19,7 ms, ruido; desactivado por defecto).
+- **Para 60 ahí hace falta:**
+  - bajar VU1 ~30 %;
+  - o solapar EE y VU1: un FINISH anticipado, con el riesgo de presentar cuadros a medio dibujar.
+- El perfil de VU1:
+  - 70 % en bloques compilados;
+  - 8 % en el despachador;
+  - 6 % en el desempaquetado de VIF1;
+  - 5 % en libc;
+  - 4 % en el modelo de tiempos.
+
+**Escala dinámica en APU:**
+
+- Con 2× el combate caía a 37-45: la iGPU consume potencia del paquete y baja el reloj de la CPU, sin que el GS
+  espere a la GPU.
+- Ahora la escala dinámica también baja si la media de cuadros del juego (`g_gowGuestFrames`, media exponencial
+  sobre ventanas de 0,5 s) cae por debajo de 55. Solo vuelve a probar a subir con ≥ 59.
+- Con el lanzador por defecto (2×), el combate queda en 45-46, igual que a 1×.
+
+**Para la publicación:** el ejecutable se compila con `-march=native`. Para distribuirlo hay que fijar
+`x86-64-v2`/`v3`, o funcionará solo en CPU como la del equipo de compilación.
+
+## Banco de VU1 con un envío capturado en partida (14 de octubre de 2026)
+
+- **Captura** (`GOW_VIF_CAPTURA="<carpeta>:<segundo>"`, `ps2_memory.cpp`): el primer envío de VIF1 de más de 1 MB
+  desde ese segundo se guarda con las memorias de VU1, la VRAM y los registros de VIF1. Es el formato de
+  `tools/render/repetir_cadena_vif.cpp`. Datos del juego: solo en local, en `logs/`.
+  - Combate de la cubierta: `logs/vif_combate`, 2,76 MB, 1.840 MSCAL (ningún MSCNT).
+  - 3,04 millones de pares de VU1, todos compilados (`GOW_VU1C_DIAG`).
+- **Objetivo CMake** `repetir_cadena_vif` (fuera de `all`): la herramienta con el microcódigo compilado del juego.
+  Opciones nuevas:
+  - `GOW_REPETIR_SIN_GS=1`: descarta los paquetes GIF y no lee la imagen. Mide solo VIF1/VU1.
+  - Huella de toda la salida hacia el GS.
+  - `GOW_REPETIR_PERTURBAR=<clases|vfN|viN>`.
+  - `GOW_REPETIR_TRAZA_VI`.
+  - `GOW_REPETIR_BORRAR_ESCRITO`.
+  - `GOW_MUESTREO` dentro de la herramienta.
+- **Medición** (`logs/vu1_banco/medir.sh`: CPU 2 fija, 7 tandas de 60 pasadas, mínimo y mediana).
+  - Con el perfil de ahorro de energía, el ruido entre ejecuciones sueltas es enorme: 16-44 ms para el mismo
+    binario.
+  - Con el método fijo: **23,9-24,1 ms por cuadro**, unos 18 ciclos por par.
+- **PGO de GCC:** con el perfil actual, sin datos o sin la opción, 23,9-24,1 ms en los tres casos. Ahora no aporta
+  ni estorba. Una primera lectura en sentido contrario era ruido.
+- **Perfil sin GS:**
+  - 70-75 % en bloques compilados;
+  - 7,7 % en `processVIF1Data` (ya tiene caminos por formato);
+  - 7,2 % en el despachador;
+  - 2-4 % en el modelo de tiempos y XGKICK.
+  - Lo importante: sin el modelo de tiempos cambia el 80 % de la imagen (ver arriba).
+
+### Dependencias entre lanzamientos (para un VU1 en paralelo)
+
+- **Registros:** basura antes de cada MSCAL. La salida hacia el GS no cambia con VF, ACC, Q/P/I ni flags; sí con
+  VI. Uno a uno, solo **VI11 y VI13**.
+  - VI13 rota 341 → 682 → 1024 → 341: triple búfer de salida en cuartos de palabra (qwords). La memoria de datos se
+    reparte en tercios con TOPS.
+  - Los programas son 0x0000 (840), 0x0018 (555) y 0x0030 (445).
+- **Memoria:** basura en lo que escribió cada programa al terminar. La salida sí cambia: algo de lo que escribe un
+  lanzamiento se lee después. Puede ser el XGKICK que sigue enviando durante el lanzamiento siguiente, o datos
+  persistentes en los tercios. Falta separarlo.
+- **Plan:** paralelizar requiere ejecución especulativa por lanzamiento:
+  - copia de la memoria al empezar cada lanzamiento;
+  - VI11/VI13 previstos y validados al confirmar;
+  - salida GIF confirmada en orden.
+  - Es un proyecto grande. Con un solo hilo, recortar el 25 % que falta en el combate con ahorro de energía exige
+    rediseñar el código por par (FMAC con su normalización y flags).
+
+### Matriz con las dos GPU (ahorro de energía, `GOW_SKIP_FMV=1`, renderizador por hardware, imagen nítida)
+
+| Configuración | 25-45 s | Combate 50-65 s |
+|---|---|---|
+| Radeon 680M 1× (tres pasadas) | 54-60 | 46-51 |
+| RTX 4050 1× | 55-60 | 46-51 |
+| RTX 4050 2× dinámica | 55-60 | 46-51 (baja a 1×) |
+| RTX 4050 3× dinámica | 55-60 | 45-51 (baja a 1×) |
+| RTX 4050 3× fija | 51-60 | 30-33 |
+
+- En el combate el límite es VU1 (CPU), igual con las dos GPU.
+- Con el reloj del perfil de ahorro de energía, VU1 tarda ~19-20 ms por cuadro en la partida.

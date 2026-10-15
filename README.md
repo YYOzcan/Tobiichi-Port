@@ -48,11 +48,16 @@ The goal is a native-feeling PC port: real-time game speed, smooth presentation,
 |---|---|
 | **Launcher** | Graphics card, resolution, widescreen, FSR upscaling, frame-rate limit, file paths — all in one place |
 | **Widescreen** | Real Hor+ camera (16:9, 16:10, 21:9), based on the PCSX2 patch; off = bit-identical to the original |
-| **Upscaling** | AMD FSR 1.0 (EASU + RCAS) and FXAA on the presentation layer |
+| **Internal resolution** | The GS draws at 1×–8× (supersampling); 2× by default, with dynamic resolution that steps down when the GPU cannot hold 60 FPS. "Sharp image" removes the PS2's line doubling and anti-flicker blur |
+| **Upscaling** | AMD FSR 1.0 (EASU + RCAS) and FXAA on the presentation layer; area downsampling when the render is larger than the screen |
 | **Smooth window** | The window presents at up to 120+ FPS independently of the game's 60 Hz logic |
 | **Audio** | Time-stretch with a dead band and an IOP clock tied to EE time: tempo stays at 1.00, no looping |
-| **VU1 recompiled** | The game's VU1 microcode is compiled to native code, bit-exact against the interpreter (~23 % faster than before) |
+| **VU1 recompiled** | The game's VU1 microcode is compiled to native code; fast mode with PCSX2-level precision (1.5× faster) or bit-exact mode |
 | **Real-time speed** | VBlank follows the wall clock: the game drops frames instead of running in slow motion |
+| **Lock-on** | **Alt** locks onto the nearest enemy and Kratos aims his attacks at it; move the mouse left/right to switch targets |
+| **Agile combat** | Attacks and blocks come out of a roll at 20 % instead of 50 %, and a missed attack press is retried for a moment (e.g. releasing L1 and attacking in the same frame); cancelling attacks into block or evade was already in the game |
+| **Button prompts** | In-game button icons follow your device: the key or mouse button you assigned, Xbox buttons on other controllers (A/B/X/Y, LB/RB/LT/RT) and the originals on PlayStation pads; drawn at window resolution in the style of the game's menus |
+| **Cheat menu** | **F2** in game: god mode, one-hit kills, infinite magic and Rage of the Gods, max orbs, all upgrades and powers, unlock all extras |
 
 ## Current status
 
@@ -68,19 +73,26 @@ Per-library and per-component breakdown: [`docs/estado/detalle.en.md`](docs/esta
 | Rendering (OpenGL; hardware rasterizer with `fragment_shader_interlock` or compute rasterizer) | ✅ |
 | Audio at real-time tempo | ✅ |
 | Widescreen (Hor+) and FSR upscaling | ✅ |
-| FMV: intro decoded and displayed; other videos unverified | 🔧 |
+| Internal resolution 2×–8× and sharp image | ✅ |
+| FMV: the intro plays to the end with picture and sound and hands over to the game; other videos use the same path, not yet checked one by one | 🔧 |
 | Memory card: save/load verified; formatting unverified | 🔧 |
-| Performance: 60 FPS in light and medium scenes, **~30 FPS in the heaviest ones** | 🔧 |
+| Performance: 60 FPS in gameplay with fast VU1 mode (the ship-deck test scene went from 30 to 60 on an RTX 4050) | ✅ |
 
 ### About frame rate
 
 The game's logic is locked to the PS2's 60 Hz VBlank, so **the game itself cannot run above 60 FPS**; forcing a higher
 VBlank rate only makes it play faster. The window can present at 120 Hz or more, which shows each new frame sooner and
-lowers latency. In the heaviest scenes the VU1 thread needs ~20 ms per frame (60 FPS needs ≤ ~15 ms) and the CPU is
-the limit; a dedicated GPU matters for the GS rasterizer (4–7 ms per frame on an RTX 4050 vs. 20–26 ms on a Radeon 680M).
+lowers latency. The limit is the VU1 thread (CPU). The **fast VU1 mode** (`PS2X_VU1_RAPIDO=ON`, the default build
+here) uses PCSX2-level precision (round-toward-zero SSE with DAZ/FTZ, Z/S flags computed lazily) instead of the
+bit-exact model: VU1 per frame 22 → 13 ms and the heaviest test scene 30 → 60 FPS, with the rendered test frame
+pixel-identical. `PS2X_VU1_RAPIDO=OFF` builds the bit-exact mode. A dedicated GPU matters for the GS rasterizer
+(4–7 ms per frame on an RTX 4050 vs. 20–26 ms on a Radeon 680M).
 
-**Not available:** 2×–4× internal resolution. The GS is emulated at its native 640×448 on its interleaved VRAM;
-supersampling it is a large project. Use FSR for sharpness.
+**Internal resolution:** each sample position gets its own copy of the GS VRAM (the paraLLEl-GS scheme); reads and
+palettes use the native copy, so the game sees the same memory as on a PS2. GPU cost grows with the square of the
+scale. On an RTX 4050 Laptop: 1× 60 FPS, 2× 40–60 FPS, 3× 18–24 FPS. 4× and above need a much faster GPU. Dynamic resolution (on by
+default) keeps 60 FPS by stepping down as far as 1×; below that point the GPU is the limit. "Sharp image" alone
+already removes most of the PS2 blur.
 
 ## Quick start
 
@@ -115,14 +127,15 @@ matching `TOBIICHI_*` variables. Details: [`docs/LANZADOR.md`](docs/LANZADOR.md)
 
 | Tab | What you can set |
 |---|---|
-| **Graphics** | Graphics card, fullscreen/window and resolution, aspect ratio (4:3, 16:9, 16:10, 21:9 Hor+), stretch, FSR / bilinear / pixel upscaling, sharpness, FXAA |
+| **Graphics** | Graphics card, fullscreen/window and resolution, aspect ratio (4:3, 16:9, 16:10, 21:9 Hor+), stretch, FSR / bilinear / pixel upscaling, sharpness, FXAA, render resolution (auto, 1×–8×), sharp image |
 | **Performance** | Frame-rate limit (30 … unlimited), VSync, on-screen FPS counter |
 | **Files** | Game executable (verified by CRC), ISO, port runner, memory-card folder, automatic detection |
 | **Controls** | Keyboard layout, ESC behaviour, key table |
+| **Cheats** | Cheats active at start (the in-game **F2** menu toggles them live) |
 | **Other** | Language, skip videos, fast boot, shortcuts, last game log, restore defaults, optional cover image |
 
 `tobiichi-launcher --jugar` starts the game directly with the saved settings (the menu entry's "Play now" action).
-In game: **F11** toggles fullscreen and **F1** opens the developer panel.
+In game: **F11** toggles fullscreen, **F2** opens the cheat menu and **F1** opens the developer panel.
 
 ## Repository layout
 

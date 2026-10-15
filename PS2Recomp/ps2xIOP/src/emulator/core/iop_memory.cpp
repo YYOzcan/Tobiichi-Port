@@ -6,6 +6,8 @@
 
 namespace ps2x::iop::detail
 {
+    uint64_t spu2AdmaRetardo(const Spu2 &spu2, uint32_t core); // GOW-Port: spu2.cpp
+
     namespace
     {
         constexpr uint32_t kDmaSpu0Chcr = 0x1F8010C8u;
@@ -313,14 +315,19 @@ namespace ps2x::iop::detail
         if (const auto current = m_hardware.find(address - 8u); current != m_hardware.end())
             madr = physicalAddress(current->second) & (RamSize - 1u);
         const size_t bytes = static_cast<size_t>(std::min<uint64_t>(transferWords * 4u, RamSize - madr));
+        uint64_t retardoAdma = 0u;
         if ((value & 1u) != 0u)
+        {
             (void)m_spu2.dmaWrite(core, m_ram.data() + madr, bytes);
+            // GOW-Port: en ADMA el SPU2 consume el DMA a 48 kHz; termina cuando lee el último bloque (spu2.cpp).
+            retardoAdma = spu2AdmaRetardo(m_spu2, core);
+        }
         else if (m_spu2.dmaRead(core, m_ram.data() + madr, bytes))
             markOwned(madr, bytes);
         m_spu2.markDmaReady(core);
         m_dmaStart = DmaStart{
             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
-            std::max<uint64_t>(transferWords * 2u, 64u),
+            retardoAdma != 0u ? retardoAdma : std::max<uint64_t>(transferWords * 2u, 64u),
         };
     }
 

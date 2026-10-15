@@ -1028,4 +1028,25 @@ static inline void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
             ctx_ptr->r[reg_idx] = (val);   \
     } while (0)
 
+// GOW-Port: PMULTH conserva ocho productos signed de 16x16 bits, sin sumarlos.
+// LO={p0,p1,p4,p5}, HI={p2,p3,p6,p7}; rd={p0,p2,p4,p6}.
+// hi/lo son las mitades bajas de 64 bits; hi1/lo1, las altas. Operandos
+// por valor: rd puede coincidir con rs/rt. rd=0 no elimina los efectos HI/LO.
+inline void ps2_pmulth(R5900Context *ctx, __m128i rs, __m128i rt, unsigned rd)
+{
+    int16_t a[8], b[8];
+    int32_t products[8];
+    std::memcpy(a, &rs, sizeof(a));
+    std::memcpy(b, &rt, sizeof(b));
+    for (unsigned i = 0; i < 8; ++i)
+        products[i] = int32_t(a[i]) * int32_t(b[i]);
+    const auto pair = [&](unsigned first) {
+        return uint64_t(uint32_t(products[first])) |
+               (uint64_t(uint32_t(products[first + 1])) << 32);
+    };
+    ctx->lo = pair(0); ctx->hi = pair(2);
+    ctx->lo1 = pair(4); ctx->hi1 = pair(6);
+    SET_GPR_VEC(ctx, rd, _mm_setr_epi32(products[0], products[2], products[4], products[6]));
+}
+
 #endif // PS2_RUNTIME_MACROS_H

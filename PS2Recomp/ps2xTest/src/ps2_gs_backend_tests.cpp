@@ -10,13 +10,212 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <vector>
 #include <xmmintrin.h>
 
+bool gowGsPresentMailboxActive();       // GOW-Port: gs_threaded_backend.cpp
+uint64_t gowGsPresentMailboxDelivered(); // GOW-Port: gs_threaded_backend.cpp
+uint64_t gowGsHwTriangulos();            // GOW-Port: gs_hw_render.cpp
+uint64_t gowGsHwSprites();               // GOW-Port: gs_hw_render.cpp
+
 namespace
 {
+// GOW-Port: alias del mismo destino por stride y vuelta de VRAM. Un lote largo
+// en el primer XY hace observable que el ultimo sprite pierde sus escrituras.
+// Los controles conservan el batching normal, incluso al volver la base FBP.
+void gpuCoordinateAliasing(TestCase &t,bool hardware)
+{
+    std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
+    auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
+    raw->SetHardwareRasterAllowed(hardware);
+    GSThreadedBackend backend(std::move(gpu));
+    for(unsigned psm:{0u,1u,2u,10u}) for(unsigned fixture=0;fixture<10;++fixture) {
+        const bool wrap=fixture==1 || fixture==6,reverse=fixture==5 || fixture==6;
+        const bool depthOnly=fixture==7 || fixture==8,inactiveDepth=fixture==9;
+        const bool hazard=fixture==0 || wrap || reverse || depthOnly;
+        const unsigned colorPsm=fixture==7 || inactiveDepth?GS_PSM_CT16:fixture==8?GS_PSM_CT32:psm;
+        const unsigned depthPsm=fixture==8?GS_PSM_Z16:GS_PSM_Z32;
+        const auto &colorFormat=GSSwizzle::GetFormat(colorPsm);
+        const auto &depthFormat=GSSwizzle::GetFormat(depthPsm);
+        const unsigned height=depthOnly || inactiveDepth?32u:1u<<colorFormat.pageShiftY;
+        const unsigned bw=wrap?32u:fixture==4?2u:1u;
+        const unsigned period=512u/bw*(1u<<colorFormat.pageShiftY);
+        unsigned ax=0,ay=wrap?0:fixture==8?64u:height;
+        unsigned bx=fixture==2 || wrap?0:fixture==3?128u:64u,by=fixture==2?ay:wrap?period:0;
+        if(reverse){std::swap(ax,bx);std::swap(ay,by);}
+        const unsigned repetitions=reverse?1u:64u;
+        const auto first=GSSwizzle::Locate(depthOnly?depthFormat:colorFormat,(depthOnly?128u:511u)*32u,bw,ax,ay);
+        const auto last=GSSwizzle::Locate(depthOnly?depthFormat:colorFormat,(depthOnly?128u:511u)*32u,bw,bx,by);
+        if(hazard)t.IsTrue(first.byte==last.byte && (ax!=bx || ay!=by),"XY distintos apuntan al mismo pixel fisico");
+        std::vector<uint8_t> seed(vram.size());
+        for(size_t i=0;i<seed.size();i+=4){const uint32_t word=0xA5123456u;std::memcpy(seed.data()+i,&word,4);}
+        auto cpuVram=seed;GSCpuBackend cpu;cpu.Initialize(cpuVram.data(),uint32_t(cpuVram.size()));
+        std::vector<GSPrimitiveBatch> draws;
+        for(unsigned i=0;i<=repetitions;++i) {
+            const bool final=i==repetitions;const unsigned x=final?bx:ax,y=final?by:ay;
+            GSPrimitiveBatch b{};b.vertexCount=2;b.state.prim.type=GS_PRIM_SPRITE;b.state.colclamp=1;
+            auto &c=b.state.context;c.frame={511,bw,uint8_t(colorPsm),0};c.scissor={0,2047,0,2047};
+            c.zbuf={128,uint8_t(depthPsm),!depthOnly};c.test=0x30000;
+            b.vertices[0].x=float(x);b.vertices[0].y=float(y);
+            b.vertices[1].x=float(x+64u);b.vertices[1].y=float(y+height);
+            b.vertices[1].z=final?0xccbbaa:0x010203;
+            b.vertices[1].r=final?0xaa:0x11;b.vertices[1].g=final?0xbb:0x22;
+            b.vertices[1].b=final?0xcc:0x33;b.vertices[1].a=128;
+            draws.push_back(b);cpu.Submit(b);
+        }
+        std::vector<uint8_t> expected;cpu.SnapshotVram(expected);
+        t.IsTrue(expected!=seed,"El control realmente escribe color y, si procede, Z");
+        if(depthOnly)t.Equals(cpu.ReadVram(depthPsm,128u*32u,bw,bx,by),
+            uint32_t(depthPsm==GS_PSM_Z16?0xbbaau:0xccbbaau),"La ultima primitiva gana el alias de profundidad");
+        bool observedHardware=false;unsigned pass=0;
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(12);
+        do {
+            backend.Sync(GSSyncReason::Finish);std::copy(seed.begin(),seed.end(),vram.begin());
+            backend.Initialize(vram.data(),uint32_t(vram.size()));
+            if(dynamic_cast<GSGpuBackend*>(&backend.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
+            backend.Sync(GSSyncReason::Finish);const auto before=raw->GetStats();
+            for(const auto &draw:draws)backend.Submit(draw);
+            backend.Sync(GSSyncReason::DebugReadback);std::vector<uint8_t> actual;backend.SnapshotVram(actual);
+            const auto after=raw->GetStats();
+            t.IsTrue(actual==expected,"Stride/wrap preservan los 4 MiB frente a CPU");
+            t.IsTrue(after.batches-before.batches==(hazard?2u:1u),"Solo el riesgo con paginas solapadas divide el lote");
+            t.IsTrue(after.flushTarget-before.flushTarget==(hazard?1u:0u),"Orden del destino acumulado, en ambos sentidos");
+            t.IsTrue(after.flushTexture-before.flushTexture==0u,"No hay textura en estos controles");
+            t.IsTrue(after.prims-before.prims==draws.size(),"Todas las primitivas se rasterizan realmente");
+            if(after.tiles-before.tiles==0 && after.prims-before.prims==draws.size())observedHardware=true;
+            if(!hardware)t.IsTrue(after.tiles>before.tiles,"Compute efectivo requerido");
+            ++pass;if(hardware && !observedHardware)std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        } while(pass<4 || (hardware && !observedHardware && std::chrono::steady_clock::now()<deadline));
+        if(hardware)t.IsTrue(observedHardware,"Hardware efectivo, sin tiles compute");
+    }
+}
+// GOW-Port: preservar los píxeles ajenos al rectángulo conservador de triángulos finos.
+void uncoveredTriangles(TestCase &t)
+{
+    std::vector<uint8_t> seed(GSSwizzle::kMemorySize, 0x35u), expected;
+    std::vector<GSPrimitiveBatch> draws;
+    for (unsigned i = 0; i < 8u; ++i) {
+        GSPrimitiveBatch b{}; b.vertexCount = 3; b.state.prim.type = GS_PRIM_TRIANGLE;
+        b.state.prim.iip = true; b.state.prim.abe = true; b.state.colclamp = 1;
+        auto &c = b.state.context;
+        c.frame = {2, 1, GS_PSM_CT32, 0}; c.scissor = {2, 61, 2, 61};
+        c.zbuf = {104, GS_PSM_Z32, true}; c.test = 0x30000; c.alpha = 0x44;
+        const float offset = float(i) * 0.125f;
+        b.vertices[0].x = 1.125f + offset; b.vertices[0].y = 1.375f;
+        b.vertices[1].x = 59.375f; b.vertices[1].y = 55.875f + offset;
+        b.vertices[2].x = i == 7u ? b.vertices[1].x : 60.125f;
+        b.vertices[2].y = i == 7u ? b.vertices[1].y : 57.375f + offset;
+        for (unsigned v = 0; v < 3u; ++v) {
+            b.vertices[v].r = uint8_t(32u + i * 13u + v * 3u);
+            b.vertices[v].g = 64u; b.vertices[v].b = 96u; b.vertices[v].a = 64u;
+        }
+        if (i & 1u) std::swap(b.vertices[1], b.vertices[2]);
+        draws.push_back(b);
+    }
+    auto cpuVram = seed; GSCpuBackend cpu;
+    cpu.Initialize(cpuVram.data(), uint32_t(cpuVram.size()));
+    for (const auto &b : draws) cpu.Submit(b);
+    cpu.SnapshotVram(expected);
+    t.IsTrue(expected != seed, "Los triangulos finos escriben frente al fondo inicial");
+    auto gpuVram = seed; auto gpu = std::make_unique<GSGpuBackend>(); auto *raw = gpu.get();
+    raw->SetHardwareRasterAllowed(true); GSThreadedBackend backend(std::move(gpu));
+    backend.Initialize(gpuVram.data(), uint32_t(gpuVram.size()));
+    if (dynamic_cast<GSGpuBackend *>(&backend.Inner()) != raw || !raw->IsReady()) {
+        t.Fail("OpenGL requerido"); return;
+    }
+    // GOW-Port: una variante fría empieza en compute mientras compila en otro hilo.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    bool observedHardware = false;
+    do {
+        backend.Sync(GSSyncReason::Finish);
+        std::copy(seed.begin(), seed.end(), gpuVram.begin());
+        backend.Initialize(gpuVram.data(), uint32_t(gpuVram.size()));
+        const auto before = raw->GetStats();
+        for (const auto &b : draws) backend.Submit(b);
+        std::vector<uint8_t> actual; backend.SnapshotVram(actual);
+        t.IsTrue(actual == expected, "Cobertura, mezcla y los 4 MiB coinciden con CPU");
+        const auto after = raw->GetStats();
+        observedHardware = after.tiles == before.tiles && after.prims > before.prims;
+        if (!observedHardware) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (!observedHardware && std::chrono::steady_clock::now() < deadline);
+    t.IsTrue(observedHardware, "El control realmente ejecuta el shader hardware");
+}
+}
+
+namespace
+{
+    // GOW-Port: oraculo RGBA externo PCSX2 v2.8.2 SW, bilinear STQ signed 16.16.
+    // SHA256 3566bc0c748d3948c2180c311562175df43c745a28bc8d7ad165d165b57d4e28.
+    // Texels 4x4 procedurales; 256 muestras cerca de cero/medios texels/pesos de 4 bits.
+    void bilinearStqReference(TestCase &t,GSRasterBackend &backend,GSGpuBackend *gpu=nullptr,bool hardware=false)
+    {
+        struct Restore {unsigned csr=_mm_getcsr();~Restore(){_mm_setcsr(csr);}} restore;
+        _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
+        for(unsigned y=0;y<4;++y) for(unsigned x=0;x<4;++x) {
+            const unsigned i=y*4+x;
+            backend.WriteVram(GS_PSM_CT32,8192,8,x,y,
+                (17u*i<<24)|((231u-13u*i)<<16)|((19u+11u*i)<<8)|(7u+15u*i));
+        }
+        constexpr float e=1.0f/131072;
+        const float limits[]={-2-e,-1-e,-0.5f-e,-0.25f-e,-0.0625f-e,-e,-2*e,0,e,
+            0.0625f-e,0.0625f+e,0.5f-e,0.5f,0.5f+e,1-e,1+e};
+        bool observedHardware=false;
+        for(bool triangle:{false,true}) for(float q:{1.0f,2.0f})
+            for(unsigned mode:{_MM_ROUND_NEAREST,_MM_ROUND_TOWARD_ZERO,_MM_ROUND_UP,_MM_ROUND_DOWN}) {
+                _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
+                GSPrimitiveBatch b{};b.vertexCount=triangle?3:2;
+                b.state.prim.type=triangle?GS_PRIM_TRIANGLE:GS_PRIM_SPRITE;b.state.prim.tme=true;
+                b.state.textureWidth=b.state.textureHeight=4;b.state.colclamp=1;b.state.linearFilter=true;
+                auto &c=b.state.context;c.frame.fbw=8;c.scissor={0,15,0,15};
+                c.zbuf.zbp=104;c.zbuf.psm=GS_PSM_Z24;c.zbuf.zmask=true;c.test=0x30000;
+                c.tex1=0x60;c.tex0.tbp0=8192;c.tex0.tbw=8;c.tex0.tw=c.tex0.th=2;c.tex0.tcc=1;c.tex0.tfx=1;
+                backend.ClearFramebuffer(c,0);
+                const auto statsBefore=gpu?gpu->GetStats():GSGpuBackend::Stats{};
+                const unsigned before=(restore.csr & ~_MM_ROUND_MASK)|mode;_mm_setcsr(before);
+                for(unsigned y=0;y<16;++y) for(unsigned x=0;x<16;++x) {
+                    const float u=limits[x];
+                    const float v=limits[y];
+                    for(auto &vertex:b.vertices) {
+                        vertex.r=vertex.g=vertex.b=vertex.a=128;vertex.z=7;
+                        vertex.s=u*q/4.0f;vertex.t=v*q/4.0f;vertex.q=q;
+                    }
+                    if(triangle) {
+                        b.vertices[0].x=float(x)-0.25f;b.vertices[0].y=float(y)-0.25f;
+                        b.vertices[1].x=float(x)+0.75f;b.vertices[1].y=float(y)-0.25f;
+                        b.vertices[2].x=float(x)-0.25f;b.vertices[2].y=float(y)+0.75f;
+                    } else {
+                        b.vertices[0].x=float(x);b.vertices[0].y=float(y);
+                        b.vertices[1].x=float(x+1);b.vertices[1].y=float(y+1);
+                    }
+                    backend.Submit(b);
+                }
+                backend.Sync(GSSyncReason::Finish);
+                const unsigned controls=_MM_ROUND_MASK|_MM_MASK_MASK|_MM_FLUSH_ZERO_MASK|0x40u;
+                t.IsTrue((_mm_getcsr()&controls)==(before&controls),"Bilinear STQ conserva los controles SSE del productor");
+                _mm_setcsr(restore.csr & ~_MM_ROUND_MASK);
+                std::vector<uint8_t> actual;backend.SnapshotVram(actual);
+                if(actual.size()!=GSSwizzle::kMemorySize){t.Fail("VRAM completa requerida");return;}
+                uint64_t hash=14695981039346656037ull;
+                const auto &format=GSSwizzle::GetFormat(GS_PSM_CT32);
+                for(unsigned y=0;y<16;++y) for(unsigned x=0;x<16;++x) {
+                    const auto p=GSSwizzle::Locate(format,0,8,x,y);
+                    for(unsigned channel=0;channel<4;++channel) hash=(hash^actual[p.byte+channel])*1099511628211ull;
+                }
+                const uint64_t expected=0xc6e49fa0342e621full;
+                t.IsTrue(hash==expected,"RGBA bilinear STQ coincide con la referencia externa en sprites/triangulos");
+                if(gpu) {
+                    const auto after=gpu->GetStats();
+                    t.IsTrue(after.prims-statsBefore.prims==256,"Las 256 primitivas se rasterizan en OpenGL");
+                    if(after.prims-statsBefore.prims==256 && after.tiles==statsBefore.tiles)observedHardware=true;
+                    if(!hardware)t.IsTrue(after.tiles>statsBefore.tiles,"La ruta compute se ejecuta sin fallback CPU");
+                }
+            }
+        if(gpu && hardware)t.IsTrue(observedHardware,"Al menos una matriz se rasteriza en hardware sin tiles compute");
+    }
+
     // GOW-Port: el GS recibe datos, no debe heredar el redondeo SSE del EE/VU.
     void cpuRoundingIndependent(TestCase &t, bool threaded)
     {
@@ -128,6 +327,111 @@ namespace
         void SnapshotVram(std::vector<uint8_t> &out) const override { out = r.uploaded; }
         GSTransferSnapshot GetTransferSnapshot() const override { return {}; }
     };
+    void ponerEntorno(const char *name, const char *value)
+    {
+#ifdef _WIN32
+        _putenv_s(name, value ? value : "");
+#else
+        if (value) setenv(name, value, 1);
+        else unsetenv(name);
+#endif
+    }
+
+    // GOW-Port: fuente para el buzón de presentación: las primeras llamadas a Present dan un cuadro de 1x1 con el número
+    // de la llamada; las siguientes, ninguno (como el backend OpenGL cuando la VRAM no cambió).
+    class MailboxSource final : public GSRasterBackend
+    {
+        int m_frames, m_calls = 0;
+    public:
+        explicit MailboxSource(int frames) : m_frames(frames) {}
+        void Initialize(uint8_t *, uint32_t) override {}
+        void Reset() override {}
+        void Submit(const GSPrimitiveBatch &) override {}
+        void LoadClut(const GSTex0Reg &, const GSTexClutReg &) override {}
+        void BeginTransfer(const GSTransferCommand &) override {}
+        void UploadImage(const uint8_t *, uint32_t) override {}
+        void Flush() override {}
+        void TextureFlush() override {}
+        void Sync(GSSyncReason) override {}
+        PresentationFrame Present(const GSPresentationRequest &) override
+        {
+            if (++m_calls > m_frames) return {};
+            PresentationFrame frame; frame.width = frame.height = 1u;
+            frame.pixels.assign(4u, static_cast<uint8_t>(m_calls));
+            return frame;
+        }
+        bool ClearFramebuffer(const GSContext &, uint32_t) override { return true; }
+        uint32_t ConsumeLocalToHostBytes(uint8_t *,uint32_t) override { return 0; }
+        uint32_t ReadVram(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t) const override { return 0; }
+        void WriteVram(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t) override {}
+        void SnapshotVram(std::vector<uint8_t> &out) const override { out.clear(); }
+        GSTransferSnapshot GetTransferSnapshot() const override { return {}; }
+    };
+
+    // GOW-Port: con el buzón, Present entrega cada cuadro una sola vez: si el GS no produjo otro, devuelve un cuadro
+    // vacío y el número de entrega no cambia (el frontend conserva el suyo sin copiar varios MB por VSync).
+    void mailboxDeliversEachFrameOnce(TestCase &t)
+    {
+        ponerEntorno("PS2X_GS_PRESENT_BUZON", "1");
+        {
+            GSThreadedBackend b(std::make_unique<MailboxSource>(2)); b.Initialize(nullptr,0);
+            t.IsTrue(gowGsPresentMailboxActive(),"Buzón activo");
+            GSPresentationRequest req{};
+            t.IsFalse(static_cast<bool>(b.Present(req)),"Sin cuadro antes de que el GS presente");
+            b.Flush();
+            auto first=b.Present(req);
+            t.IsTrue(first && first.pixels[0]==1u,"Primer cuadro del GS");
+            const uint64_t firstDelivery=gowGsPresentMailboxDelivered();
+            t.IsTrue(firstDelivery!=0u,"Entrega numerada");
+            b.Flush();
+            auto second=b.Present(req);
+            t.IsTrue(second && second.pixels[0]==2u,"Segundo cuadro del GS");
+            const uint64_t secondDelivery=gowGsPresentMailboxDelivered();
+            t.IsTrue(secondDelivery!=firstDelivery,"Nueva entrega con un cuadro nuevo");
+            b.Flush();
+            t.IsFalse(static_cast<bool>(b.Present(req)),"El mismo cuadro no se copia otra vez");
+            t.Equals(gowGsPresentMailboxDelivered(),secondDelivery,"Sin cuadro nuevo la entrega no cambia");
+        }
+        ponerEntorno("PS2X_GS_PRESENT_BUZON", nullptr);
+        { Recording r; GSThreadedBackend reset(std::make_unique<Recorder>(r)); }
+        t.IsFalse(gowGsPresentMailboxActive(),"Sin la variable el siguiente backend no usa el buzón");
+    }
+
+    // GOW-Port: PS2X_GS_NITIDO=1 con la temporización real de GoW (dos circuitos con DBY 1 y 0, campos en modo
+    // cuadro): cada línea del búfer sale tal cual, sin mezcla antiparpadeo ni duplicado, igual en los dos campos.
+    void gpuSharpPresentation(TestCase &t)
+    {
+        std::vector<uint8_t> vram(GSSwizzle::kMemorySize);
+        auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();
+        GSThreadedBackend backend(std::move(gpu)); backend.Initialize(vram.data(),uint32_t(vram.size()));
+        if (dynamic_cast<GSGpuBackend *>(&backend.Inner()) != raw) { t.Fail("OpenGL no pudo inicializarse"); return; }
+        std::vector<uint8_t> pattern;
+        const auto color=[](uint32_t x,uint32_t y,uint32_t c) {
+            return static_cast<uint8_t>(c==0 ? x : (c==1 ? y*7u+x/64u : (x^y)));
+        };
+        for(uint32_t y=0;y<448;++y) for(uint32_t x=0;x<512;++x) for(uint32_t c=0;c<3;++c) pattern.push_back(color(x,y,c));
+        GSTransferCommand upload{}; upload.direction=0; upload.bitbltbuf.dbp=0xd0u*32u; upload.bitbltbuf.dbw=8;
+        upload.bitbltbuf.dpsm=GS_PSM_CT24; upload.trxreg={512,448};
+        backend.BeginTransfer(upload); backend.UploadImage(pattern.data(),static_cast<uint32_t>(pattern.size()));
+        GSPresentationRequest req{}; req.pmode=0x8023; req.smode2=0x401;
+        req.dispfb1=0x800000090d0ull; req.dispfb2=0x90d0ull;
+        req.display1=0x1be9ff0203227cull; req.display2=0x1bf9ff0203227cull;
+        req.vsyncTick=0; const auto blended=backend.Present(req);
+        ponerEntorno("PS2X_GS_NITIDO","1");
+        req.vsyncTick=0; const auto even=backend.Present(req);
+        req.vsyncTick=1; const auto odd=backend.Present(req);
+        ponerEntorno("PS2X_GS_NITIDO",nullptr);
+        t.Equals(even.width,512u,"Ancho"); t.Equals(even.height,448u,"Alto");
+        t.IsTrue(even.pixels==odd.pixels,"Los dos campos dan la misma imagen");
+        t.IsTrue(even.pixels!=blended.pixels,"Distinta de la imagen con antiparpadeo");
+        size_t wrong=0;
+        if(even.pixels.size()>=static_cast<size_t>(640u)*448u*4u)
+            for(uint32_t y=0;y<448;++y) for(uint32_t x=0;x<512;++x) for(uint32_t c=0;c<3;++c)
+                wrong+=even.pixels[(static_cast<size_t>(y)*640u+x)*4u+c]!=color(x,y,c);
+        else wrong=1;
+        t.Equals(wrong,size_t(0),"Cada línea del búfer aparece sin mezclar");
+    }
+
     // GOW-Port: valores crudos iguales no son direcciones iguales entre FRAME y TEX0.
     void preferredSourceDrawAddressUnits(TestCase &t)
     {
@@ -265,6 +569,312 @@ namespace
         for(auto &v : b.vertices) { v.r = 25; v.g = 51; v.b = 99; v.a = 128; v.z = 7; }
         return b;
     }
+    // GOW-Port: el renderizador por hardware (PS2X_GS_HW=1) da la misma VRAM que la ruta software con una escena del
+    // tipo dominante en GoW: borrado, Z escrito por un sprite (ruta software), textura T8 con CLUT, mezcla
+    // (Cs-Cd)*As+Cd, Z GEQUAL, prueba de alfa con KEEP y con FB_ONLY y un triángulo Gouraud. El color puede diferir en
+    // 2 por el redondeo de la mezcla y del filtrado de la GPU; Z, texturas y CLUT, nada.
+    std::vector<uint8_t> escenaHw(bool hw)
+    {
+        ponerEntorno("PS2X_GS_HW", hw ? "1" : nullptr);
+        std::vector<uint8_t> vram(GSSwizzle::kMemorySize, 0u), out;
+        {
+            GSThreadedBackend b(std::make_unique<GSGpuBackend>()); b.Initialize(vram.data(),uint32_t(vram.size()));
+            GSContext ctx{}; ctx.frame={0,1,GS_PSM_CT32,0}; ctx.scissor={0,63,0,63}; ctx.zbuf={32,GS_PSM_Z24,false};
+            b.ClearFramebuffer(ctx,0x80203040u);
+            auto z=sprite(); z.state.context.frame.fbmsk=0xFFFFFFFFu; z.state.context.zbuf={32,GS_PSM_Z24,false};
+            z.vertices[0].x=0;z.vertices[0].y=0;z.vertices[1].x=64;z.vertices[1].y=64;
+            for(auto &v:z.vertices) v.z=1000;
+            b.Submit(z);
+            std::vector<uint8_t> tex(16*16), clut(16*16*4);
+            for(uint32_t y=0;y<16;++y) for(uint32_t x=0;x<16;++x) tex[y*16+x]=uint8_t((x+y*3)&255u);
+            for(uint32_t i=0;i<256;++i){clut[i*4]=uint8_t(i*5);clut[i*4+1]=uint8_t(255-i);clut[i*4+2]=uint8_t(i*2);clut[i*4+3]=uint8_t(0x40+(i&0x3F));}
+            GSTransferCommand up{}; up.direction=0; up.bitbltbuf.dbp=2048; up.bitbltbuf.dbw=1; up.bitbltbuf.dpsm=0x13; up.trxreg={16,16};
+            b.BeginTransfer(up); b.UploadImage(tex.data(),uint32_t(tex.size()));
+            up.bitbltbuf.dbp=2560; up.bitbltbuf.dpsm=GS_PSM_CT32;
+            b.BeginTransfer(up); b.UploadImage(clut.data(),uint32_t(clut.size()));
+            GSTex0Reg t0{}; t0.tbp0=2048; t0.tbw=1; t0.psm=0x13; t0.tw=4; t0.th=4; t0.tcc=1; t0.tfx=0; t0.cbp=2560; t0.cpsm=0; t0.csm=0; t0.cld=1;
+            b.LoadClut(t0,{});
+            const auto tri=[&](float x0,float y0,float x1,float y1,float x2,float y2) {
+                GSPrimitiveBatch p{}; p.vertexCount=3; p.state.prim.type=GS_PRIM_TRIANGLE; p.state.colclamp=1;
+                p.state.context=ctx; p.vertices[0].x=x0;p.vertices[0].y=y0;p.vertices[1].x=x1;p.vertices[1].y=y1;p.vertices[2].x=x2;p.vertices[2].y=y2;
+                return p;
+            };
+            auto a=tri(0,0,60,2,3,61); a.state.prim.tme=true; a.state.prim.fst=true; a.state.prim.abe=true;
+            a.state.context.tex0=t0; a.state.textureWidth=16; a.state.textureHeight=16; a.state.context.alpha=0x44;
+            a.state.context.test=2ull<<17;
+            const uint16_t uv[3][2]={{0,0},{16*15,16*2},{16*1,16*15}};
+            for(int i=0;i<3;++i){auto &v=a.vertices[i]; v.r=v.g=v.b=v.a=128; v.z=2000; v.u=uv[i][0]; v.v=uv[i][1];}
+            b.Submit(a);
+            auto g=tri(10,40,62,30,40,63); g.state.prim.iip=true; g.state.context.test=(2ull<<17)|1u|(6u<<1)|(0x30u<<4);
+            const uint8_t al[3]={0x10,0x80,0x50};
+            for(int i=0;i<3;++i){auto &v=g.vertices[i]; v.r=uint8_t(40*i); v.g=uint8_t(200-50*i); v.b=90; v.a=al[i]; v.z=3000;}
+            b.Submit(g);
+            auto f=tri(2,20,50,10,30,55); f.state.prim.iip=true; f.state.context.test=(2ull<<17)|1u|(6u<<1)|(0x40u<<4)|(1u<<12);
+            for(int i=0;i<3;++i){auto &v=f.vertices[i]; v.r=200; v.g=uint8_t(30*i); v.b=uint8_t(250-40*i); v.a=uint8_t(0x20+0x30*i); v.z=4000;}
+            b.Submit(f);
+            b.SnapshotVram(out);
+        }
+        ponerEntorno("PS2X_GS_HW", nullptr);
+        return out;
+    }
+
+    void gpuHwMatchesSoftware(TestCase &t)
+    {
+        const auto soft=escenaHw(false);
+        const uint64_t antes=gowGsHwTriangulos();
+        const auto hw=escenaHw(true);
+        t.Equals(gowGsHwTriangulos()-antes,uint64_t(3u),"Los tres triángulos van por hardware");
+        if(soft.size()!=hw.size() || soft.empty()) { t.Fail("Sin VRAM"); return; }
+        size_t distintos=0, fuera=0; int maximo=0;
+        for(size_t i=0;i<soft.size();++i)
+            if(soft[i]!=hw[i]) { ++distintos; const int d=std::abs(int(soft[i])-int(hw[i])); maximo=std::max(maximo,d); if(d>2) ++fuera; }
+        t.Equals(fuera,size_t(0),"Diferencias de color como mucho de 2 (distintos "+std::to_string(distintos)+", máximo "+std::to_string(maximo)+")");
+        // La escena dibuja de verdad: cuántos píxeles del cuadro no quedan con el color del borrado.
+        size_t dibujados=0;
+        for(size_t i=0;i<64u*64u*4u;i+=4) dibujados+=(soft[i]|soft[i+1]<<8|soft[i+2]<<16|uint32_t(soft[i+3])<<24)!=0x80203040u;
+        t.IsTrue(dibujados>1500u,"La escena cubre buena parte del cuadro ("+std::to_string(dibujados)+" píxeles)");
+        std::fprintf(stderr,"[prueba-hw] dibujados %zu, bytes distintos %zu, diferencia máxima %d\n",dibujados,distintos,maximo);
+        bool zIgual=true;
+        // Z24: comparar los bytes de las páginas de Z (bloque 32*32 en adelante, una página por 64x32).
+        for(size_t i=32u*8192u;i<34u*8192u;i+=4)
+            if((soft[i]|soft[i+1]<<8|soft[i+2]<<16)!=(hw[i]|hw[i+1]<<8|hw[i+2]<<16)) zIgual=false;
+        t.IsTrue(zIgual,"Z idéntica");
+    }
+
+    // GOW-Port: sprites por hardware (posprocesado de GoW): sin textura con mezcla, T8 escalada con bilineal, copia
+    // de un objetivo a otro 1:1 y escalada (STQ), lectura CT24 con TEXA y un sprite que lee su propio objetivo dos
+    // veces (la segunda, lo que acaba de escribir la primera). Con PS2X_GS_ESCALA=escala; se compara el plano 0.
+    std::vector<uint8_t> escenaSprites(bool hw, const char *escala)
+    {
+        ponerEntorno("PS2X_GS_HW", hw ? "1" : nullptr);
+        ponerEntorno("PS2X_GS_ESCALA", escala);
+        std::vector<uint8_t> vram(GSSwizzle::kMemorySize, 0u), out;
+        {
+            GSThreadedBackend b(std::make_unique<GSGpuBackend>()); b.Initialize(vram.data(),uint32_t(vram.size()));
+            GSContext a{}; a.frame={0,1,GS_PSM_CT32,0}; a.scissor={0,63,0,63}; a.zbuf={32,GS_PSM_Z24,true}; a.test=1ull<<17;
+            GSContext bb=a; bb.frame.fbp=40;
+            b.ClearFramebuffer(a,0x80203040u);
+            b.ClearFramebuffer(bb,0x80000000u);
+            std::vector<uint8_t> tex(16*16), clut(16*16*4);
+            for(uint32_t y=0;y<16;++y) for(uint32_t x=0;x<16;++x) tex[y*16+x]=uint8_t((x*7+y*3)&255u);
+            for(uint32_t i=0;i<256;++i){clut[i*4]=uint8_t(i*5);clut[i*4+1]=uint8_t(255-i);clut[i*4+2]=uint8_t(i*2);clut[i*4+3]=uint8_t(0x40+(i&0x3F));}
+            GSTransferCommand up{}; up.direction=0; up.bitbltbuf.dbp=2048; up.bitbltbuf.dbw=1; up.bitbltbuf.dpsm=0x13; up.trxreg={16,16};
+            b.BeginTransfer(up); b.UploadImage(tex.data(),uint32_t(tex.size()));
+            up.bitbltbuf.dbp=2560; up.bitbltbuf.dpsm=GS_PSM_CT32;
+            b.BeginTransfer(up); b.UploadImage(clut.data(),uint32_t(clut.size()));
+            GSTex0Reg t8{}; t8.tbp0=2048; t8.tbw=1; t8.psm=0x13; t8.tw=4; t8.th=4; t8.tcc=1; t8.tfx=0; t8.cbp=2560; t8.cpsm=0; t8.csm=0; t8.cld=1;
+            b.LoadClut(t8,{});
+            const auto spr=[&](const GSContext &c,float x0,float y0,float x1,float y1) {
+                GSPrimitiveBatch p{}; p.vertexCount=2; p.state.prim.type=GS_PRIM_SPRITE; p.state.colclamp=1; p.state.context=c;
+                p.vertices[0].x=x0;p.vertices[0].y=y0;p.vertices[1].x=x1;p.vertices[1].y=y1;
+                for(auto &v:p.vertices){v.r=v.g=v.b=v.a=128;}
+                return p;
+            };
+            // Un triángulo con textura en A: A pasa a ser un objetivo del renderizador por hardware.
+            GSPrimitiveBatch tri{}; tri.vertexCount=3; tri.state.prim.type=GS_PRIM_TRIANGLE; tri.state.colclamp=1; tri.state.context=a;
+            tri.state.prim.tme=true; tri.state.prim.fst=true; tri.state.context.tex0=t8; tri.state.textureWidth=16; tri.state.textureHeight=16;
+            const float tv[3][2]={{0,0},{60,4},{6,62}}; const uint16_t uv[3][2]={{0,0},{16*15,16*2},{16*1,16*15}};
+            for(int i=0;i<3;++i){auto &v=tri.vertices[i]; v.x=tv[i][0]; v.y=tv[i][1]; v.r=v.g=v.b=v.a=128; v.u=uv[i][0]; v.v=uv[i][1];}
+            b.Submit(tri);
+            // Sin textura, (Cs-Cd)*As+Cd.
+            auto m=spr(a,5,5,40,30); m.state.prim.abe=true; m.state.context.alpha=0x44;
+            for(auto &v:m.vertices){v.r=200;v.g=100;v.b=50;v.a=64;}
+            b.Submit(m);
+            // T8 de 16x16 a 24x20 con bilineal.
+            auto e=spr(a,30,30,54,50); e.state.prim.tme=true; e.state.prim.fst=true; e.state.linearFilter=true;
+            e.state.context.tex0=t8; e.state.textureWidth=16; e.state.textureHeight=16; e.state.context.clamp=1u|(1u<<2);
+            e.vertices[0].u=0;e.vertices[0].v=0;e.vertices[1].u=16*16;e.vertices[1].v=16*16;
+            b.Submit(e);
+            GSTex0Reg ta{}; ta.tbp0=0; ta.tbw=1; ta.psm=GS_PSM_CT32; ta.tw=6; ta.th=6; ta.tcc=1; ta.tfx=1;
+            // A -> B 1:1.
+            auto c1=spr(bb,0,0,64,32); c1.state.prim.tme=true; c1.state.prim.fst=true; c1.state.context.tex0=ta;
+            c1.state.textureWidth=64; c1.state.textureHeight=64; c1.state.context.clamp=1u|(1u<<2);
+            c1.vertices[0].u=0;c1.vertices[0].v=0;c1.vertices[1].u=64*16;c1.vertices[1].v=32*16;
+            b.Submit(c1);
+            // A (0,0)-(32,16) -> B (0,32)-(48,48) con bilineal y STQ.
+            auto c2=spr(bb,0,32,48,48); c2.state.prim.tme=true; c2.state.linearFilter=true; c2.state.context.tex0=ta;
+            c2.state.textureWidth=64; c2.state.textureHeight=64; c2.state.context.clamp=1u|(1u<<2);
+            c2.vertices[0].s=0;c2.vertices[0].t=0;c2.vertices[0].q=1;c2.vertices[1].s=0.5f;c2.vertices[1].t=0.25f;c2.vertices[1].q=1;
+            b.Submit(c2);
+            // A como CT24 con TEXA (AEM: negro transparente) -> B (48,32)-(64,64), mezcla con As.
+            auto c3=spr(bb,48,32,64,64); c3.state.prim.tme=true; c3.state.prim.fst=true; c3.state.context.tex0=ta;
+            c3.state.context.tex0.psm=GS_PSM_CT24; c3.state.texa.ta0=0x30; c3.state.texa.aem=true; c3.state.textureWidth=64; c3.state.textureHeight=64;
+            c3.state.context.clamp=1u|(1u<<2); c3.state.prim.abe=true; c3.state.context.alpha=0x44;
+            c3.vertices[0].u=16*16;c3.vertices[0].v=0;c3.vertices[1].u=32*16;c3.vertices[1].v=32*16;
+            b.Submit(c3);
+            // A lee A: (8,0)-(40,32) -> (0,0)-(32,32); después (0,0)-(16,16) -> (32,32)-(48,48), que acaba de escribirse.
+            auto s1=spr(a,0,0,32,32); s1.state.prim.tme=true; s1.state.prim.fst=true; s1.state.context.tex0=ta;
+            s1.state.textureWidth=64; s1.state.textureHeight=64; s1.state.context.clamp=1u|(1u<<2);
+            s1.vertices[0].u=8*16;s1.vertices[0].v=0;s1.vertices[1].u=40*16;s1.vertices[1].v=32*16;
+            b.Submit(s1);
+            auto s2=s1; s2.vertices[0].x=32;s2.vertices[0].y=32;s2.vertices[1].x=48;s2.vertices[1].y=48;
+            s2.vertices[0].u=0;s2.vertices[0].v=0;s2.vertices[1].u=16*16;s2.vertices[1].v=16*16;
+            b.Submit(s2);
+            // Triángulos con (Cs-Cd)*Ad+Cd que se solapan (el lote exacto se parte) y uno con DATE (DATM=1).
+            {
+                GSPrimitiveBatch t1{}; t1.vertexCount=3; t1.state.prim.type=GS_PRIM_TRIANGLE; t1.state.prim.iip=true; t1.state.colclamp=1;
+                t1.state.context=bb; t1.state.prim.abe=true; t1.state.context.alpha=0x54;
+                const float p1[3][2]={{2,2},{60,8},{10,58}};
+                for(int i=0;i<3;++i){auto &v=t1.vertices[i]; v.x=p1[i][0]; v.y=p1[i][1]; v.r=uint8_t(200-60*i); v.g=uint8_t(40+70*i); v.b=150; v.a=0x80;}
+                b.Submit(t1);
+                auto t2=t1; t2.vertices[0].x=50; t2.vertices[0].y=60; b.Submit(t2);
+                auto t3=t1; t3.state.prim.abe=false; t3.state.context.test=(1ull<<14)|(1ull<<15)|(1ull<<16)|(1ull<<17);
+                t3.vertices[1].x=62; t3.vertices[1].y=62; b.Submit(t3);
+            }
+            b.SnapshotVram(out);
+        }
+        ponerEntorno("PS2X_GS_HW", nullptr);
+        ponerEntorno("PS2X_GS_ESCALA", nullptr);
+        return out;
+    }
+
+    // GOW-Port: los movimientos de canales del posprocesado de GoW (logs/traza2): CT16 sobre el CT32 del cuadro con
+    // FBMSK 0x3FFF leyendo el mismo cuadro como CT16 (x - 8: la otra mitad de cada palabra), un búfer CT16 auxiliar
+    // dibujado por la ruta software y leído de vuelta, DATE con Cd - Cs*As, mezcla con Ad y una lectura Z16.
+    std::vector<uint8_t> escenaCanales(bool hw, const char *escala)
+    {
+        constexpr int pasos=5; // GOW-Port: al buscar un fallo, menos pasos acotan el primero que difiere
+        ponerEntorno("PS2X_GS_HW", hw ? "1" : nullptr);
+        ponerEntorno("PS2X_GS_ESCALA", escala);
+        std::vector<uint8_t> vram(GSSwizzle::kMemorySize, 0u), out;
+        {
+            GSThreadedBackend b(std::make_unique<GSGpuBackend>()); b.Initialize(vram.data(),uint32_t(vram.size()));
+            GSContext a{}; a.frame={0,1,GS_PSM_CT32,0}; a.scissor={0,63,0,31}; a.zbuf={32,GS_PSM_Z24,true}; a.test=1ull<<17;
+            b.ClearFramebuffer(a,0x40102030u);
+            const auto spr=[&](const GSContext &c,float x0,float y0,float x1,float y1) {
+                GSPrimitiveBatch p{}; p.vertexCount=2; p.state.prim.type=GS_PRIM_SPRITE; p.state.colclamp=1; p.state.context=c;
+                p.vertices[0].x=x0;p.vertices[0].y=y0;p.vertices[1].x=x1;p.vertices[1].y=y1;
+                for(auto &v:p.vertices){v.r=v.g=v.b=v.a=128;}
+                return p;
+            };
+            // Contenido variado (también el alfa), copiado a A con un sprite: A pasa a ser un objetivo por hardware y las
+            // dos rutas parten de los mismos bytes.
+            std::vector<uint8_t> img(64*32*4);
+            uint32_t semilla=12345u;
+            for(auto &x:img){semilla=semilla*1103515245u+12345u; x=uint8_t(semilla>>16);}
+            GSTransferCommand up{}; up.direction=0; up.bitbltbuf.dbp=2048; up.bitbltbuf.dbw=1; up.bitbltbuf.dpsm=GS_PSM_CT32; up.trxreg={64,32};
+            b.BeginTransfer(up); b.UploadImage(img.data(),uint32_t(img.size()));
+            {
+                GSTex0Reg ti{}; ti.tbp0=2048; ti.tbw=1; ti.psm=GS_PSM_CT32; ti.tw=6; ti.th=5; ti.tcc=1; ti.tfx=1;
+                auto p=spr(a,0,0,64,32); p.state.prim.tme=true; p.state.prim.fst=true; p.state.context.tex0=ti;
+                p.state.textureWidth=64; p.state.textureHeight=32;
+                p.vertices[0].u=0; p.vertices[0].v=0; p.vertices[1].u=64*16; p.vertices[1].v=32*16;
+                b.Submit(p);
+            }
+            GSContext a16=a; a16.frame.psm=GS_PSM_CT16; a16.frame.fbmsk=0x3FFFu; a16.scissor={0,63,0,63};
+            GSTex0Reg t16{}; t16.tbp0=0; t16.tbw=1; t16.psm=GS_PSM_CT16; t16.tw=10; t16.th=10; t16.tcc=1; t16.tfx=1;
+            if(pasos>0)
+            {
+            // 1. x en [8,16) de cada bloque <- x - 8, con FBMSK 0x3FFF.
+            for(int x=8;x<64;x+=16){
+                auto p=spr(a16,float(x),0,float(x+8),64); p.state.prim.tme=true; p.state.prim.fst=true; p.state.context.tex0=t16;
+                p.state.textureWidth=1024; p.state.textureHeight=1024;
+                p.vertices[0].u=uint16_t((x-8)*16+8); p.vertices[0].v=8; p.vertices[1].u=uint16_t(x*16+8); p.vertices[1].v=64*16+8;
+                b.Submit(p);
+            }
+            }
+            if(pasos>1)
+            {
+            // 2. Búfer CT16 auxiliar (bloque 512, 64 de ancho) <- A como CT16 (ruta software: CT16 sin objetivo CT32), y
+            // de vuelta a A en la otra mitad de las palabras.
+            GSContext tmp=a16; tmp.frame.fbp=16; tmp.frame.fbmsk=0u;
+            {
+                // Como en GoW, el búfer auxiliar ya es un objetivo CT24 (copias CT24 del cuadro anterior).
+                GSContext t24=a; t24.frame.fbp=16; t24.frame.psm=GS_PSM_CT24; t24.scissor={0,63,0,31};
+                GSTex0Reg ti{}; ti.tbp0=2048; ti.tbw=1; ti.psm=GS_PSM_CT32; ti.tw=6; ti.th=5; ti.tcc=0; ti.tfx=1;
+                auto c24=spr(t24,0,0,64,32); c24.state.prim.tme=true; c24.state.prim.fst=true; c24.state.context.tex0=ti;
+                c24.state.textureWidth=64; c24.state.textureHeight=32;
+                c24.vertices[0].u=0; c24.vertices[0].v=0; c24.vertices[1].u=64*16; c24.vertices[1].v=32*16;
+                b.Submit(c24);
+                auto p=spr(tmp,0,0,16,64); p.state.prim.tme=true; p.state.prim.fst=true; p.state.context.tex0=t16;
+                p.state.textureWidth=1024; p.state.textureHeight=1024;
+                p.vertices[0].u=16*16+8; p.vertices[0].v=8; p.vertices[1].u=32*16+8; p.vertices[1].v=64*16+8;
+                b.Submit(p);
+                GSTex0Reg tt=t16; tt.tbp0=512;
+                auto q=spr(a16,40,0,48,64); q.state.prim.tme=true; q.state.prim.fst=true; q.state.context.tex0=tt;
+                q.state.textureWidth=1024; q.state.textureHeight=1024;
+                q.vertices[0].u=8; q.vertices[0].v=8; q.vertices[1].u=8*16+8; q.vertices[1].v=64*16+8;
+                b.Submit(q);
+            }
+            }
+            if(pasos>2)
+            {
+            // 3. DATE (DATM=1): Cd - Cs*As donde el bit alto del alfa está puesto.
+            {
+                GSContext d=a; d.test=(1ull<<14)|(1ull<<15)|(1ull<<16)|(1ull<<17);
+                auto p=spr(d,0,0,64,32); p.state.prim.abe=true; p.state.context.alpha=0x42;
+                for(auto &v:p.vertices){v.r=v.g=v.b=38;v.a=128;}
+                b.Submit(p);
+            }
+            }
+            if(pasos>3)
+            {
+            // 4. (Cs-Cd)*Ad+Cd con FBMSK 0xFF000000.
+            {
+                GSContext d=a; d.frame.fbmsk=0xFF000000u;
+                auto p=spr(d,0,8,64,24); p.state.prim.abe=true; p.state.context.alpha=0x54;
+                for(auto &v:p.vertices){v.r=200;v.g=30;v.b=160;v.a=128;}
+                b.Submit(p);
+            }
+            }
+            if(pasos>4)
+            {
+            // 5. Una lectura Z16 de un búfer CT24 (bloque 1024) a la mitad alta de A.
+            {
+                GSContext c24=a; c24.frame.fbp=32; c24.frame.psm=GS_PSM_CT24;
+                b.ClearFramebuffer(c24,0x00C0A060u);
+                GSTex0Reg tz=t16; tz.tbp0=1024; tz.psm=0x32;
+                auto p=spr(a16,8,0,16,64); p.state.prim.tme=true; p.state.prim.fst=true; p.state.context.tex0=tz;
+                p.state.textureWidth=64; p.state.textureHeight=1024;
+                p.vertices[0].u=8; p.vertices[0].v=8; p.vertices[1].u=8*16+8; p.vertices[1].v=64*16+8;
+                b.Submit(p);
+            }
+            }
+            b.SnapshotVram(out);
+        }
+        ponerEntorno("PS2X_GS_HW", nullptr);
+        ponerEntorno("PS2X_GS_ESCALA", nullptr);
+        return out;
+    }
+
+    void gpuHwChannelsMatchSoftware(TestCase &t)
+    {
+        for(const char *escala : {"1","3"}) {
+            const auto soft=escenaCanales(false,escala);
+            const uint64_t antes=gowGsHwSprites();
+            const auto hw=escenaCanales(true,escala);
+            const uint64_t porHw=gowGsHwSprites()-antes;
+            if(soft.size()!=hw.size() || soft.empty()) { t.Fail("Sin VRAM"); return; }
+            size_t distintos=0; int primero=-1;
+            for(size_t i=0;i<8192u;++i) if(soft[i]!=hw[i]) { ++distintos; if(primero<0) primero=int(i); }
+            std::fprintf(stderr,"[prueba-hw-canales] %sx: %llu sprites por hardware, bytes distintos %zu (primero %d)\n",escala,
+                         static_cast<unsigned long long>(porHw),distintos,primero);
+            t.IsTrue(porHw>=11u,std::string("Los movimientos de canales van por hardware a ")+escala+"x ("+std::to_string(porHw)+")");
+            t.Equals(distintos,size_t(0),std::string("Canales idénticos a la ruta software a ")+escala+"x");
+        }
+    }
+
+    void gpuHwSpritesMatchSoftware(TestCase &t)
+    {
+        for(const char *escala : {"1","3"}) {
+            const auto soft=escenaSprites(false,escala);
+            const uint64_t antes=gowGsHwSprites();
+            const auto hw=escenaSprites(true,escala);
+            t.Equals(gowGsHwSprites()-antes,uint64_t(7u),std::string("Los siete sprites van por hardware a ")+escala+"x");
+            if(soft.size()!=hw.size() || soft.empty()) { t.Fail("Sin VRAM"); return; }
+            // A en el bloque 0 y B en el 1280: dos páginas de 64x32 cada uno.
+            size_t distintos=0, fuera=0; int maximo=0, primero=-1;
+            for(const size_t base : {size_t(0), size_t(1280u*256u)})
+                for(size_t i=base;i<base+2u*8192u;++i)
+                    if(soft[i]!=hw[i]) { ++distintos; const int d=std::abs(int(soft[i])-int(hw[i])); maximo=std::max(maximo,d); if(d>2){ ++fuera; if(primero<0) primero=int(i);} }
+            std::fprintf(stderr,"[prueba-hw-sprites] %sx: bytes distintos %zu, diferencia máxima %d, primero fuera %d\n",escala,distintos,maximo,primero);
+            t.Equals(fuera,size_t(0),std::string("Sprites: diferencias como mucho de 2 a ")+escala+"x (distintos "+std::to_string(distintos)+")");
+            size_t enB=0;
+            for(size_t i=1280u*256u;i<1280u*256u+2u*8192u;i+=4) enB+=(soft[i]|soft[i+1]<<8|soft[i+2]<<16)!=0u;
+            t.IsTrue(enB>3000u,"Las copias llegan a B ("+std::to_string(enB)+" píxeles)");
+        }
+    }
+
     // GOW-Port: manual GS 2.4.4/3.2.9: centro entero y lados superior/izquierdo incluidos.
     void triangleSampling(TestCase &t, GSRasterBackend &backend, unsigned fixture)
     {
@@ -658,7 +1268,8 @@ void register_ps2_gs_backend_tests()
                 std::vector<uint8_t> bytes(GSSwizzle::kMemorySize);GS gs;gs.init(bytes.data(),uint32_t(bytes.size()));
                 gs.setRasterBackend(std::make_unique<GSCpuBackend>());
                 gs.writeRegister(GS_REG_FRAME_1,1ull<<16);gs.writeRegister(GS_REG_SCISSOR_1,63ull<<16|63ull<<48);
-                gs.writeRegister(GS_REG_ZBUF_1,32);gs.writeRegister(GS_REG_TEST_1,1ull<<17);gs.writeRegister(GS_REG_RGBAQ,0x80332211u);
+                // GOW-Port: este fixture pretende escribir Z32; activar ZTE ademas de ZTST=ALWAYS.
+                gs.writeRegister(GS_REG_ZBUF_1,32);gs.writeRegister(GS_REG_TEST_1,(1ull<<16)|(1ull<<17));gs.writeRegister(GS_REG_RGBAQ,0x80332211u);
                 const uint64_t packet[]={1ull|(1ull<<15)|(1ull<<46)|(1ull<<60),5ull,0x0000001000000010ull,z};
                 const auto *data=reinterpret_cast<const uint8_t*>(packet);
                 if(native) t.IsTrue(gs.processNativePackedGIFPacket(data,sizeof(packet)),"Ruta nativa consume PACKED");
@@ -1201,22 +1812,49 @@ void register_ps2_gs_backend_tests()
                 t.Equals(GSSwizzle::LoadAt(f,a.data()+loc.byte,loc.shift),reads[i](b.data(),base,8,x,y),"Lectura del formato");
             }
         });
+        t.Run("presentation mailbox delivers each frame once",mailboxDeliversEachFrameOnce);
+        t.Run("CPU bilinear STQ quantizes signed coordinates before filtering",[](TestCase &t){
+            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSCpuBackend backend;
+            backend.Initialize(vram.data(),uint32_t(vram.size()));bilinearStqReference(t,backend);
+        });
+        t.Run("Threaded CPU bilinear STQ matches the external RGBA reference",[](TestCase &t){
+            std::vector<uint8_t> vram(GSSwizzle::kMemorySize);GSThreadedBackend backend(std::make_unique<GSCpuBackend>());
+            backend.Initialize(vram.data(),uint32_t(vram.size()));bilinearStqReference(t,backend);
+        });
         // GOW-Port: pruebas nativas opcionales; CI sin GPU prueba la cola y el fallback.
         const char *gpu=std::getenv("GOW_GS_GPU_TEST");
         if(gpu && *gpu && *gpu!='0')
         {
-            t.Run("OpenGL triangle depth keeps large-area precision independently of SSE",[](TestCase &t){
+            // GOW-Port: GOW_GS_GPU_TEST=<texto>: solo las pruebas de GPU con ese texto en el nombre (1: todas).
+            const bool todas=std::strcmp(gpu,"1")==0;
+            const auto correr=[&](const char *nombre,TestRunnerCallback fn){ if(todas || std::strstr(nombre,gpu)) t.Run(nombre,fn); };
+            correr("OpenGL sharp image shows every buffer line without anti-flicker",gpuSharpPresentation);
+            correr("OpenGL compute orders coordinate aliases from stride and VRAM wrap",[](TestCase &t){gpuCoordinateAliasing(t,false);});
+            correr("OpenGL hardware orders coordinate aliases from stride and VRAM wrap",[](TestCase &t){gpuCoordinateAliasing(t,true);});
+            correr("OpenGL bilinear STQ matches signed fixed-point filtering boundaries",[](TestCase &t){
+                for(bool hardware:{false,true}) {
+                    std::vector<uint8_t> vram(GSSwizzle::kMemorySize);auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
+                    raw->SetHardwareRasterAllowed(hardware);GSThreadedBackend backend(std::move(gpu));backend.Initialize(vram.data(),uint32_t(vram.size()));
+                    if(dynamic_cast<GSGpuBackend*>(&backend.Inner())!=raw || !raw->IsReady()){t.Fail("OpenGL requerido");return;}
+                    bilinearStqReference(t,backend,raw,hardware);
+                }
+            });
+            correr("OpenGL hardware triangle renderer matches the software path",gpuHwMatchesSoftware);
+            correr("OpenGL hardware sprites match the software path at 1x and 3x",gpuHwSpritesMatchSoftware);
+            correr("OpenGL hardware channel shuffles match the software path at 1x and 3x",gpuHwChannelsMatchSoftware);
+            correr("OpenGL hardware preserves thin subpixel triangle coverage and blending",uncoveredTriangles);
+            correr("OpenGL triangle depth keeps large-area precision independently of SSE",[](TestCase &t){
                 gpuTrianglePrecision(t,false);gpuTrianglePrecision(t,true);
             });
-            t.Run("OpenGL compute agrees with synthetic CPU fixture",[](TestCase &t){gpuComparison(t,false);});
-            t.Run("OpenGL hardware or compute fallback agrees with CPU fixture",[](TestCase &t){gpuComparison(t,true);});
-            t.Run("OpenGL CT24 and Z24 retain pixels across every upload byte cut",[](TestCase &t){
+            correr("OpenGL compute agrees with synthetic CPU fixture",[](TestCase &t){gpuComparison(t,false);});
+            correr("OpenGL hardware or compute fallback agrees with CPU fixture",[](TestCase &t){gpuComparison(t,true);});
+            correr("OpenGL CT24 and Z24 retain pixels across every upload byte cut",[](TestCase &t){
                 std::vector<uint8_t> vram(GSSwizzle::kMemorySize); auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();
                 GSThreadedBackend backend(std::move(gpu)); backend.Initialize(vram.data(),uint32_t(vram.size()));
                 if(dynamic_cast<GSGpuBackend *>(&backend.Inner())!=raw || !raw->IsReady()) {t.Fail("OpenGL requerido");return;}
                 transfer24Fragments(t,backend); transfer24Reset(t,backend);
             });
-            t.Run("OpenGL state handoff preserves a partial CT24 pixel",[](TestCase &t){
+            correr("OpenGL state handoff preserves a partial CT24 pixel",[](TestCase &t){
                 std::vector<uint8_t> vram(GSSwizzle::kMemorySize); auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();
                 GSThreadedBackend backend(std::move(gpu)); backend.Initialize(vram.data(),uint32_t(vram.size()));
                 if(dynamic_cast<GSGpuBackend *>(&backend.Inner())!=raw || !raw->IsReady()) {t.Fail("OpenGL requerido");return;}
@@ -1232,7 +1870,7 @@ void register_ps2_gs_backend_tests()
                     t.Equals(backend.GetTransferSnapshot().direction,3u,"La transferencia importada termina");
                 }
             });
-            t.Run("OpenGL compute and hardware follow GS sprite sampling rules",[](TestCase &t){
+            correr("OpenGL compute and hardware follow GS sprite sampling rules",[](TestCase &t){
                 for(const bool hardware : {false,true}) {
                     std::vector<uint8_t> vram(GSSwizzle::kMemorySize); auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();
                     raw->SetHardwareRasterAllowed(hardware); GSThreadedBackend backend(std::move(gpu));
@@ -1241,7 +1879,7 @@ void register_ps2_gs_backend_tests()
                     for(unsigned fixture=0;fixture<4u;++fixture) spriteSampling(t,backend,fixture);
                 }
             });
-            t.Run("OpenGL compute and hardware preserve constant triangle RGBA and FOG",[](TestCase &t){
+            correr("OpenGL compute and hardware preserve constant triangle RGBA and FOG",[](TestCase &t){
                 for(const bool hardware:{false,true}){
                     std::vector<uint8_t> vram(GSSwizzle::kMemorySize);auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
                     raw->SetHardwareRasterAllowed(hardware);GSThreadedBackend backend(std::move(gpu));backend.Initialize(vram.data(),uint32_t(vram.size()));
@@ -1249,7 +1887,7 @@ void register_ps2_gs_backend_tests()
                     triangleConstants(t,backend,false);triangleConstants(t,backend,true);
                 }
             });
-            t.Run("OpenGL compute and hardware preserve constant triangle UV and STQ",[](TestCase &t){
+            correr("OpenGL compute and hardware preserve constant triangle UV and STQ",[](TestCase &t){
                 for(const bool hardware:{false,true}){
                     std::vector<uint8_t> vram(GSSwizzle::kMemorySize);auto gpu=std::make_unique<GSGpuBackend>();auto *raw=gpu.get();
                     raw->SetHardwareRasterAllowed(hardware);GSThreadedBackend backend(std::move(gpu));backend.Initialize(vram.data(),uint32_t(vram.size()));
@@ -1257,7 +1895,7 @@ void register_ps2_gs_backend_tests()
                     triangleTextureConstants(t,backend,true);triangleTextureConstants(t,backend,false);
                 }
             });
-            t.Run("OpenGL compute and hardware follow GS triangle sampling rules",[](TestCase &t){
+            correr("OpenGL compute and hardware follow GS triangle sampling rules",[](TestCase &t){
                 for(const bool hardware : {false,true}) {
                     std::vector<uint8_t> vram(GSSwizzle::kMemorySize); auto gpu=std::make_unique<GSGpuBackend>(); auto *raw=gpu.get();
                     raw->SetHardwareRasterAllowed(hardware); GSThreadedBackend backend(std::move(gpu));

@@ -8,7 +8,7 @@ Generado por `tools/estado/generar.py` a partir de `docs/estado/datos.toml` y `c
 
 | Librería | Funciones | Estado | Nota |
 |---|---:|---|---|
-| `libmpeg` | 103 | 🔧 Parcial | La intro FMV se decodifica por software y se presenta sin GOW_SKIP_FMV; falta verificar el resto de vídeos |
+| `libmpeg` | 103 | 🔧 Parcial | La intro FMV se reproduce entera (imagen, sonido por ADMA y fin con sceMpegIsEnd) y pasa al juego; falta verificar el resto de vídeos |
 | `libipu` | 5 | 🔧 Parcial | sceIpuInit corregido; la ruta MPEG por software funciona, sin verificar todas las operaciones de la IPU |
 | `libgraph` | 7 | ✅ Funciona |  |
 | `libdma` | 8 | ✅ Funciona |  |
@@ -43,7 +43,7 @@ Generado por `tools/estado/generar.py` a partir de `docs/estado/datos.toml` y `c
 | GS / VU | GIF (PATH1-3) | 2 | ✅ Funciona |  |
 | GS / VU | IPU: vídeo FMV | 2 | 🔧 Parcial | La intro FMV funciona por decodificación MPEG por software; no demuestra emulación completa del hardware IPU |
 | IOP | CPU R3000A (intérprete) | 3 | ✅ Funciona | Planificador ocioso de Opus integrado y validado con GS/VU1: recuerda el próximo despertar; su perfil reduce IOP de ~1300–1500 a ~570–650 ms cada 5 s; falta una comparación de FPS sin compilaciones concurrentes |
-| IOP | SPU2: salida de audio | 3 | 🔧 Parcial | Bancos cargados y sonido continuo en tiempo emulado verificados; a ~2 fps se oye entrecortado; faltan reverb y ADMA |
+| IOP | SPU2: salida de audio | 3 | 🔧 Parcial | Bancos cargados y sonido continuo en tiempo emulado verificados; a ~2 fps se oye entrecortado; ADMA (sonido de los vídeos) emulado; falta reverb |
 | IOP | Módulos IRX originales | 2 | ✅ Funciona |  |
 | IOP | SIF: RPC y DMA EE ↔ IOP | 2 | ✅ Funciona |  |
 | IOP | CDVD: lectura de la ISO original | 2 | ✅ Funciona |  |

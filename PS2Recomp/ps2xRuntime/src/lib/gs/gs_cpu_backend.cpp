@@ -89,10 +89,13 @@ namespace
         switch (psm)
         {
         case GS_PSM_CT24:
+        case GS_PSM_Z24: // GOW-Port: el alias depth usa la misma expansión TEXA.
             a = (texa.aem && rgbZero) ? 0u : texa.ta0;
             break;
         case GS_PSM_CT16:
         case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S: // GOW-Port: TA0/TA1/AEM también al muestrear profundidad.
             if ((a & 0x80u) != 0u)
                 a = texa.ta1;
             else
@@ -1057,10 +1060,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
 
     if (state.prim.fge)
     {
-        const uint32_t inverseFog = 255u - fog;
+        const uint32_t inverseFog = 256u - fog; // GOW-Port: pesos de niebla suman 256.
         auto applyFog = [&](uint8_t input, uint8_t fogColor) -> uint8_t
         {
-            return static_cast<uint8_t>(((static_cast<uint32_t>(fog) * input) >> 8) + ((inverseFog * fogColor) >> 8));
+            // GOW-Port: sumar antes de truncar conserva el color cuando input == fogColor.
+            return static_cast<uint8_t>((static_cast<uint32_t>(fog) * input + inverseFog * fogColor) >> 8);
         };
 
         r = applyFog(r, state.fogR);
@@ -1080,7 +1084,9 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         return;
     }
 
-    const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+    // GOW-Port: ZTE=0 ignora ZTST y tampoco escribe profundidad.
+    const bool ztestEnabled = (ctx.test & 0x10000u) != 0u;
+    const uint32_t ztestMethod = ztestEnabled ? static_cast<uint32_t>((ctx.test >> 17) & 3u) : 1u;
     const bool alphaBlendEnabled = state.prim.abe;
     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
     const bool destinationAlphaTestNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
@@ -1171,9 +1177,14 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
                 int cAlpha = (csel == 0) ? a : (csel == 1) ? da
                                                            : fix;
 
-                r = clampU8(((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr));
-                g = clampU8(((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg));
-                b = clampU8(((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db));
+                // GOW-Port: COLCLAMP=0 envuelve el resultado de ALPHA a ocho bits,
+                // incluidos negativos, como GSRendererSW original y el backend GLSL.
+                const auto outputChannel = [&](int value) -> uint8_t {
+                    return (state.colclamp & 1u) ? clampU8(value) : static_cast<uint8_t>(value);
+                };
+                r = outputChannel(((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr));
+                g = outputChannel(((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg));
+                b = outputChannel(((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db));
             }
             else
             {
@@ -1209,7 +1220,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel);
     }
 
-    if (writeMask.writeDepth && !ctx.zbuf.zmask)
+    if (writeMask.writeDepth && ztestEnabled && !ctx.zbuf.zmask)
     {
         WriteVramUnlocked(zpsm, zbp, fbw, x, y, z);
     }
@@ -1316,18 +1327,18 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         return 0xFFFF00FFu;
     };
 
+    // GOW-Port: ambos filtros convierten STQ a 16.16 (PCSX2 v2.8.2 SW).
+    // En bilinear, truncar ANTES de restar medio texel conserva los pesos signed.
+    const float fixedU = std::trunc(texUf * 65536.0f);
+    const float fixedV = std::trunc(texVf * 65536.0f);
     if (!state.linearFilter)
     {
-        // GOW-Port: STQ pasa por 16.16 antes de elegir el texel (PCSX2 v2.8.2 SW).
-        // Truncar directo a entero pierde negativos; floor directo falla cerca de cero.
-        const float fixedU = std::trunc(texUf * 65536.0f);
-        const float fixedV = std::trunc(texVf * 65536.0f);
         return samplePoint(static_cast<int>(std::floor(fixedU / 65536.0f)),
                            static_cast<int>(std::floor(fixedV / 65536.0f)));
     }
 
-    const float sampleU = texUf - 0.5f;
-    const float sampleV = texVf - 0.5f;
+    const float sampleU = fixedU / 65536.0f - 0.5f;
+    const float sampleV = fixedV / 65536.0f - 0.5f;
     const int u0 = static_cast<int>(std::floor(sampleU));
     const int v0 = static_cast<int>(std::floor(sampleV));
     const int u1 = u0 + 1;

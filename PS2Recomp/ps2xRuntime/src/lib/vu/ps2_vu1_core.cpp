@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cfenv>
+#include <xmmintrin.h> // GOW-Port: _mm_getcsr / _mm_setcsr (modo rápido de VU1)
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -14,8 +15,19 @@
 #include <filesystem>
 #include <limits>
 #include <string>
+#include <chrono>
+#include <array>
+#include <unordered_map>
+#include <vector>
 #include <ps2_log.h>
+
 #include "runtime/ps2_perf.h"
+
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+// GOW-Port: MAC perezoso del modo rápido (ps2_vu1_step.inl).
+Vu1MacRapido g_vu1MacRapido;
+void vu1RapidoResolverMac(uint32_t &mac, uint64_t ciclo) { vu1RapidoResolverMacT(mac, ciclo); }
+#endif
 
 namespace
 {
@@ -92,6 +104,13 @@ void VU1Interpreter::setDirectRegisterWrites(bool enabled)
 void VU1Interpreter::resetScheduler()
 {
     commitReadyFlags(); // GOW-Port: las ya listas se habrían confirmado en su ciclo
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+    if (m_unit == Unit::VU1)
+    {
+        vu1RapidoResolverMacT(m_state.mac, m_cycle); // lo mismo con el MAC perezoso
+        g_vu1MacRapido = {};
+    }
+#endif
     m_nextCommitCycle = ~0ull;
     m_flagPipeline = {};
     m_fdiv = {};
@@ -908,7 +927,13 @@ void VU1Interpreter::commitReadyPipelines()
             m_flagHead = (m_flagHead + 1u) % kMaxFlagEntries;
             --m_flagCount;
             if (entry.writesMac)
+            {
                 m_state.mac = entry.mac;
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+                if (m_unit == Unit::VU1)
+                    g_vu1MacRapido.listoPrincipal = entry.readyCycle;
+#endif
+            }
             if (entry.writesStatus)
             {
                 const uint32_t current = entry.status & 0xFu;
@@ -940,7 +965,13 @@ void VU1Interpreter::commitReadyPipelines()
         --m_flagCount;
 
         if (entry.writesMac)
+        {
             m_state.mac = entry.mac;
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+            if (m_unit == Unit::VU1)
+                g_vu1MacRapido.listoPrincipal = entry.readyCycle;
+#endif
+        }
         if (entry.writesStatus)
         {
             const uint32_t current = entry.status & 0xFu;
@@ -1374,7 +1405,13 @@ void VU1Interpreter::commitReadyFlags()
         m_flagHead = (m_flagHead + 1u) % kMaxFlagEntries;
         --m_flagCount;
         if (entry.writesMac)
+        {
             m_state.mac = entry.mac;
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+            if (m_unit == Unit::VU1)
+                g_vu1MacRapido.listoPrincipal = entry.readyCycle;
+#endif
+        }
         if (entry.writesStatus)
         {
             const uint32_t current = entry.status & 0xFu;
@@ -1938,12 +1975,87 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
     m_stopRequested = true;
 }
 
+namespace
+{
+    // GOW-Port: GOW_VU1_DEPS=1 (con GOW_VU1_SIN_COMPILAR=1, solo el intérprete): ¿depende cada programa de VU1 del
+    // anterior? Por ejecución, registros leídos antes de escribirlos (vienen del programa anterior) y lecturas de
+    // memoria de VU que escribió otro programa (no el VIF, que se detecta comparando la memoria con la del final
+    // del programa anterior). Por segundo imprime cuántas ejecuciones dependen y de qué.
+    struct DepsVu1
+    {
+        uint32_t idEjecucion = 0;
+        uint32_t entrada = 0;
+        bool enCurso = false;
+        std::array<uint8_t, 32> escritosVf{}; // carriles escritos de cada VF
+        uint32_t escritosVi = 0, vivosVf = 0, vivosVi = 0;
+        bool escAcc = false, escQ = false, escP = false, escI = false, escClip = false;
+        bool vivAcc = false, vivQ = false, vivP = false, vivI = false, vivClip = false;
+        bool depMem = false;
+        uint32_t distMin = 0xFFFFFFFFu; // ejecuciones hacia atrás hasta la dependencia más cercana
+        std::array<uint32_t, 32> escritorVf{}; // ejecución que escribió cada VF / VI por última vez
+        std::array<uint32_t, 16> escritorVi{};
+        std::array<uint64_t, 6> histDist{}; // 1, 2, 3-4, 5-16, >16, solo VIF/inicial
+        std::vector<uint32_t> escritor = std::vector<uint32_t>(1024u, 0u); // qword -> ejecución que lo escribió
+        std::vector<uint8_t> copia = std::vector<uint8_t>(16384u, 0u);
+        // por segundo
+        uint64_t ejecuciones = 0, conRegs = 0, conMem = 0, independientes = 0;
+        std::array<uint64_t, 32> vfVeces{};
+        std::array<uint64_t, 16> viVeces{};
+        uint64_t accVeces = 0, qVeces = 0, pVeces = 0, iVeces = 0, clipVeces = 0;
+        std::unordered_map<uint32_t, std::array<uint64_t, 3>> porEntrada;
+        std::chrono::steady_clock::time_point inicio = std::chrono::steady_clock::now();
+    };
+    bool depsVu1Activo()
+    {
+        static const bool on = [] { const char *v = std::getenv("GOW_VU1_DEPS"); return v && v[0] == '1'; }();
+        return on;
+    }
+    DepsVu1 &depsVu1()
+    {
+        static DepsVu1 d;
+        return d;
+    }
+    // Opcodes superiores (bits 5:0, o el especial ((upper >> 6) & 0x1F) << 2 | (upper & 3)) que leen I o Q.
+    bool upperLeeI(uint32_t upper)
+    {
+        const uint32_t op = upper & 0x3Fu;
+        const uint32_t codigo = (op & 0x3Cu) == 0x3Cu ? ((((upper >> 6) & 0x1Fu) << 2) | (upper & 3u)) : op;
+        const bool especial = (op & 0x3Cu) == 0x3Cu;
+        if (codigo == 0x1Eu || codigo == 0x22u || codigo == 0x23u || codigo == 0x26u || codigo == 0x27u)
+            return true;
+        return !especial && (codigo == 0x1Du || codigo == 0x1Fu);
+    }
+    bool upperLeeQ(uint32_t upper)
+    {
+        const uint32_t op = upper & 0x3Fu;
+        const uint32_t codigo = (op & 0x3Cu) == 0x3Cu ? ((((upper >> 6) & 0x1Fu) << 2) | (upper & 3u)) : op;
+        return codigo == 0x1Cu || codigo == 0x20u || codigo == 0x21u || codigo == 0x24u || codigo == 0x25u;
+    }
+}
+
 void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint8_t *vuData, uint32_t dataSize,
                              GS &gs, PS2Memory *memory,
                              uint32_t startPC, uint32_t top, uint32_t itop,
                              uint32_t maxCycles)
 {
+    if (m_unit == Unit::VU1 && depsVu1Activo() && vuData && dataSize >= 16384u)
+    {
+        DepsVu1 &d = depsVu1();
+        // Lo que ha cambiado desde el final del programa anterior lo ha escrito el VIF.
+        for (uint32_t q = 0; q < 1024u; ++q)
+            if (std::memcmp(vuData + q * 16u, d.copia.data() + q * 16u, 16u) != 0)
+                d.escritor[q] = 0u;
+        ++d.idEjecucion;
+        d.entrada = startPC & microAddressMask();
+        d.enCurso = true;
+        d.escritosVf.fill(0u);
+        d.escritosVi = d.vivosVf = d.vivosVi = 0u;
+        d.escAcc = d.escQ = d.escP = d.escI = d.escClip = false;
+        d.vivAcc = d.vivQ = d.vivP = d.vivI = d.vivClip = false;
+        d.depMem = false;
+        d.distMin = 0xFFFFFFFFu;
+    }
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
     m_state.ebit = false;
@@ -1971,10 +2083,58 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
+namespace
+{
+    // GOW-Port: GOW_VU1_PERFIL=1: por segundo, ejecuciones de VU1 (programas o reanudaciones), ciclos de VU,
+    // cortes por presupuesto y las entradas (PC) que más ciclos se llevan, con su coste medio.
+    struct PerfilVu1
+    {
+        struct Entrada { uint64_t veces = 0, ciclos = 0, ns = 0; };
+        std::unordered_map<uint32_t, Entrada> porPc;
+        uint64_t ejecuciones = 0, ciclos = 0, ns = 0, cortes = 0;
+        std::chrono::steady_clock::time_point inicio = std::chrono::steady_clock::now();
+    };
+    bool perfilVu1Activo()
+    {
+        static const bool on = [] { const char *v = std::getenv("GOW_VU1_PERFIL"); return v && v[0] == '1'; }();
+        return on;
+    }
+    void perfilVu1Anotar(uint32_t pc, uint64_t ciclos, uint64_t ns, bool corte)
+    {
+        static PerfilVu1 p;
+        PerfilVu1::Entrada &e = p.porPc[pc];
+        ++e.veces;
+        e.ciclos += ciclos;
+        e.ns += ns;
+        ++p.ejecuciones;
+        p.ciclos += ciclos;
+        p.ns += ns;
+        p.cortes += corte ? 1u : 0u;
+        const auto ahora = std::chrono::steady_clock::now();
+        if (ahora - p.inicio < std::chrono::seconds(1))
+            return;
+        std::vector<std::pair<uint32_t, PerfilVu1::Entrada>> orden(p.porPc.begin(), p.porPc.end());
+        std::sort(orden.begin(), orden.end(), [](const auto &a, const auto &b) { return a.second.ciclos > b.second.ciclos; });
+        std::fprintf(stderr, "[vu1-perfil] ejecuciones=%llu ciclos=%llu ms=%.1f cortes=%llu entradas=%zu top:",
+                     static_cast<unsigned long long>(p.ejecuciones), static_cast<unsigned long long>(p.ciclos), p.ns / 1e6,
+                     static_cast<unsigned long long>(p.cortes), orden.size());
+        for (size_t i = 0; i < orden.size() && i < 8u; ++i)
+            std::fprintf(stderr, " %04x:%llux%llu(%.0f%%)", orden[i].first, static_cast<unsigned long long>(orden[i].second.veces),
+                         static_cast<unsigned long long>(orden[i].second.ciclos / std::max<uint64_t>(1u, orden[i].second.veces)),
+                         100.0 * static_cast<double>(orden[i].second.ciclos) / static_cast<double>(std::max<uint64_t>(1u, p.ciclos)));
+        std::fputc('\n', stderr);
+        p = PerfilVu1{};
+    }
+}
+
 void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
+    const bool perfil = m_unit == Unit::VU1 && perfilVu1Activo();
+    const uint32_t perfilPc = m_state.pc;
+    const uint64_t perfilCiclo = m_cycle;
+    const auto perfilInicio = perfil ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     m_activeVuData = vuData;
     m_activeVuDataSize = dataSize;
     m_activeGs = &gs;
@@ -1983,6 +2143,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     ps2_perf::Scope perf(ps2_perf::Bucket::Vu); // GOW-Port: VU0/VU1; las llamadas al GS se descuentan.
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO && (defined(__SSE__) || defined(_M_X64))
+    // GOW-Port: modo rápido (ps2_vu1_compiled.inl): DAZ y FTZ mientras corre VU1, como PCSX2. Los subnormales
+    // valen cero en los operandos y en los resultados (la PS2 no tiene subnormales).
+    const unsigned int previousCsr = _mm_getcsr();
+    if (m_unit == Unit::VU1)
+        _mm_setcsr(previousCsr | 0x8040u);
+#endif
     StepContext context{vuCode, codeSize, vuData, dataSize, &gs, memory, m_cycle + maxCycles, false};
     m_lastRunHitBudget = false; // GOW-Port: funciona también con un despachador compilado.
     if (CompiledProgramFn program = compiledProgramFor(vuCode, codeSize, memory))
@@ -1993,6 +2160,67 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
     const bool programEnded = context.programEnded;
 
+    if (programEnded && m_unit == Unit::VU1 && depsVu1Activo() && depsVu1().enCurso && vuData && dataSize >= 16384u)
+    {
+        DepsVu1 &d = depsVu1();
+        d.enCurso = false;
+        std::memcpy(d.copia.data(), vuData, 16384u);
+        const bool regs = d.vivosVf != 0u || d.vivosVi != 0u || d.vivAcc || d.vivQ || d.vivP || d.vivI || d.vivClip;
+        ++d.ejecuciones;
+        d.conRegs += regs ? 1u : 0u;
+        d.conMem += d.depMem ? 1u : 0u;
+        d.independientes += (!regs && !d.depMem) ? 1u : 0u;
+        const uint32_t dm = d.distMin;
+        ++d.histDist[dm == 0xFFFFFFFFu ? 5u : dm <= 1u ? 0u : dm == 2u ? 1u : dm <= 4u ? 2u : dm <= 16u ? 3u : 4u];
+        for (uint32_t r = 1; r < 32u; ++r)
+            d.vfVeces[r] += (d.vivosVf >> r) & 1u;
+        for (uint32_t r = 1; r < 16u; ++r)
+            d.viVeces[r] += (d.vivosVi >> r) & 1u;
+        d.accVeces += d.vivAcc;
+        d.qVeces += d.vivQ;
+        d.pVeces += d.vivP;
+        d.iVeces += d.vivI;
+        d.clipVeces += d.vivClip;
+        auto &e = d.porEntrada[d.entrada];
+        ++e[0];
+        e[1] += regs ? 1u : 0u;
+        e[2] += d.depMem ? 1u : 0u;
+        if (std::chrono::steady_clock::now() - d.inicio >= std::chrono::seconds(1))
+        {
+            std::fprintf(stderr, "[vu1-deps] ejecuciones=%llu independientes=%llu con_registros=%llu con_memoria=%llu "
+                                 "distancia[1]=%llu [2]=%llu [3-4]=%llu [5-16]=%llu [>16]=%llu [ninguna]=%llu | vf:",
+                         static_cast<unsigned long long>(d.ejecuciones), static_cast<unsigned long long>(d.independientes),
+                         static_cast<unsigned long long>(d.conRegs), static_cast<unsigned long long>(d.conMem),
+                         static_cast<unsigned long long>(d.histDist[0]), static_cast<unsigned long long>(d.histDist[1]),
+                         static_cast<unsigned long long>(d.histDist[2]), static_cast<unsigned long long>(d.histDist[3]),
+                         static_cast<unsigned long long>(d.histDist[4]), static_cast<unsigned long long>(d.histDist[5]));
+            for (uint32_t r = 1; r < 32u; ++r)
+                if (d.vfVeces[r] != 0u)
+                    std::fprintf(stderr, " %u=%llu", r, static_cast<unsigned long long>(d.vfVeces[r]));
+            std::fprintf(stderr, " vi:");
+            for (uint32_t r = 1; r < 16u; ++r)
+                if (d.viVeces[r] != 0u)
+                    std::fprintf(stderr, " %u=%llu", r, static_cast<unsigned long long>(d.viVeces[r]));
+            std::fprintf(stderr, " acc=%llu q=%llu p=%llu i=%llu clip=%llu | entradas:", static_cast<unsigned long long>(d.accVeces),
+                         static_cast<unsigned long long>(d.qVeces), static_cast<unsigned long long>(d.pVeces),
+                         static_cast<unsigned long long>(d.iVeces), static_cast<unsigned long long>(d.clipVeces));
+            for (const auto &[pc, v] : d.porEntrada)
+                std::fprintf(stderr, " %04x=%llu/%llu/%llu", pc, static_cast<unsigned long long>(v[0]),
+                             static_cast<unsigned long long>(v[1]), static_cast<unsigned long long>(v[2]));
+            std::fputc('\n', stderr);
+            const auto copia = std::move(d.copia);
+            const auto escritor = std::move(d.escritor);
+            const uint32_t id = d.idEjecucion;
+            const auto escVf = d.escritorVf;
+            const auto escVi = d.escritorVi;
+            d = DepsVu1{};
+            d.copia = std::move(copia);
+            d.escritor = std::move(escritor);
+            d.idEjecucion = id;
+            d.escritorVf = escVf;
+            d.escritorVi = escVi;
+        }
+    }
     if (programEnded)
     {
         flushPipelines();
@@ -2004,9 +2232,22 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_lastRunHitBudget = !programEnded && !m_stopRequested && m_cycle >= context.budgetEnd; // GOW-Port
     xgkickAdvanceTo(m_cycle); // GOW-Port: PATH1 al día tras la ejecución (si se cortó por presupuesto)
     commitReadyFlags(); // GOW-Port: el estado visible tras la ejecución
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
+    if (m_unit == Unit::VU1)
+        vu1RapidoResolverMacT(m_state.mac, m_cycle);
+#endif
     m_state.cycles = m_cycle;
+    if (perfil)
+        perfilVu1Anotar(perfilPc, m_cycle - perfilCiclo,
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - perfilInicio).count()),
+                        m_lastRunHitBudget);
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
+#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO && (defined(__SSE__) || defined(_M_X64))
+    if (m_unit == Unit::VU1)
+        _mm_setcsr((_mm_getcsr() & ~0x8040u) | (previousCsr & 0x8040u));
+#endif
 }
 
 bool VU1Interpreter::stepInterpreted(StepContext &context)
@@ -2021,6 +2262,109 @@ bool VU1Interpreter::stepInterpreted(StepContext &context)
     {
         reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
         return false;
+    }
+    if (m_unit == Unit::VU1 && depsVu1Activo() && depsVu1().enCurso)
+    {
+        DepsVu1 &d = depsVu1();
+        // Lecturas (superior e inferior leen a la vez, antes de escribir).
+        const auto leerVf = [&](const VfAccess &a)
+        {
+            if (a.reg != 0u && (a.lanes & ~d.escritosVf[a.reg & 31u]) != 0u)
+            {
+                d.vivosVf |= 1u << a.reg;
+                if (d.escritorVf[a.reg & 31u] != 0u)
+                    d.distMin = std::min(d.distMin, d.idEjecucion - d.escritorVf[a.reg & 31u]);
+            }
+        };
+        for (const InstructionUsage *u : {&decoded.upperUsage, &decoded.lowerUsage})
+        {
+            if (!decoded.iBit || u == &decoded.upperUsage)
+            {
+                for (uint32_t r = 0; r < u->vfReadCount && r < 2u; ++r)
+                    leerVf(u->vfRead[r]);
+                const uint32_t viVivos = u->viRead & 0xFFFEu & ~d.escritosVi;
+                d.vivosVi |= viVivos;
+                for (uint32_t r = 1; r < 16u; ++r)
+                    if (((viVivos >> r) & 1u) != 0u && d.escritorVi[r] != 0u)
+                        d.distMin = std::min(d.distMin, d.idEjecucion - d.escritorVi[r]);
+                if (u->accRead && !d.escAcc)
+                    d.vivAcc = true;
+                if (u->waitP && !d.escP)
+                    d.vivP = true;
+                if (u->readsClip && !d.escClip)
+                    d.vivClip = true;
+            }
+        }
+        if (upperLeeI(decoded.upper) && !d.escI)
+            d.vivI = true;
+        if (upperLeeQ(decoded.upper) && !d.escQ)
+            d.vivQ = true;
+        // Memoria: dirección del acceso del inferior con los VI de antes de ejecutarlo.
+        if (!decoded.iBit && context.vuData && context.dataSize >= 16384u)
+        {
+            const uint32_t ins = decoded.lower;
+            const uint32_t opHi = (ins >> 25) & 0x7Fu;
+            const uint32_t viT = (ins >> 16) & 0x1Fu, viS = (ins >> 11) & 0x1Fu;
+            const int32_t imm11 = static_cast<int32_t>(ins << 21) >> 21;
+            int32_t leida = -1, escrita = -1;
+            const auto vi = [&](uint32_t r) { return static_cast<int32_t>(m_state.vi[r & 15u]); };
+            if (opHi == 0x00u || opHi == 0x04u)
+                leida = vi(viS) + imm11;
+            else if (opHi == 0x01u)
+                escrita = vi(viT) + imm11;
+            else if (opHi == 0x05u)
+                escrita = vi(viS) + imm11;
+            else if (opHi == 0x40u && (ins & 0x3Cu) == 0x3Cu)
+            {
+                const uint32_t f2 = (ins & 3u) | ((ins >> 4) & 0x7Cu);
+                if (f2 == 0x34u || f2 == 0x3Eu)
+                    leida = static_cast<uint16_t>(vi(viS));
+                else if (f2 == 0x36u)
+                    leida = static_cast<uint16_t>(vi(viS) - 1);
+                else if (f2 == 0x35u)
+                    escrita = static_cast<uint16_t>(vi(viT));
+                else if (f2 == 0x37u)
+                    escrita = static_cast<uint16_t>(vi(viT) - 1);
+                else if (f2 == 0x3Fu)
+                    escrita = static_cast<uint16_t>(vi(viS));
+            }
+            if (leida != -1)
+            {
+                const uint32_t q = static_cast<uint32_t>(leida) & 1023u;
+                if (d.escritor[q] != 0u && d.escritor[q] != d.idEjecucion)
+                {
+                    d.depMem = true;
+                    d.distMin = std::min(d.distMin, d.idEjecucion - d.escritor[q]);
+                }
+            }
+            if (escrita != -1)
+                d.escritor[static_cast<uint32_t>(escrita) & 1023u] = d.idEjecucion;
+        }
+        // Escrituras.
+        for (const InstructionUsage *u : {&decoded.upperUsage, &decoded.lowerUsage})
+        {
+            if (decoded.iBit && u == &decoded.lowerUsage)
+                continue;
+            if (u->vfWrite.reg != 0u)
+            {
+                d.escritosVf[u->vfWrite.reg & 31u] |= u->vfWrite.lanes;
+                d.escritorVf[u->vfWrite.reg & 31u] = d.idEjecucion;
+            }
+            d.escritosVi |= u->viWrite & 0xFFFEu;
+            for (uint32_t r = 1; r < 16u; ++r)
+                if (((u->viWrite >> r) & 1u) != 0u)
+                    d.escritorVi[r] = d.idEjecucion;
+            if (u->accWrite)
+                d.escAcc = true;
+            if (u->writesClip)
+                d.escClip = true;
+        }
+        if (!decoded.iBit && decoded.lowerUsage.pipeline == PipelineFdiv && !decoded.lowerUsage.waitQ)
+            d.escQ = true;
+        if (!decoded.iBit && decoded.lowerUsage.pipeline == PipelineEfu)
+            d.escP = true;
+        if (decoded.iBit)
+            d.escI = true;
     }
     return stepPair(decoded, context);
 }

@@ -7,7 +7,9 @@
 #include "ThreadPriority.h"
 #include "ThreadNaming.h"
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <algorithm>
 #include <cstdlib>
@@ -67,6 +69,10 @@ namespace
     std::atomic<bool> g_presentMailbox{false};
     std::mutex g_mailboxMutex;
     PresentationFrame g_mailboxFrame;
+    // GOW-Port: número del cuadro del buzón y del último entregado al hilo principal. Si no cambió, Present no copia
+    // el cuadro otra vez (con resolución interna son varios MB por VSync).
+    uint64_t g_mailboxSequence = 0u;
+    uint64_t g_mailboxDelivered = 0u;
 }
 
 bool gowGsPresentMailboxActive()
@@ -74,11 +80,23 @@ bool gowGsPresentMailboxActive()
     return g_presentMailbox.load(std::memory_order_relaxed);
 }
 
+uint64_t gowGsPresentMailboxDelivered()
+{
+    std::lock_guard<std::mutex> lock(g_mailboxMutex);
+    return g_mailboxDelivered;
+}
+
 GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
     : m_inner(std::move(inner))
 {
-    if (const char *mailbox = std::getenv("PS2X_GS_PRESENT_BUZON"); mailbox && mailbox[0] == '1' && !GSSharedPresent::Active())
-        g_presentMailbox.store(true, std::memory_order_relaxed);
+    // GOW-Port: el buzón se decide en cada backend (uno por proceso) y empieza vacío.
+    {
+        const char *mailbox = std::getenv("PS2X_GS_PRESENT_BUZON");
+        std::lock_guard<std::mutex> lock(g_mailboxMutex);
+        g_presentMailbox.store(mailbox && mailbox[0] == '1' && !GSSharedPresent::Active(), std::memory_order_relaxed);
+        g_mailboxFrame = {};
+        g_mailboxSequence = g_mailboxDelivered = 0u;
+    }
     const char *compact = std::getenv("PS2X_GS_COMPACT_QUEUE");
     m_compactQueue = !compact || *compact != '0';
     if (const char *limit = std::getenv("PS2X_GS_QUEUE_CHUNKS"))
@@ -251,12 +269,42 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
     const uint8_t *data = chunk.data();
     const size_t size = chunk.size();
     size_t offset = 0u;
+    // GOW-Port: PS2X_GS_OP_PROF=1: tiempo del hilo del GS por tipo de comando (cada 5 s).
+    static const bool opProf = [] { const char *v = std::getenv("PS2X_GS_OP_PROF"); return v && v[0] == '1'; }();
+    static std::array<double, 12> opMs{};
+    static std::array<uint64_t, 12> opCount{};
+    static auto opReport = std::chrono::steady_clock::now();
     while (offset + 5u <= size)
     {
         const Op op = static_cast<Op>(data[offset]);
         const uint32_t length = readAt<uint32_t>(data + offset + 1u);
         const uint8_t *payload = data + offset + 5u;
         offset += 5u + length;
+        const auto opStart = opProf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        struct OpTimer
+        {
+            bool on; Op op; std::chrono::steady_clock::time_point start;
+            ~OpTimer()
+            {
+                if (!on || static_cast<size_t>(op) >= opMs.size())
+                    return;
+                const auto now = std::chrono::steady_clock::now();
+                opMs[static_cast<size_t>(op)] += std::chrono::duration<double, std::milli>(now - start).count();
+                ++opCount[static_cast<size_t>(op)];
+                if (now - opReport < std::chrono::seconds(5))
+                    return;
+                static const char *kNames[12] = {"mxcsr", "submit", "clut", "transfer", "upload", "texflush",
+                                                 "writevram", "sync", "present", "drawstate", "vertices", "call"};
+                std::fprintf(stderr, "[gs-op-prof]");
+                for (size_t i = 0; i < opMs.size(); ++i)
+                    if (opCount[i])
+                        std::fprintf(stderr, " %s %.0fms/%llu", kNames[i], opMs[i], static_cast<unsigned long long>(opCount[i]));
+                std::fprintf(stderr, "\n");
+                opMs.fill(0.0);
+                opCount.fill(0u);
+                opReport = now;
+            }
+        } opTimer{opProf, op, opStart};
         switch (op)
         {
         case Op::Mxcsr:
@@ -306,6 +354,7 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
                 {
                     std::lock_guard<std::mutex> lock(g_mailboxMutex);
                     g_mailboxFrame = std::move(frame);
+                    ++g_mailboxSequence;
                 }
             }
             else
@@ -421,6 +470,9 @@ PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &reques
             PublishLocked();
         }
         std::lock_guard<std::mutex> lock(g_mailboxMutex);
+        if (g_mailboxDelivered != 0u && g_mailboxDelivered == g_mailboxSequence)
+            return {}; // el mismo cuadro: el frontend conserva el que ya tiene (gowGsPresentMailboxDelivered)
+        g_mailboxDelivered = g_mailboxSequence;
         return g_mailboxFrame; // copia: el último cuadro sigue disponible para el siguiente VSync
     }
     PresentationFrame frame;

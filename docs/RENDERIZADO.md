@@ -1156,3 +1156,247 @@ usa el estado de la primera primitiva de cada variante; compute, el del primer
 estado del lote. No constituyen atribución por primitiva. El profiler espera
 los resultados de las consultas y altera el ritmo del juego: debe desactivarse
 al medir FPS. El arreglo mejora el diagnóstico, sin acreditar más rendimiento.
+
+## Resolución interna (supermuestreo)
+
+`PS2X_GS_ESCALA=S` (1..8, 1 por defecto) dibuja el GS a S× sobre S² planos de VRAM (4 MB + 512 páginas de 8 KB de
+copia cada uno, en un único SSBO). Es el esquema de paraLLEl-GS: el plano `k` muestrea en el desplazamiento
+`((k % S)·16/S, (k / S)·16/S)` en dieciseisavos de píxel.
+
+- Subidas, copias local→local, `ClearFramebuffer` y `WriteVram` se aplican a todos los planos. Los dibujos se
+  repiten por plano con su desplazamiento (`uRaster.zw` en cómputo, `uHw.yz` en hardware).
+- Las lecturas (EE, CLUT, `ReadVram`) usan el plano 0, que es exactamente el GS nativo.
+- Los **sprites no se desplazan**. Son blits 2D: el HUD, las copias del cuadro y las mezclas de canales en tiras de 8
+  píxeles. Cada plano lee el mismo texel en su propio plano. Desplazar la textura cambiaba de texel en el borde de
+  cada tira: columnas verdes en `x % 24 == 20` a 3× (`logs/escala3b`) e imagen doble. Sin el desplazamiento, la
+  columna más verde pasa de 55 a 9 de diferencia G−R (`logs/escala3c`).
+- La presentación intercala los planos en una imagen de 512·S × 448·S, sin relleno de filas. El frontend toma el
+  ancho del cuadro y la textura de raylib crece con él.
+- Coste: el trabajo de GPU crece con S². En la RTX 4050 Laptop la GPU está al 23 % a 1× y al 100 % a 2×
+  (40-60 FPS) y 3× (18-24 FPS). Medido con `nvidia-smi` durante la cubierta del barco.
+
+### Imagen nítida (`PS2X_GS_NITIDO=1`)
+
+El efecto de PCSX2 "PCRTC Anti-Blur". God of War presenta en modo campo con
+`SMODE2=0x401` y dos circuitos sobre el mismo búfer: DBY 1 y 0, ALP 0x80 (`PMODE=0x8023`). Es un filtro
+antiparpadeo que promedia cada línea con la siguiente. Además, cada campo duplica sus líneas. Con la opción:
+
+- No se duplican las líneas del campo (`fieldFlags = 0`). El búfer tiene el cuadro entero.
+- Si los dos circuitos leen la misma imagen con una línea de diferencia, se apaga el de DBY mayor y no se mezcla.
+
+Prueba: `OpenGL sharp image shows every buffer line without anti-flicker` (con `GOW_GS_GPU_TEST=1`). Con la
+temporización real de GoW, cada línea del búfer sale tal cual y los dos campos dan la misma imagen.
+
+### Presentación sin copias repetidas
+
+Con el buzón (`PS2X_GS_PRESENT_BUZON=1`), el backend OpenGL cuenta revisiones del contenido. Si la VRAM y el CRTC no
+cambiaron desde la última composición, no recompone ni vuelve a leer. Devuelve un cuadro vacío y el buzón conserva
+el anterior. El buzón numera sus cuadros: `Present` no copia otra vez uno ya entregado, el frontend conserva el que
+tiene y `UploadFrame` no lo sube de nuevo. A 1× el hilo del GS pasa de 2,4 a 1,25 s por cada 5 s. Prueba:
+`presentation mailbox delivers each frame once`.
+
+`PS2X_GS_OP_PROF=1` imprime cada 5 s el tiempo del hilo del GS por tipo de comando (`[gs-op-prof]`). A 3× mostró
+que el tiempo se iba en `present`, esperando a la GPU llena (`throttleGpuFrames`), y no en la CPU.
+
+### Reducción a la pantalla
+
+Si la imagen del juego es mayor que el destino, el presentador de `ps2_runtime.cpp` no usa EASU, que solo sirve
+para ampliar y a más de 1,5:1 se salta texeles. Tampoco usa FXAA, porque el supermuestreo ya suaviza los bordes.
+En su lugar, `kReducir` promedia, ponderados por superficie, todos los texeles que cubre cada píxel de salida, con
+hasta 10×10 por píxel. Con FSR, RCAS afila el resultado como siempre.
+
+### Configuración regional (tr_TR)
+
+GLFW pone `LC_CTYPE` del sistema al inicializarse. Con `tr_TR.UTF-8`, `tolower('I')` devuelve `'I'` y `toupper('i')`
+devuelve `'i'`. Fallaban las comparaciones ASCII de nombres de módulos IRX, del disco y de la ROM: `LIBSD.IRX` daba la
+clave `lIbsd`. Con las pruebas de GPU, que inicializan GLFW, cinco pruebas del IOP fallaban por eso. Ahora,
+`InitWindow` y `GSGL::Context::Create` restauran `LC_CTYPE` a `"C"`. El juego no usa entrada de texto.
+
+### Escala dinámica (`PS2X_GS_ESCALA_DINAMICA=1`)
+
+`PS2X_GS_ESCALA` pasa a ser el tope: se reservan sus planos y la escala activa se mueve entre 1 y el tope.
+
+- Señal: la fracción de tiempo que el hilo del GS espera a la GPU en `throttleGpuFrames`, medida cada 0,5 s. Si la
+  GPU no llega, el GS espera ahí y el EE baja de 60.
+- Baja un paso si la espera supera el 10 %.
+- Sube un paso, a prueba, tras 5 s con menos del 2 % y un bloqueo de 20 s desde el último cambio. Si la subida se
+  satura en menos de 5 s, el bloqueo se duplica, hasta 600 s.
+- Al subir, los planos nuevos copian el plano 0, la VRAM nativa completa, y el juego los redibuja en el cuadro
+  siguiente.
+- Fallo corregido: un cuadro leído antes de bajar de escala (1024 de ancho) entraba en el relleno a 640 de la
+  escala 1 y desbordaba (`free(): corrupted unsorted chunks`). Ahora el relleno solo se aplica a cuadros más
+  estrechos que 640.
+- La textura de raylib toma el tamaño exacto del cuadro. Antes solo crecía, y tras bajar de 4× a 1× se borraba y
+  subía entera, 2048×1792, en cada cuadro: `upload_ms` 1050 frente a 260.
+- Medición (`logs/dinamica2`, tope 2×, RTX 4050 Laptop, cubierta del barco):
+  - En los menús se mantiene en 2×; en la batalla baja a 1× y da 60 cuadros/s.
+  - Las subidas de prueba dejan 58-59 cuadros/s durante unos 0,5 s y luego se espacian.
+  - La batalla no sostiene 2× a 60 en esta GPU: a 1× la GPU ya está al 23 % y 2× cuesta cuatro veces más.
+
+## Renderizador por hardware de triángulos (`PS2X_GS_HW=1`, 13 de octubre de 2026)
+
+`gs_hw_render.cpp` dibuja los triángulos con el pipeline de la GPU, en texturas de color (RGBA8) y profundidad (32F)
+a la resolución interna. La mezcla, el Z y el muestreo los hace la GPU. Los planos de VRAM siguen siendo la
+referencia:
+
+- Un objetivo se carga desde los planos antes de dibujar en él.
+- Se vuelca a los planos antes de cualquier operación de la ruta software que lea o escriba sus páginas: dibujos,
+  CLUT, transferencias, borrados, `WriteVram`/`ReadVram`, presentación, lecturas de depuración y reinicio. GS FINISH
+  solo emite.
+- Cada página tiene un número de generación. Las escrituras de la ruta software invalidan los objetivos y las texturas
+  decodificadas que la usan.
+
+Cómo se elige y se muestrea:
+
+- **Por qué los triángulos.** Censo (`PS2X_GS_CENSO=1`): en la cubierta del barco el 40 % de la superficie son
+  triángulos T8 con mezcla `(Cs-Cd)*As+Cd`, Z GEQUAL y prueba de alfa; el resto, sprites de posprocesado. Con
+  `PS2X_GS_OMITIR=sprite` la GPU baja solo de 49 % a 43 %: casi todo el coste son los triángulos.
+- **Texturas.** Se decodifican del plano 0 a RGBA8 con la CLUT y TEXA de la ruta software, y se guardan en una caché.
+  La clave de la CLUT es su carga y la generación de sus páginas de origen. Mipmaps: solo el nivel 0, como la ruta
+  software.
+- **Mezcla.** `(A-B)*C+D` se traduce a factores de la GPU con dual-source; C = As o FIX. No hay equivalente para
+  C = Ad, `1+C` ni PABE: esos triángulos van a la ruta software.
+- **COLCLAMP=0.** La GPU satura en lugar de desbordar. `PS2X_GS_HW_EXACTO=1` lo deja en la ruta software.
+- **Prueba de alfa.** KEEP descarta. FB_ONLY, ZB_ONLY y RGB_ONLY usan una segunda pasada con las máscaras de
+  escritura.
+
+La prueba `OpenGL hardware triangle renderer matches the software path` compara una escena con borrado, Z de un
+sprite, T8+CLUT, mezcla, Z GEQUAL, alfa KEEP/FB_ONLY y Gouraud. 2600 píxeles dibujados, como mucho 1 de diferencia
+de color y Z idéntica.
+
+Medido en la cubierta del barco, RTX 4050 Laptop:
+
+| Escala | Antes | Con el renderizador por hardware |
+|---|---|---|
+| 1× | 49 % de GPU | 39 % de GPU |
+| 2× | GPU al 100 %, 40 FPS | 60 FPS, GPU al 49 % |
+| 3× | 18-24 FPS | 47-57 FPS, GPU al 73 % |
+
+- El 99,5 % de los triángulos van por hardware.
+- **Pendiente:**
+  - Sprites de posprocesado: leen los objetivos como textura, a veces reinterpretando el formato. Causan unos 10
+    volcados y cargas por cuadro.
+  - Mezcla con Ad.
+  - Presentación sin pasar por la CPU, que a 3× limita el hilo principal.
+- `PS2X_GS_HW_DIAG=1`: triángulos por hardware y por software, rechazos con su registro y volcados por origen.
+
+Al cerrar, `CloseWindow` (`glfwTerminate`) destruía el contexto GL del GS mientras su hilo aún dibujaba (SIGSEGV en
+el controlador). Ahora el runtime cambia antes a un backend CPU: la cola se vacía y el backend OpenGL se destruye en
+su hilo. `TOBIICHI_CERRAR_TRAS=N` cierra como el botón de la ventana a los N segundos, para probarlo.
+
+## Sprites por hardware, canales de GoW y presentación compartida (15 de octubre de 2026)
+
+**Objetivo:** 60 FPS a 3× y 4× con la GPU integrada (Radeon 680M). Medido en el portátil, en modo rendimiento y en la
+partida de la cubierta del barco, de 25 a 70 s después de arrancar:
+
+| Escala | Antes | Ahora |
+|---|---|---|
+| 1× | 53-56 FPS, GPU 60 % | 60 FPS, GPU 50-55 % |
+| 2× | — | 56-60 FPS |
+| 3× | 17 FPS | 31-32 FPS (48-53 al principio) |
+| 4× | 10 FPS | 18-19 FPS |
+
+**El objetivo no se ha alcanzado.** A 3× la GPU sigue al 100 %.
+
+### Diagnóstico
+
+- `PS2X_GS_HW_DIAG=1` con `PS2X_GS_GPU_PROF=1` da el tiempo de GPU por clase de trabajo (`GPU ms/s`): cargas,
+  volcados, decodificación, triángulos, triángulos exactos, sprites, sprites exactos, CT16 y subida de vértices.
+- `[gs-hw-lote]` reparte ese tiempo por objetivo, textura, mezcla y prueba.
+- `[gs-hw-copia]` cuenta las cargas y los volcados por objetivo y origen; `[gs-hw-sprite]`, los sprites rechazados por
+  clase.
+- `PS2X_GS_TRAZA="t:n"` escribe los registros de los n sprites siguientes a t segundos (`[gs-traza]`), con el número de
+  triángulos entre uno y otro.
+
+**De dónde salía el tiempo** a 3×, por cuadro:
+
+- 19 ms: la ruta de cómputo, sobre todo los sprites del posprocesado en 9 planos.
+- 16 ms: cargas y volcados de objetivos, porque el cuadro pasaba de la GPU a la ruta software varias veces por
+  cuadro.
+- 6 ms: triángulos.
+- 2,4 ms: composición.
+
+### El posprocesado de GoW (`logs/traza2`)
+
+Tras la escena, sobre el cuadro (CT32 en el bloque 0, 512 × 416), un búfer CT24 (bloque `0xD00`, el mismo que la Z de
+la escena: el juego trata la profundidad como color), un búfer de 1024 de ancho (`0x1A00`, la imagen de 640) y un
+auxiliar de 64 de ancho (`0x2B80`):
+
+- 32 sprites CT16 de 8 × 832 sobre el cuadro con FBMSK `0x3FFF`, cada uno leyendo el cuadro como CT16 8 píxeles a la
+  izquierda.
+- Pasadas a pantalla completa en tiras de 32: solo el canal G, inversión del búfer CT24, DATE con `Cd - Cs*As`,
+  `(Cs - Cd)*Ad + Cd`.
+- Cuatro sprites por tira entre el cuadro y el auxiliar en CT16.
+- Un máximo en Z sobre el auxiliar, con el color y la Z en la misma dirección.
+- Una lectura Z16 del auxiliar.
+- La copia escalada a 640 con bilineal.
+
+En un búfer CT16 que es alias de uno CT32, los píxeles x y x + 8 de cada bloque de 16 son la mitad baja y la alta de
+la misma palabra. Los movimientos de canales leen y escriben cada palabra una sola vez.
+
+### Cambios en `gs_hw_render.cpp`
+
+- **Sprites por hardware** (`PS2X_GS_HW_SPRITES=0` los devuelve a la ruta de cómputo):
+  - Se dibujan como dos triángulos. El sombreador calcula el píxel nativo y el plano de cada muestra y obtiene la UV
+    y el muestreo (punto y bilineal con pesos de 4 bits) igual que `drawSprite`.
+  - Las fuentes son la textura decodificada; un objetivo en su formato (CT32, CT24, o CT32 leído como CT24 con TEXA),
+    leído en su propio plano a la resolución interna; un objetivo CT32 o CT24 leído como CT16; o los planos de la
+    VRAM, en cualquier formato sin paleta, también los alias de profundidad.
+  - Pasado el ancho del búfer, la lectura sigue la dirección lineal de página del GS (la fila de páginas siguiente),
+    como hace la copia bilineal de GoW en su borde derecho.
+- **Modo exacto** (sprites y triángulos):
+  - Lee el píxel del destino y aplica `writePixel` de la ruta de cómputo: mezcla con Ad, PABE, COLCLAMP, DATE,
+    FBMSK por bits y FBA.
+  - Un lote no pasa dos veces por un píxel. Se lleva la cuenta de los bloques de 8 × 8 escritos y el lote se parte
+    si se solapan, con `glTextureBarrier` antes de cada lote exacto.
+  - `PS2X_GS_HW_TRI_EXACTO=0` deja esos triángulos en la ruta software.
+- **CT16 sobre un objetivo CT32 o CT24:**
+  - Cada píxel del objetivo son dos medias palabras CT16. Las tablas inversas de posición por página salen de
+    `GSSwizzle` (búfer 13).
+  - Se dibuja un rectángulo por tramo de bloques CT32 que ocupa el sprite.
+- **CT24 se carga y se vuelca como CT32:** el byte alto del objetivo es el de la VRAM. Los dibujos CT24 no lo
+  escriben y los CT16 pueden cambiarlo.
+- **Lectura del propio objetivo:** cada sprite copia la zona que lee antes del dibujo del lote. Si la zona se solapa
+  con lo que ya escribió el lote, se emite antes.
+- **Color y Z en las mismas páginas** van a la ruta software (motivo 12).
+- **Cargas parciales:** cada objetivo guarda la generación de sus páginas al cargarse y solo vuelve a cargar las que
+  cambiaron.
+- **Volcados:** se deciden y se anuncian con las páginas del rectángulo sucio, no con todo el ancho (el búfer de 1024
+  usa 640 y el resto es el auxiliar).
+- **Texturas leídas:** solo cuentan las páginas de los texels que se leen, calculados con la misma cuenta que el
+  sombreador, no las del tamaño TW × TH entero.
+- **Texturas decodificadas** con filtro sin mipmaps: si no, estaban incompletas para `texelFetch`.
+- **Z16 y Z24 decodificados** como sus formatos de color.
+- **FBO** por pareja (color, Z).
+- **Variantes de sombreador** por modo y fuente.
+- **Lotes:** sin barrera de memoria entre lotes y sin volver al FBO 0 tras cada lote.
+
+### Presentación
+
+- Solo se vuelcan los búferes que leen los circuitos del CRTC (y la fuente preferida), no todos los objetivos.
+- `PS2X_GS_DIRECT_PRESENT=1` (por defecto en Linux: `run_gow.sh` y el lanzador):
+  - El contexto del GS comparte texturas con el de la ventana (GLFW, `gs_gl.cpp`) y el cuadro llega como textura
+    (`GSSharedPresent::Acquire` en `UploadFrame`), sin lectura a la RAM.
+  - El GS crea su contexto antes que la ventana. Tras capturar el de la ventana se vuelve a crear el backend.
+  - Parte común de los huecos y los fences: Windows y Linux.
+
+### Pruebas (`GOW_GS_GPU_TEST`; con un texto, solo las pruebas de GPU que lo contienen)
+
+- `OpenGL hardware sprites match the software path at 1x and 3x`: sin textura, T8 escalada con bilineal, copias
+  entre objetivos 1:1 y con STQ, CT24 con TEXA, lectura del propio objetivo y triángulos con Ad y DATE. Diferencia
+  máxima 1 (los triángulos).
+- `OpenGL hardware channel shuffles match the software path at 1x and 3x`: los movimientos de canales de la traza,
+  con el auxiliar como objetivo CT24, DATE, Ad y la lectura Z16. Idénticos byte a byte.
+
+### Lo que queda
+
+- A 3× la GPU sigue llena. Por cuadro:
+  - Triángulos: 10 ms. 6 ms son la geometría T8 con `(Cs-Cd)*As+Cd` y prueba de alfa; 3 ms, triángulos aditivos
+    grandes.
+  - Sprites: 11 ms entre unas 30 pasadas a pantalla completa, de 0,4-0,7 ms cada una a 3×.
+- Hay unos 5 ms por cuadro que no escalan con la resolución:
+  - decodificar texturas, unas 24 por cuadro: 1,25 ms;
+  - cargas de CLUT: 1,1 ms;
+  - lotes exactos partidos;
+  - el coste fijo por lote.
+- En modo de bajo consumo los relojes bajan: no está medido (no se cambia el perfil de energía del sistema).

@@ -32,6 +32,11 @@ add_library(ps2_test_lib STATIC
     src/ps2_vu1_tests.cpp
     src/ps2_vu_tests.cpp
     src/ps2_gs_tests.cpp
+    src/ps2_gs_fog_latch_tests.cpp # GOW-Port: atributo FOG después de XYZF.
+    src/ps2_gs_fog_math_tests.cpp # GOW-Port: RGB de referencia para la niebla.
+    src/ps2_gs_zte_tests.cpp # GOW-Port: habilitacion de test y escritura Z.
+    src/ps2_gs_cpu_colclamp_tests.cpp # GOW-Port: wrap/clamp del RGB de mezcla en CPU.
+    src/ps2_gs_texa_depth_tests.cpp # GOW-Port: TEXA en alias de profundidad.
     src/ps2_gs_backend_tests.cpp # GOW-Port: cola, VRAM y comparación CPU/OpenGL.
     src/ps2_iop_tests.cpp
     src/ps2_sif_rpc_tests.cpp

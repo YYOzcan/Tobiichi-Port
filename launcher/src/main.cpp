@@ -83,10 +83,12 @@ int main(int argc, char *argv[])
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed, &app, [] { QCoreApplication::exit(1); },
                      Qt::QueuedConnection);
     // Para la documentación y las pruebas: TOBIICHI_CAPTURA=<png> guarda la ventana y sale;
-    // TOBIICHI_CAPTURA_PESTANA elige la pestaña.
+    // TOBIICHI_CAPTURA_PESTANA elige la pestaña y TOBIICHI_CAPTURA_ALTO la altura de la ventana.
     const QByteArray captura = qgetenv("TOBIICHI_CAPTURA");
     engine.rootContext()->setContextProperty(QStringLiteral("pestanaInicial"), qEnvironmentVariableIntValue("TOBIICHI_CAPTURA_PESTANA"));
     engine.loadFromModule(QStringLiteral("Tobiichi"), QStringLiteral("Main"));
+    if (!captura.isEmpty() && qEnvironmentVariableIntValue("TOBIICHI_CAPTURA_ALTO") > 0 && !engine.rootObjects().isEmpty())
+        engine.rootObjects().first()->setProperty("height", qEnvironmentVariableIntValue("TOBIICHI_CAPTURA_ALTO"));
     if (!captura.isEmpty())
         QTimer::singleShot(3000, &app, [&engine, captura]
         {

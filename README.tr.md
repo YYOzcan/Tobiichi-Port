@@ -48,11 +48,16 @@ Hedef, yerel hissi veren bir PC portu: gerçek zamanlı oyun hızı, akıcı gö
 |---|---|
 | **Launcher** | Ekran kartı, çözünürlük, geniş ekran, FSR büyütme, FPS sınırı, dosya yolları — hepsi tek yerde |
 | **Geniş ekran** | Gerçek Hor+ kamera (16:9, 16:10, 21:9), PCSX2 yamasına dayalı; kapalıyken orijinalle bit bit aynı |
-| **Büyütme** | Sunum katmanında AMD FSR 1.0 (EASU + RCAS) ve FXAA |
+| **İç çözünürlük** | GS 1×–8× çizer (süper örnekleme); varsayılan 2×; GPU 60 FPS'i tutamazsa dinamik çözünürlük bir kademe düşürür. "Net görüntü" PS2'nin satır çiftleme ve titreşim önleme bulanıklığını kaldırır |
+| **Büyütme** | Sunum katmanında AMD FSR 1.0 (EASU + RCAS) ve FXAA; görüntü ekrandan büyükse alan ortalamasıyla küçültme |
 | **Akıcı pencere** | Pencere, oyunun 60 Hz mantığından bağımsız olarak 120+ FPS'e kadar sunum yapar |
 | **Ses** | Ölü bantlı zaman esnetme ve EE zamanına bağlı IOP saati: tempo 1,00'da kalır, looplama yok |
-| **Derlenmiş VU1** | Oyunun VU1 mikro kodu yerel koda derlenir, yorumlayıcıyla bit bit aynıdır (öncekinden ~%23 hızlı) |
+| **Derlenmiş VU1** | Oyunun VU1 mikro kodu yerel koda derlenir; PCSX2 hassasiyetinde hızlı mod (1,5 kat hızlı) ya da bit bit birebir mod |
 | **Gerçek zamanlı hız** | VBlank duvar saatini izler: oyun ağır çekime girmek yerine kare atlar |
+| **Hedefe kilitlenme** | **Alt** en yakın düşmana kilitlenir, Kratos saldırılarını ona yöneltir; fareyi sağa/sola oynatınca hedef değişir |
+| **Çevik dövüş** | Yuvarlanmadan saldırı veya blok %50 yerine %20'de çıkar; kaçırılan saldırı tuşu kısa süre yeniden denenir (ör. L1'i bırakıp aynı karede saldırmak); saldırıyı blok veya kaçınmayla kesmek oyunda zaten vardı |
+| **Düğme simgeleri** | Oyundaki düğme simgeleri cihaza göre değişir: atadığınız klavye/fare tuşu, diğer kollarda Xbox düğmeleri (A/B/X/Y, LB/RB/LT/RT), PlayStation kolunda orijinaller; pencere çözünürlüğünde, oyunun menü tarzında çizilir |
+| **Hile menüsü** | Oyun içinde **F2**: ölümsüzlük, tek vuruşta öldürme, sınırsız büyü ve Rage of the Gods, maksimum küre, tüm yükseltmeler ve güçler, tüm ekstralar |
 
 ## Güncel durum
 
@@ -68,20 +73,25 @@ Kütüphane ve bileşen bazında ayrıntı: [`docs/estado/detalle.en.md`](docs/e
 | Görüntü (OpenGL; `fragment_shader_interlock` ile donanım çizici veya hesaplama çizicisi) | ✅ |
 | Gerçek zamanlı tempoda ses | ✅ |
 | Geniş ekran (Hor+) ve FSR büyütme | ✅ |
-| FMV: giriş videosu çözülüp gösteriliyor; diğer videolar doğrulanmadı | 🔧 |
+| 2×–8× iç çözünürlük ve net görüntü | ✅ |
+| FMV: giriş videosu görüntü ve sesle sonuna kadar oynuyor ve oyuna geçiyor; diğer videolar aynı yolu kullanıyor, tek tek denenmedi | 🔧 |
 | Hafıza kartı: kaydet/yükle doğrulandı; biçimlendirme doğrulanmadı | 🔧 |
-| Performans: hafif ve orta sahnelerde 60 FPS, **en ağır sahnelerde ~30 FPS** | 🔧 |
+| Performans: hızlı VU1 moduyla oynanışta 60 FPS (gemi test sahnesi RTX 4050'de 30'dan 60'a çıktı) | ✅ |
 
 ### Kare hızı hakkında
 
 Oyunun mantığı PS2'nin 60 Hz VBlank'ine kilitlidir; bu yüzden **oyunun kendisi 60 FPS'in üstüne çıkamaz**. VBlank'i
 yükseltmek oyunu yalnızca hızlı oynatır. Pencere 120 Hz ve üstünde sunum yapabilir; bu, her yeni kareyi daha erken
-gösterir ve gecikmeyi azaltır. En ağır sahnelerde VU1 iş parçacığı kare başına ~20 ms ister (60 FPS için ≤ ~15 ms
-gerekir) ve sınır işlemcidir; GS çizicisi için harici ekran kartı önemlidir (RTX 4050'de kare başına 4–7 ms,
-Radeon 680M'de 20–26 ms).
+gösterir ve gecikmeyi azaltır. Sınır VU1 iş parçacığıdır (işlemci). **Hızlı VU1 modu** (`PS2X_VU1_RAPIDO=ON`, buradaki
+varsayılan derleme) bit bit birebir model yerine PCSX2 hassasiyetini kullanır (sıfıra doğru yuvarlayan SSE, DAZ/FTZ,
+Z/S bayrakları tembel hesaplanır). Kare başına VU1 süresi 22 ms'den 13 ms'ye, en ağır test sahnesi 30'dan 60 FPS'e
+iner; test karesinin görüntüsü piksel piksel aynıdır. `PS2X_VU1_RAPIDO=OFF` birebir modu derler. GS çizicisi için
+harici ekran kartı önemlidir (RTX 4050'de kare başına 4–7 ms, Radeon 680M'de 20–26 ms).
 
-**Yok:** 2×–4× iç çözünürlük. GS, kendi 640×448 çözünürlüğünde, iç içe geçmiş VRAM'i üzerinde taklit ediliyor; onu
-süper örneklemek büyük bir iştir. Netlik için FSR kullanın.
+**İç çözünürlük:** her örnek konumunun GS VRAM'inin kendi kopyası vardır (paraLLEl-GS yöntemi); okumalar ve paletler
+yerel kopyayı kullanır, böylece oyun PS2'dekiyle aynı belleği görür. GPU maliyeti ölçeğin karesiyle artar. RTX 4050
+Laptop'ta: 1× 60 FPS, 2× 40–60 FPS, 3× 18–24 FPS. 4× ve üstü çok daha hızlı bir GPU ister. Dinamik çözünürlük (varsayılan açık)
+1×'e kadar inerek 60 FPS'i korur; bunun altında sınır GPU'dur. "Net görüntü" tek başına PS2 bulanıklığının çoğunu giderir.
 
 ## Hızlı başlangıç
 
@@ -116,14 +126,15 @@ scripts\3_ejecutar.cmd
 
 | Sekme | Ayarlar |
 |---|---|
-| **Grafik** | Ekran kartı, tam ekran/pencere ve çözünürlük, en-boy oranı (4:3, 16:9, 16:10, 21:9 Hor+), yayma, FSR / bilinear / piksel büyütme, keskinlik, FXAA |
+| **Grafik** | Ekran kartı, tam ekran/pencere ve çözünürlük, en-boy oranı (4:3, 16:9, 16:10, 21:9 Hor+), yayma, FSR / bilinear / piksel büyütme, keskinlik, FXAA, çizim çözünürlüğü (otomatik, 1×–8×), net görüntü |
 | **Performans** | Kare hızı sınırı (30 … sınırsız), VSync, ekranda FPS göstergesi |
 | **Dosyalar** | Oyun dosyası (CRC ile doğrulanır), ISO, port çalıştırıcısı, hafıza kartı klasörü, otomatik bulma |
 | **Kontroller** | Klavye düzeni, ESC davranışı, tuş tablosu |
+| **Hileler** | Oyun açılırken etkin hileler (oyun içi **F2** menüsü anında açıp kapatır) |
 | **Diğer** | Dil, video atlama, hızlı açılış, kısayollar, son oyun günlüğü, varsayılanlara dön, isteğe bağlı kapak görseli |
 
 `tobiichi-launcher --jugar` oyunu kayıtlı ayarlarla doğrudan başlatır (menü girdisindeki "Hemen oyna" eylemi).
-Oyun içinde: **F11** tam ekranı açıp kapatır, **F1** geliştirici panelini açar.
+Oyun içinde: **F11** tam ekranı açıp kapatır, **F2** hile menüsünü, **F1** geliştirici panelini açar.
 
 ## Depo yapısı
 

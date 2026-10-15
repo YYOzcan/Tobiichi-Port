@@ -6,16 +6,18 @@ TabButton {
     id: raiz
     property string icono: ""
     implicitHeight: 46
-    implicitWidth: etiqueta.implicitWidth + 34
+    implicitWidth: etiqueta.implicitWidth + 26
+    // Ancho según el texto (TabBar reparte el ancho a partes iguales y con seis pestañas las largas se solapaban).
+    width: implicitWidth
     hoverEnabled: true
 
     contentItem: Text {
         id: etiqueta
         text: raiz.text.toLocaleUpperCase(Tema.idioma === "tr" ? "tr-TR" : "en-US")
         font.family: Tema.fuenteTitulo
-        font.pixelSize: 15
+        font.pixelSize: 14
         font.weight: Font.DemiBold
-        font.letterSpacing: 1.6
+        font.letterSpacing: 1.2
         color: raiz.checked ? Tema.oroClaro : (raiz.hovered ? Tema.texto : Tema.textoSuave)
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter
