@@ -3367,3 +3367,19 @@ compartida".
 
 **Fallo encontrado y corregido:** antes de esa captura salía una niebla verde, porque los sprites que leen su propio
 objetivo solo copiaban la zona del primero del lote.
+
+### Rama `ultimate`: runtime de Waffle565 con las funciones de Tobiichi Port (15 de octubre)
+
+Integrado [Waffle565/God-Of-War-Native-Port](https://github.com/Waffle565/God-Of-War-Native-Port) (ramas `runtime` y
+`main`) tomando su runtime como base: GS nativo por render targets, IOP compilado, VU1 nativa, vídeos con libmpeg2.
+Detalle completo en `docs/ULTIMATE.md`.
+
+**Comprobado:**
+- Compila en Linux (GCC 16, LTO) tras portar el contexto GL a GLFW y tres ajustes de compilación.
+- Arranca, carga y llega a la partida (estado 11) desde la ISO, con los 8 IRX en código nativo.
+- La imagen del barco y del menú de título es correcta a 2x, con presentación compartida.
+- Se cargan las funciones de Tobiichi (iconos, fijar objetivo, combate ágil, vídeo progresivo); los iconos se ven en
+  el menú de pausa y en el de título, con la corrección vertical del modo 16:9 del juego.
+- Cuadros del juego por segundo: 1x 50-56, 2x 46-47, 3x 35 (la ventana a 13 Hz).
+
+**Sin comprobar:** menú de trucos y fijar objetivo en partida, QTE, lanzador recompilado, Windows.

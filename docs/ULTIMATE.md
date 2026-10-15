@@ -87,3 +87,35 @@ como `PS2X_GS_HW_SCALE`.
 `docs/waffle/` (inglés): estado, diagnóstico, puerto nativo, rendimiento, sonido, vídeos, tarjeta de memoria,
 detalles internos del juego. Sus herramientas están en `tools/waffle/` (zonas, partidas guardadas, vídeos,
 desensambladores) y `tools/iop/` (generador del IOP nativo).
+
+## Medidas en este portátil (Radeon 680M, perfil de rendimiento, 15 de octubre de 2026)
+
+Barco, partida nueva, 40-95 s, `GOW_PAD_GUION="5:start,12:x,20:x,28:x"`, IOP nativo (los 8 módulos):
+
+| `PS2X_GS_HW_SCALE` | cuadros del juego/s | ventana | GPU |
+|---|---|---|---|
+| 1 | 50-56 | 60 Hz | 48-60 % |
+| 2 | 46-47 | 60 Hz | 86 % |
+| 3 | 35 | 13 Hz | 100 % |
+
+- A 1x y 2x el límite no es la GPU sino el hilo de VU1 (~3 s de cada 5: 159 M ciclos de VU1 por segundo, todo
+  nativo, 3,7 ns por ciclo) y la espera del EE (`guest_wait_ms` ~2,6 s de cada 5).
+- A 3x la GPU está llena y la ventana (`EndDrawing`) espera detrás del trabajo del GS: el juego va a 35 cuadros/s
+  pero se ven 13. Por eso `run_gow.sh` usa 2.
+- Comparado con la rama `main` (mismo recorrido): 1x 60, 2x 56-60, 3x 31-32. El GS de Waffle es más ligero a 3x,
+  pero aquí su VU1 en un solo hilo limita a 1x y 2x.
+
+## Iconos de botones con el modo 16:9 del juego
+
+Los overrides de Waffle activan siempre el modo 16:9 del propio juego (0x29CC90 = 1). En ese modo el reproductor de
+Flash estira el escenario en vertical 4/3 alrededor del centro; `gow_iconos.cpp` aplica `y' = 240 + (y - 240) * 4/3`
+mientras el indicador está activo (medido con seis iconos del menú de pausa y del de título: error < 4 píxeles).
+
+## Pendiente
+
+- La ventana a 3x (prioridad de la presentación frente al GS en la GPU, o escala dinámica en el renderizador de
+  Waffle).
+- Probar en partida: menú de trucos (F2), fijar objetivo (Alt) con el 16:9 del juego (la marca usa la proyección
+  4:3), combate ágil, avisos de QTE.
+- El lanzador (Qt) no se ha recompilado en esta rama.
+- Windows: el código de WGL es el de Waffle, sin cambios de comportamiento, pero no se ha compilado en esta rama.

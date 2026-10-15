@@ -28,6 +28,7 @@
 #include "runtime/gs/gs_swizzle.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -472,6 +473,10 @@ namespace
         float r, g, b, a; // multiplicadores del cxform (oscurecido y transparencia de los menús)
     };
     std::mutex g_mutex;
+    // GOW-Port: modo 16:9 del propio juego (0x29CC90 = 1; los overrides de Waffle y TOBIICHI_PANORAMICO lo activan).
+    // En ese modo el reproductor de Flash estira el escenario en vertical 4/3 alrededor del centro (640 x 360 visibles en
+    // los 448 renglones): medido en el menú de pausa y en el de título, error < 4 píxeles a 922 x 518.
+    std::atomic<bool> g_panoramicoJuego{false};
     std::vector<Icono> g_construyendo, g_publicados;
     std::chrono::steady_clock::time_point g_ultimoAnotado{}, g_publicadoEn{};
 
@@ -554,6 +559,7 @@ namespace
             g_dibujarForma(rdram, ctx, runtime);
             return;
         }
+        g_panoramicoJuego.store(rdram[0x29CC90u] == 1u, std::memory_order_relaxed);
         const uint32_t entrada = GPR_U32(ctx, 4), m = GPR_U32(ctx, 7);
         if (!g_ocultar.empty() && (g_ocultar.count(entrada) || g_ocultar.count(GPR_U32(ctx, 6))))
         {
@@ -1088,7 +1094,8 @@ void gowIconosDibujar(float dx, float dy, float dw, float dh)
         // Radio en píxeles del escenario (el espacio de la matriz va a medio píxel).
         const float r = i.escala * 0.5f * ajuste;
         const float alto = 2.0f * r / 480.0f * dh, ancho = alto * t.aspecto;
-        const float cx = dx + i.x / 640.0f * dw, cy = dy + i.y / 480.0f * dh;
+        const float y = g_panoramicoJuego.load(std::memory_order_relaxed) ? 240.0f + (i.y - 240.0f) * (4.0f / 3.0f) : i.y;
+        const float cx = dx + i.x / 640.0f * dw, cy = dy + y / 480.0f * dh;
         const Rectangle origen{0.0f, 0.0f, float(t.rt.texture.width), -float(t.rt.texture.height)};
         const Color tinte{static_cast<unsigned char>(255.0f * i.r), static_cast<unsigned char>(255.0f * i.g),
                           static_cast<unsigned char>(255.0f * i.b), static_cast<unsigned char>(255.0f * i.a)};
