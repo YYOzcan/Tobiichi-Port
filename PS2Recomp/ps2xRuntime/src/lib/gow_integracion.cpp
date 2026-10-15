@@ -19,6 +19,7 @@
 #include "raylib.h"
 
 #include <algorithm>
+#include <atomic>
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
@@ -116,6 +117,45 @@ namespace
     // TOBIICHI_TECLAS los sticks del teclado salen del mapa configurable; con el menú de trucos abierto el paquete
     // queda en reposo (botones sueltos, sticks centrados, sin presión).
     void reaplicarPanoramico(uint8_t *rdram); // más abajo, junto al panorámico
+
+    // GOW-Port: cuadros del juego por segundo (TOBIICHI_FPS_GOSTER=1): entradas a la función del cuadro, 0x1837B8 (la de
+    // GOW_PERF_FRAME_PC). Las reanudaciones tras un checkpoint (ctx->pc distinto de la entrada) no cuentan.
+    constexpr uint32_t kFuncionCuadro = 0x001837B8u;
+    PS2Runtime::RecompiledFunction g_funcionCuadro = nullptr;
+    std::atomic<uint64_t> g_cuadrosJuego{0};
+
+    void funcionCuadro(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == kFuncionCuadro)
+            g_cuadrosJuego.fetch_add(1, std::memory_order_relaxed);
+        g_funcionCuadro(rdram, ctx, runtime);
+    }
+
+    void dibujarFps(float x, float y, float h)
+    {
+        static double ultimo = 0.0;
+        static uint64_t cuadrosAntes = 0;
+        static int fpsJuego = 0;
+        const double ahora = GetTime();
+        const uint64_t cuadros = g_cuadrosJuego.load(std::memory_order_relaxed);
+        if (ultimo == 0.0)
+        {
+            ultimo = ahora;
+            cuadrosAntes = cuadros;
+        }
+        else if (ahora - ultimo >= 0.5)
+        {
+            fpsJuego = static_cast<int>(static_cast<double>(cuadros - cuadrosAntes) / (ahora - ultimo) + 0.5);
+            ultimo = ahora;
+            cuadrosAntes = cuadros;
+        }
+        const int tam = std::max(16, static_cast<int>(h / 40.0f));
+        const char *texto = TextFormat("%d FPS  |  %d Hz", fpsJuego, GetFPS());
+        const int ancho = MeasureText(texto, tam);
+        const int px = static_cast<int>(x) + tam / 2, py = static_cast<int>(y) + tam / 2;
+        DrawRectangle(px - tam / 3, py - tam / 4, ancho + tam * 2 / 3, tam + tam / 2, Color{0, 0, 0, 150});
+        DrawText(texto, px, py, tam, fpsJuego >= 55 ? Color{120, 230, 120, 255} : fpsJuego >= 28 ? Color{240, 210, 90, 255} : Color{240, 100, 90, 255});
+    }
     constexpr uint32_t kGowPad2Read = 0x0027B9F0u;
     PS2Runtime::RecompiledFunction g_gowPad2Read = nullptr;
 
@@ -182,15 +222,35 @@ namespace
         };
         const float target = gowAspectoPanoramico();
         float factor = 0.75f;
-        if (target > 0.0f)
+        // Con un vídeo reproduciéndose (estado 11 del hilo de vídeos, 0x29C838; el 10 es uno precargado que espera mientras
+        // se juega) se deja el modo 16:9 de Waffle: con
+        // 0x304D94 = 2 el juego dibuja el vídeo panorámico en una caja 4:3 (estrecho y con bandas); así llena la imagen.
+        static uint32_t original304D94 = 0xFFFFFFFFu;
+        const uint32_t estadoVideo = read32(0x29C838u);
+        const bool video = (estadoVideo >= 3u && estadoVideo <= 9u) || estadoVideo == 11u; // cargando o reproduciendo
+        if (target > 0.0f && original304D94 == 0xFFFFFFFFu)
+            original304D94 = read32(0x304D94u);
+        if (target > 0.0f && video)
+        {
+            if (original304D94 != 0xFFFFFFFFu)
+                write32(0x304D94u, original304D94);
+            write32(0x7F04u, 1u);
+        }
+        else if (target > 0.0f)
         {
             const uint32_t bits = floatBits(target);
             write32(0x32F1B0u, bits);
             write32(0x2FD930u, bits);
             write32(0x2FD968u, bits);
             rdram[0x29CC90u] = 1u;
-            write32(0x304D94u, 2u);
-            write32(0x7F04u, 0u);
+            // 0x304D94 = 2 (parche de PCSX2) hace que el juego meta los vídeos en una caja 4:3; con el 16:9 nativo de
+            // Waffle no hace falta. TOBIICHI_PANORAMICO_304D94=1 lo vuelve a escribir (comparaciones).
+            static const bool escribir304D94 = [] { const char *v = std::getenv("TOBIICHI_PANORAMICO_304D94"); return v && v[0] == '1'; }();
+            if (escribir304D94)
+                write32(0x304D94u, 2u);
+            // Vídeos panorámicos (.PSW): el runtime de Waffle los reproduce de forma nativa y llenan la imagen; en
+            // Tobiichi se usaban los 4:3 porque FFmpeg pintaba el vídeo encima a su propia proporción.
+            write32(0x7F04u, 1u);
             uint16_t menuBackground = 0u;
             std::memcpy(&menuBackground, rdram + 0x29CC50u, sizeof(menuBackground));
             if (menuBackground == 1u)
@@ -217,6 +277,10 @@ namespace
     {
         const float target = gowAspectoPanoramico();
         if (target <= 0.0f || !rdram)
+            return;
+        uint32_t video = 0u;
+        std::memcpy(&video, rdram + 0x29C838u, sizeof(video));
+        if ((video >= 3u && video <= 9u) || video == 11u) // vídeo cargando o reproduciéndose: el 16/9 de Waffle
             return;
         uint32_t bits = 0u;
         std::memcpy(&bits, &target, sizeof(bits));
@@ -321,6 +385,12 @@ void gowIntegracionInstalar(PS2Runtime &runtime, const std::string &elfPath)
                 std::cerr << "[teclado] mapa configurable activo (TOBIICHI_TECLAS); sticks del teclado desde el mapa" << std::endl;
         }
     }
+    if (envFlag("TOBIICHI_FPS_GOSTER", false) && runtime.hasFunction(kFuncionCuadro))
+        if (PS2Runtime::RecompiledFunction actual = runtime.lookupFunction(kFuncionCuadro))
+        {
+            g_funcionCuadro = actual;
+            runtime.replaceFunction(kFuncionCuadro, &funcionCuadro);
+        }
     gowTrucosInstalar(runtime, elfPath);
     gowVideoInstalar(runtime, elfPath);    // escaneo progresivo siempre activado
     gowFijarInstalar(runtime, elfPath);    // fijar objetivo (envuelve la lectura del mando)
@@ -346,4 +416,6 @@ void gowCuadroDibujar(float x, float y, float w, float h)
     gowFijarDibujar(x, y, w, h);
     gowIconosDibujar(x, y, w, h);
     gowTrucosMenuDibujar();
+    if (g_funcionCuadro)
+        dibujarFps(x, y, h);
 }

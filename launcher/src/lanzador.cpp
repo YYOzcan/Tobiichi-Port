@@ -410,6 +410,21 @@ bool Lanzador::iniciar(const QVariantMap &a)
     const double nitidez = std::clamp(a.value(QStringLiteral("nitidez"), 0.8).toDouble(), 0.0, 1.0);
     entorno.insert(QStringLiteral("TOBIICHI_NITIDEZ"), QString::number(2.0 * (1.0 - nitidez), 'f', 2));
     bandera("TOBIICHI_FXAA", a.value(QStringLiteral("fxaa")).toBool());
+    // GOW-Port: escalado del runtime de Waffle (gs_host_present.cpp). "fsr" = bicúbico con realce (GOW_SHARPEN, de 0 a
+    // 0,5 con la nitidez; 0 = sin realce); "bilineal" y "pixel" = estirado bilineal, sin realce (imagen suave).
+    {
+        const QString filtro = a.value(QStringLiteral("filtro"), QStringLiteral("fsr")).toString();
+        if (filtro == QStringLiteral("fsr"))
+        {
+            entorno.insert(QStringLiteral("GOW_SCALER"), QStringLiteral("sharp"));
+            entorno.insert(QStringLiteral("GOW_SHARPEN"), QString::number(0.5 * nitidez, 'f', 2));
+        }
+        else
+        {
+            entorno.insert(QStringLiteral("GOW_SCALER"), QStringLiteral("bilinear"));
+            entorno.insert(QStringLiteral("GOW_SHARPEN"), QStringLiteral("0"));
+        }
+    }
     // Resolución interna del GS (1..8; la interfaz resuelve "automático" según la pantalla) e imagen nítida.
     entorno.insert(QStringLiteral("PS2X_GS_ESCALA"), QString::number(std::clamp(a.value(QStringLiteral("escala"), 1).toInt(), 1, 8)));
     // GOW-Port: el renderizador de Waffle (render targets) lee la escala de PS2X_GS_HW_SCALE.

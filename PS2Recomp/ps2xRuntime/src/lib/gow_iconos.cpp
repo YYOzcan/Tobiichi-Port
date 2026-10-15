@@ -96,10 +96,12 @@ namespace
         Boton boton;
         Variante variante;
     };
+    // GOW-Port: "R2ButtonStatic" (el R2 fijo del medidor de la Furia de los Dioses en el HUD) se deja como en el juego: es
+    // decorativo y grande, y con el teclado salía un "CTRL" enorme encima del medidor.
     const Simbolo kSimbolos[] = {
         {"XButton", BCruz, VNormal}, {"CircleButton", BCirculo, VNormal}, {"SquareButton", BCuadrado, VNormal},
         {"TriangleButton", BTriangulo, VNormal}, {"L1Button", BL1, VNormal}, {"R1Button", BR1, VNormal},
-        {"L2Button", BL2, VNormal}, {"R2Button", BR2, VNormal}, {"R2ButtonStatic", BR2, VNormal}, {"L3", BL3, VNormal},
+        {"L2Button", BL2, VNormal}, {"R2Button", BR2, VNormal}, {"L3", BL3, VNormal},
         {"R3", BR3, VNormal}, {"StartButton", BStart, VNormal}, {"SelectButton", BSelect, VNormal},
         {"Joystick", BStickIzq, VNormal}, {"UpButton", BArriba, VNormal}, {"DownButton", BAbajo, VNormal},
         {"LeftButton", BIzquierda, VNormal}, {"RightButton", BDerecha, VNormal}, {"DpadButton", BCruceta, VNormal},

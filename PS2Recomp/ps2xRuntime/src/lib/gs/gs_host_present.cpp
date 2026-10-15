@@ -35,12 +35,40 @@ uniform sampler2D texture0;
 uniform vec2 srcSize;
 uniform float sharpen;
 uniform float plain;
+uniform float fxaa;
 out vec4 finalColor;
 
 vec4 tex(vec2 uv) { return texture(texture0, uv); }
 
+// GOW-Port: FXAA (TOBIICHI_FXAA=1, lanzador) sobre los texeles del juego, antes del escalado de la ventana.
+vec3 fxaaColor(vec2 uv)
+{
+    vec2 inv = 1.0 / srcSize;
+    vec3 rgbNW = tex(uv + vec2(-1.0, -1.0) * inv).rgb, rgbNE = tex(uv + vec2(1.0, -1.0) * inv).rgb;
+    vec3 rgbSW = tex(uv + vec2(-1.0, 1.0) * inv).rgb, rgbSE = tex(uv + vec2(1.0, 1.0) * inv).rgb;
+    vec3 rgbM = tex(uv).rgb;
+    const vec3 luma = vec3(0.299, 0.587, 0.114);
+    float lumaNW = dot(rgbNW, luma), lumaNE = dot(rgbNE, luma), lumaSW = dot(rgbSW, luma), lumaSE = dot(rgbSE, luma);
+    float lumaM = dot(rgbM, luma);
+    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+    vec2 dir = vec2(-((lumaNW + lumaNE) - (lumaSW + lumaSE)), (lumaNW + lumaSW) - (lumaNE + lumaSE));
+    float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 / 8.0), 1.0 / 128.0);
+    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+    dir = clamp(dir * rcpDirMin, vec2(-8.0), vec2(8.0)) * inv;
+    vec3 rgbA = 0.5 * (tex(uv + dir * (1.0 / 3.0 - 0.5)).rgb + tex(uv + dir * (2.0 / 3.0 - 0.5)).rgb);
+    vec3 rgbB = rgbA * 0.5 + 0.25 * (tex(uv - dir * 0.5).rgb + tex(uv + dir * 0.5).rgb);
+    float lumaB = dot(rgbB, luma);
+    return (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
+}
+
 void main()
 {
+    if (fxaa > 0.5)
+    {
+        finalColor = vec4(fxaaColor(fragTexCoord), 1.0);
+        return;
+    }
     if (plain > 0.5)
     {
         // frame at least as large as its window rectangle: one bilinear tap, no bicubic / sharpen
@@ -67,6 +95,11 @@ void main()
            + tex(vec2(tc12.x, tc3.y)) * (w12.x * w3.y);
     float norm = (w12.x * w0.y) + (w0.x * w12.y) + (w12.x * w12.y) + (w3.x * w12.y) + (w12.x * w3.y);
     c /= norm;
+    if (sharpen <= 0.0) // GOW-Port: nitidez 0 = solo el bicúbico
+    {
+        finalColor = vec4(clamp(c.rgb, 0.0, 1.0), 1.0);
+        return;
+    }
     // contrast-adaptive sharpen from the four direct neighbours of the nearest source texel
     vec2 px = 1.0 / srcSize;
     vec3 n = tex(fragTexCoord + vec2(0.0, -px.y)).rgb, s = tex(fragTexCoord + vec2(0.0, px.y)).rgb;
@@ -82,11 +115,16 @@ void main()
 
     Shader g_scaler{};
     int g_scalerSrcSize = -1, g_scalerSharpen = -1, g_scalerPlain = -1;
+    int g_scalerFxaa = -1; // GOW-Port: TOBIICHI_FXAA
     bool g_scalerTried = false;
 
     bool scalerEnabled()
     {
-        static const bool on = [] { const char *v = std::getenv("GOW_SCALER"); return !(v && std::strcmp(v, "bilinear") == 0); }();
+        // GOW-Port: con TOBIICHI_FXAA=1 el sombreador hace falta también con el estirado bilineal.
+        static const bool on = [] {
+            const char *v = std::getenv("GOW_SCALER"), *fxaa = std::getenv("TOBIICHI_FXAA");
+            return !(v && std::strcmp(v, "bilinear") == 0) || (fxaa && fxaa[0] == '1');
+        }();
         return on;
     }
 
@@ -103,6 +141,7 @@ void main()
                     g_scalerSrcSize = GetShaderLocation(g_scaler, "srcSize");
                     g_scalerSharpen = GetShaderLocation(g_scaler, "sharpen");
                     g_scalerPlain = GetShaderLocation(g_scaler, "plain");
+                    g_scalerFxaa = GetShaderLocation(g_scaler, "fxaa");
                 }
                 else
                 {
@@ -328,6 +367,8 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
         SetShaderValue(*scaler, g_scalerSharpen, &sharpen, SHADER_UNIFORM_FLOAT);
         const float plain = magnified ? 0.0f : 1.0f;
         SetShaderValue(*scaler, g_scalerPlain, &plain, SHADER_UNIFORM_FLOAT);
+        static const float fxaa = [] { const char *v = std::getenv("TOBIICHI_FXAA"); return v && v[0] == '1' ? 1.0f : 0.0f; }();
+        SetShaderValue(*scaler, g_scalerFxaa, &fxaa, SHADER_UNIFORM_FLOAT);
         SetTextureFilter(selected.texture, TEXTURE_FILTER_BILINEAR);
         BeginShaderMode(*scaler);
     }

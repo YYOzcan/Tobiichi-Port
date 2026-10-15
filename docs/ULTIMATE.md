@@ -119,3 +119,25 @@ mientras el indicador está activo (medido con seis iconos del menú de pausa y 
   4:3), combate ágil, avisos de QTE.
 - El lanzador (Qt) no se ha recompilado en esta rama.
 - Windows: el código de WGL es el de Waffle, sin cambios de comportamiento, pero no se ha compilado en esta rama.
+
+## Correcciones tras la primera prueba con el lanzador (15 de octubre, noche)
+
+- **El acceso directo abría la rama main.** `~/.local/share/applications/tobiichi-launcher.desktop` apuntaba al
+  lanzador de `Origami Tobiichi/`, que guardaba el ejecutable de main en sus ajustes. Ahora el lanzador de esta rama
+  usa sus propios ajustes (`Tobiichi/LauncherUltimate`) y el acceso directo "Tobiichi Ultimate" lo abre; el de main
+  queda como "Tobiichi Launcher (main)".
+- **Panorámico Hor+ con los overrides de Waffle:** ellos escriben el aspecto 16/9 en cada lectura del mando;
+  `gow_integracion.cpp` vuelve a poner el elegido justo después.
+- **Vídeos a pantalla completa:** con Hor+ el juego dibujaba el vídeo en una caja 4:3 por 0x304D94 = 2 (del parche de
+  PCSX2), que ya no se escribe (`TOBIICHI_PANORAMICO_304D94=1` lo recupera). Además, mientras un
+  vídeo carga o se reproduce (estados 3-9 y 11 en 0x29C838) se deja el modo 16:9 de Waffle (vídeos `.PSW`).
+- **"CTRL" enorme en el medidor de la Furia:** el símbolo `R2ButtonStatic` del HUD es decorativo; ya no se sustituye
+  (con el mapa de teclas por defecto R2 = Ctrl).
+- **Imagen demasiado nítida:** el escalado de Waffle siempre realzaba. El lanzador pasa ahora `GOW_SCALER=bilinear`
+  con los filtros "bilineal" y "pixel", y con "fsr" el bicúbico con `GOW_SHARPEN` = 0,5 × nitidez (0 = sin realce).
+  `TOBIICHI_FXAA=1` aplica FXAA en el mismo sombreador.
+- **Contador de cuadros** (`TOBIICHI_FPS_GOSTER=1`): cuadros del juego (entradas a 0x1837B8) y de la ventana.
+- **Rendimiento:** la caída a 20-35 cuadros/s fue con el perfil `power-saver` (a 1x; con `performance`, 50-56).
+  El límite es la VU1 (~19 ms por cuadro con ese perfil, frente a ~9 ms del generador de VU1 de la rama main con
+  `gow_espera`). Siguiente paso: el generador de VU1 de main (rondas 2 y 3 de KIexster, SIMD, modo rápido) en este
+  runtime.
