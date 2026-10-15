@@ -61,26 +61,24 @@ añade lo nuestro encima. El estado anterior queda en el commit «Instantánea d
 - VU1: `tools/vu1/generar_vu1.cpp` es la versión de KIexster del 9 de octubre (`c73f6e3`), la que corresponde al
   `ps2_vu1_compiled.inl` de Waffle, y `tools/vu1/vu1n_gen.py` el backend nativo de Waffle (con `vu1n_heads.txt`).
 
-## Compilar y jugar (Linux)
+## Compilar y jugar
 
-```sh
-cd PS2Recomp
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2X_ENABLE_RUNTIME_LOGS=OFF \
-  -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_IOP_RPC_TRACE=OFF -DPS2X_BUILD_STUDIO=OFF \
-  -DPS2X_BUILD_ANALYZER=OFF -DPS2X_RUNNER_UNITY_BUILD_BATCH_SIZE=8 \
-  -DPS2X_VU1_MICROCODE_DIR="$PWD/../capturas_vu1" -DPS2X_VU1_GENERATOR_SOURCE="$PWD/../tools/vu1/generar_vu1.cpp" \
-  -DPS2X_VU1N_GEN_OVERRIDE="$PWD/../tools/vu1/vu1n_gen.py"
-nice -n 19 ninja -C build -j3 ps2EntryRunner
-cd .. && ./run_gow.sh
-```
+`./instalar.sh` (Linux) o `instalar.cmd` (Windows), descritos en los README:
 
-El código generado va en `PS2Recomp/ps2xRuntime/src/runner/` (`.cpp` + `src/gow_overrides.cpp`,
-`gow_pad2_packet.h`, `gow_gs_replay.h`) y sus cabeceras en `ps2xRuntime/include/`.
+1. Extrae la ISO en `game/` con `tools/waffle/iso_extract.py --layout` (los 16 archivos, `.disc_layout` y
+   `.disc_meta`): el juego lee el disco extraído sector a sector y ya no necesita la ISO. Copia los IRX a
+   `game/IOP_MOD/` (con enlaces en minúsculas en Linux), de donde los carga el IOP.
+2. Compila `ps2_recomp`, rellena `config/recomp.template.toml` y traduce `SCUS_973.99`; copia a
+   `PS2Recomp/ps2xRuntime/src/runner/` solo los archivos que cambian, más `src/gow_overrides.cpp`,
+   `gow_pad2_packet.h` y `gow_gs_replay.h`, y las cabeceras a `ps2xRuntime/include/`.
+3. Compila `ps2EntryRunner` (Release, sin registros) y el lanzador (Qt 6; en Windows lo descarga con aqtinstall y
+   copia sus bibliotecas con windeployqt).
+4. Optimización (la primera vez, `--optimizar` / `-Optimizar` para repetirla): abre el juego `GOW_PAD_GUION` durante
+   240 s con `GOW_VU1_CAPTURA=capturas_vu1` y `PS2X_IOP_DUMP_MODULES`, genera el IOP nativo con
+   `tools/iop/iopn_gen.py` y recompila con `PS2X_VU1_MICROCODE_DIR` (generar_vu1 + vu1n_gen).
 
-`run_gow.sh` usa los ajustes de `tools/waffle/play.cmd` (`PS2X_GS_WORKER=1`, `GOW_GS_FINISH_ASINCRONO=1`,
-`GOW_AUDIO_DEVICE=default`), escala interna `PS2X_GS_HW_SCALE=2`, la ISO (`GOW_ISO`; este árbol no tiene PART2.PAK
-extraído) y la tarjeta `Mcd001.ps2` propia del árbol. El lanzador pasa los mismos valores y la escala elegida también
-como `PS2X_GS_HW_SCALE`.
+Sin el lanzador: `./run_gow.sh` (ajustes de `tools/waffle/play.cmd`: `PS2X_GS_WORKER=1`,
+`GOW_GS_FINISH_ASINCRONO=1`, `GOW_AUDIO_DEVICE=default`; escala `PS2X_GS_HW_SCALE=2`; tarjeta `game/Mcd001.ps2`).
 
 ## Documentación de Waffle
 

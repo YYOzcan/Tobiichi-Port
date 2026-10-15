@@ -67,3 +67,11 @@ PS2Recomp/ps2xRuntime/src/vu1_compiled/programa*.cpp
 /capturas_vu1
 /Mcd001.ps2
 /disc/
+
+# --- Instaladores (instalar.sh / instalar.ps1): todo se genera a partir del juego del usuario ---
+/build-gen/
+/herramientas/
+/capturas_vu1/
+game/IOP_MOD/
+game/.disc_layout
+game/.disc_meta

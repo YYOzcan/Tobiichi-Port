@@ -226,10 +226,15 @@ QVariantMap Lanzador::pantalla() const
 QVariantMap Lanzador::rutasDetectadas() const
 {
     const QString desde = QCoreApplication::applicationDirPath();
-    QString elf = buscarHaciaArriba(desde, QStringLiteral("SCUS_973.99"));
+    // GOW-Port: el instalador deja el disco extraído en game/ (instalar.sh / instalar.ps1).
+    QString elf = buscarHaciaArriba(desde, QStringLiteral("game/SCUS_973.99"));
+    if (elf.isEmpty())
+        elf = buscarHaciaArriba(desde, QStringLiteral("SCUS_973.99"));
     QString ejecutable = buscarHaciaArriba(desde, kNombreEjecutable);
     if (ejecutable.isEmpty())
         ejecutable = buscarHaciaArriba(desde, QStringLiteral("PS2Recomp/build/ps2xRuntime/") + kNombreEjecutable);
+    if (ejecutable.isEmpty()) // generadores de Visual Studio (una carpeta por configuración)
+        ejecutable = buscarHaciaArriba(desde, QStringLiteral("PS2Recomp/build/ps2xRuntime/Release/") + kNombreEjecutable);
     if (ejecutable.isEmpty())
         ejecutable = buscarHaciaArriba(desde, QStringLiteral("build/ps2xRuntime/") + kNombreEjecutable);
     const QString iso = elf.isEmpty() ? QString() : primeraIso(QFileInfo(elf).absolutePath());
@@ -435,8 +440,9 @@ bool Lanzador::iniciar(const QVariantMap &a)
     // GOW-Port: el runtime de Waffle lee el disco de la ISO (sin PART2.PAK extraído no hay disco completo en la carpeta);
     // sin ISO elegida se usa la primera que haya junto al ELF.
     QString iso = a.value(QStringLiteral("iso")).toString();
-    if (iso.isEmpty())
-        iso = primeraIso(QFileInfo(a.value(QStringLiteral("elf")).toString()).absolutePath());
+    const QString carpetaElf = QFileInfo(a.value(QStringLiteral("elf")).toString()).absolutePath();
+    if (iso.isEmpty() && !QFileInfo::exists(QDir(carpetaElf).absoluteFilePath(QStringLiteral(".disc_layout"))))
+        iso = primeraIso(carpetaElf); // sin disco extraído (.disc_layout), la ISO de la carpeta del ELF
     if (iso.isEmpty())
         entorno.remove(QStringLiteral("GOW_ISO"));
     else
