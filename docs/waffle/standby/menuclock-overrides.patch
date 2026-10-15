@@ -1,0 +1,60 @@
+--- a/port/overrides-usa/gow_overrides.cpp
++++ b/port/overrides-usa/gow_overrides.cpp
+@@ -17,6 +17,8 @@
+ void sub_00147520_0x147520(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+ void sub_0023B6A0_0x23b6a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+ void sub_00149340_0x149340(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++void sub_0017D778_0x17d778(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime); // GOW-Port: frame clock read
++void sub_0017A2A0_0x17a2a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime); // GOW-Port: vid::WaitForDMAComplete
+ void gowDumpBranchRing(const char *why);
+ #include <map>
+ #include <unordered_map>
+@@ -1226,6 +1228,23 @@
+                          position, GPR_U32(ctx, 2), readGuest32(rdram, stream + 4u));
+     }
+ 
++    // GOW_FRAMECLOCK_TRACE=1 (debug): VBlank count and T0 (576 kHz, 9600 ticks per field) at every frame-clock read
++    // (0x17D778) and every vid::WaitForDMAComplete entry (0x17A2A0), to see where in the field the game reads its clock
++    void gowTraceFrameClock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        std::fprintf(stderr, "[fclk] read vs=%llu t0=%u ra=%x\n",
++                     static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load(std::memory_order_acquire)),
++                     runtime->memory().eeTimerLoad(0x10000000u), GPR_U32(ctx, 31));
++        sub_0017D778_0x17d778(rdram, ctx, runtime);
++    }
++    void gowTraceDmaWait(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        std::fprintf(stderr, "[fclk] gswait vs=%llu t0=%u ra=%x\n",
++                     static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load(std::memory_order_acquire)),
++                     runtime->memory().eeTimerLoad(0x10000000u), GPR_U32(ctx, 31));
++        sub_0017A2A0_0x17a2a0(rdram, ctx, runtime);
++    }
++
+     // GOW_SND_CALLLOG=1 (debug): the game's sound-group pause/continue (0x175148(pause, mask)) with its caller
+     void gowDiagSoundGroups(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+@@ -1991,6 +2010,12 @@
+             return;
+         }
+         const uint64_t usec = GPR_U32(ctx, 4);
++        static const bool frameClockTrace = std::getenv("GOW_FRAMECLOCK_TRACE") != nullptr;
++        if (frameClockTrace)
++            std::fprintf(stderr, "[fclk] delay vs=%llu t0=%u usec=%llu thread=%d ra=%x\n",
++                         static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load(std::memory_order_acquire)),
++                         runtime->memory().eeTimerLoad(0x10000000u), static_cast<unsigned long long>(usec),
++                         runtime->eeScheduler().currentThreadId(), GPR_U32(ctx, 31));
+         runtime->eeScheduler().delayCurrent(usec * EeScheduler::kEeClockHz / 1000000u); // resumes with v0 = 0
+     }
+ 
+@@ -2056,6 +2081,11 @@
+             if (std::getenv("GOW_MPEG_DIAG"))
+                 runtime.replaceFunction(0x0017AFE0u, gowDiagStreamRead);
+         }
++        if (std::getenv("GOW_FRAMECLOCK_TRACE"))
++        {
++            runtime.replaceFunction(0x0017D778u, gowTraceFrameClock);
++            runtime.replaceFunction(0x0017A2A0u, gowTraceDmaWait);
++        }
+         if (std::getenv("GOW_RENDER_DIAG"))
+             for (const uint32_t address : {0x001262C8u, 0x00126310u, 0x0012633Cu, 0x00126368u,
+                                            0x00126428u, 0x00126478u, 0x00126528u})

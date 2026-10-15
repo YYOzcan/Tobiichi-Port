@@ -6,29 +6,16 @@
 #ifndef PS2_VU1_COMPILED_INL
 #define PS2_VU1_COMPILED_INL
 
-#include <atomic>
 #include "ps2_vu1_step.inl"
 
 #include <cmath>
-#include <utility>
+#include <cstdlib>
 #include <cstring>
 #if defined(_MSC_VER) || defined(__SSE4_1__)
 #include <immintrin.h>
 #define VU1C_SIMD 1
 #else
 #define VU1C_SIMD 0
-#endif
-
-// GOW-Port: modo rápido de VU1 (PS2X_VU1_RAPIDO=1), con la precisión de PCSX2 (microVU) en lugar de la exacta.
-// Las FMAC del código compilado se calculan en SSE con el MXCSR de run() (redondeo hacia cero; DAZ y FTZ: los
-// subnormales valen cero, como en la PS2), sin las comprobaciones de rango ni la ruta escalar exacta. Los
-// operandos con exponente 255 se llevan al máximo con signo (como normalizeOperand), así no aparecen Inf/NaN.
-// Flags: Z y S por carril; sin U/O ni los bits pegajosos del producto (PCSX2 tampoco los calcula). Los
-// resultados solo cambian en los extremos (desbordamientos, subnormales). Sin la macro, todo queda exacto.
-#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
-inline constexpr bool kVu1Rapido = true;
-#else
-inline constexpr bool kVu1Rapido = false;
 #endif
 
 // GOW-Port: la aritmética de VU no depende de /fp:fast. El runtime se compila con /fp:fast, que deja al
@@ -40,23 +27,6 @@ inline constexpr bool kVu1Rapido = false;
 #pragma fp_contract(off)
 #endif
 
-namespace
-{
-    inline bool productSumFlagsFast(float result, float product, uint8_t &laneFlags)
-    {
-        uint32_t r = 0u, p = 0u;
-        std::memcpy(&r, &result, sizeof(r));
-        std::memcpy(&p, &product, sizeof(p));
-        const int er = static_cast<int>((r >> 23) & 0xFFu);
-        const int ep = static_cast<int>((p >> 23) & 0xFFu);
-        // GOW-Port: también ep > 0xFD, como epOk en el camino SSE: con redondeo hacia cero un producto que
-        // desborda queda en el máximo (exponente 0xFE) y la suma puede parecer normal sin serlo.
-        if (er < 2 || er > 0xFD || er < ep - 20 || ep > 0xFD)
-            return false;
-        laneFlags = (r & 0x80000000u) != 0u ? 0x2u : 0u;
-        return true;
-    }
-}
 #if defined(_MSC_VER)
 #define VU1C_NOINLINE __declspec(noinline)
 #else
@@ -169,30 +139,13 @@ namespace vu1c
     }
 
     // applyDest con la máscara constante.
-    // GOW-Port: un único store de 16 bytes (mezcla de carriles). Varios stores de 4 bytes seguidos de la
-    // lectura de 16 bytes del registro en el par siguiente impedían el reenvío store->load.
     template <uint32_t Dest>
     VU1_STEP_INLINE void applyDestT(float *dst, const float *src)
     {
-        if constexpr (Dest == 0u)
-            return;
-#if defined(_MSC_VER) || defined(__SSE4_1__)
-        else if constexpr (Dest == 0xFu)
-            _mm_storeu_ps(dst, _mm_loadu_ps(src));
-        else
-        {
-            constexpr int lanes = ((Dest & 8u) ? 1 : 0) | ((Dest & 4u) ? 2 : 0) | ((Dest & 2u) ? 4 : 0) | ((Dest & 1u) ? 8 : 0);
-            _mm_storeu_ps(dst, _mm_blend_ps(_mm_loadu_ps(dst), _mm_loadu_ps(src), lanes));
-        }
-#else
-        else
-        {
-            if constexpr ((Dest & 8u) != 0u) dst[0] = src[0];
-            if constexpr ((Dest & 4u) != 0u) dst[1] = src[1];
-            if constexpr ((Dest & 2u) != 0u) dst[2] = src[2];
-            if constexpr ((Dest & 1u) != 0u) dst[3] = src[3];
-        }
-#endif
+        if constexpr ((Dest & 8u) != 0u) dst[0] = src[0];
+        if constexpr ((Dest & 4u) != 0u) dst[1] = src[1];
+        if constexpr ((Dest & 2u) != 0u) dst[2] = src[2];
+        if constexpr ((Dest & 1u) != 0u) dst[3] = src[3];
     }
     // GOW-Port: store de VU1 con DEST constante, escrito en el acto. queueStore lo encolaba con un ciclo de
     // latencia, pero el mismo paso avanza ese ciclo y commitReadyPipelines lo escribe antes de que nada más
@@ -236,15 +189,13 @@ namespace vu1c
     // normalizeOperand en los cuatro carriles: exponente 0 -> cero con signo; exponente 255 -> máximo con signo.
     VU1_STEP_INLINE __m128 normalize4(__m128 v)
     {
-        // GOW-Port: sin blendv. Con a = |bits|: exponente 0 (a < 0x00800000) -> 0; exponente 255 (Inf/NaN,
-        // a >= 0x7F800000) -> min(a, 0x7F7FFFFF) = máximo; el resto queda igual. Luego se repone el signo.
-        // Bit a bit igual que la versión anterior; 6 operaciones simples en lugar de 7 con dos blendv.
         const __m128i bits = _mm_castps_si128(v);
-        const __m128i abs = _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF));
-        const __m128i sign = _mm_xor_si128(bits, abs);
-        const __m128i clamped = _mm_min_epi32(abs, _mm_set1_epi32(0x7F7FFFFF));
-        const __m128i keep = _mm_cmpgt_epi32(abs, _mm_set1_epi32(0x007FFFFF));
-        return _mm_castsi128_ps(_mm_or_si128(sign, _mm_and_si128(clamped, keep)));
+        const __m128i expMask = _mm_set1_epi32(0x7F800000);
+        const __m128i exp = _mm_and_si128(bits, expMask);
+        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
+        __m128i r = _mm_blendv_epi8(bits, sign, _mm_cmpeq_epi32(exp, _mm_setzero_si128()));
+        r = _mm_blendv_epi8(r, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)), _mm_cmpeq_epi32(exp, expMask));
+        return _mm_castsi128_ps(r);
     }
     VU1_STEP_INLINE __m128i exponent4(__m128 v)
     {
@@ -264,85 +215,6 @@ namespace vu1c
     }
     constexpr uint32_t crossLeft(uint32_t c) { return c == 0 ? 1u : c == 1 ? 2u : c == 2 ? 0u : 3u; }
     constexpr uint32_t crossRight(uint32_t c) { return c == 0 ? 2u : c == 1 ? 0u : c == 2 ? 1u : 3u; }
-    // GOW-Port: MAC (bits 0-3 Z, 4-7 S en orden de componente) y estado (Z = bit 0, S = bit 1) de una FMAC a
-    // partir de las máscaras de carriles de movemask (bit 0 = x): índice z | (s << 4), valor mac | (estado << 8).
-    // Una consulta en lugar de invertir los bits de cada máscara en cada FMAC.
-    struct MacStatusTable
-    {
-        uint16_t v[256];
-    };
-    constexpr MacStatusTable makeMacStatusTable()
-    {
-        MacStatusTable t{};
-        for (uint32_t i = 0; i < 256u; ++i)
-        {
-            const uint32_t z = i & 0xFu, s = i >> 4;
-            t.v[i] = static_cast<uint16_t>((reverse4(z) | (reverse4(s) << 4)) | (((s != 0u ? 0x2u : 0u) | (z != 0u ? 0x1u : 0u)) << 8));
-        }
-        return t;
-    }
-    inline constexpr MacStatusTable kMacStatus = makeMacStatusTable();
-
-    // GOW-Port: instrucciones inferiores que lowerT trata en línea: la misma lista que su cadena de if constexpr
-    // (si se añade un caso allí, hay que añadirlo aquí). Las demás llaman a execLower.
-    constexpr bool lowerInline(uint32_t instr)
-    {
-        const uint32_t opHi = (instr >> 25) & 0x7Fu;
-        const uint32_t funct = instr & 0x3Fu;
-        const uint32_t funct2 = (instr & 0x3u) | ((instr >> 4) & 0x7Cu);
-        if (instr == 0x00000000u || instr == 0x8000033Cu)
-            return true;
-        switch (opHi)
-        {
-        case 0x00u: case 0x01u: case 0x04u: case 0x05u: case 0x08u: case 0x09u: // LQ SQ ILW ISW IADDIU ISUBIU
-        case 0x12u: case 0x18u: case 0x1Au: case 0x1Cu:                         // FCAND FMEQ FMAND FCGET
-        case 0x20u: case 0x21u: case 0x24u: case 0x25u:                         // B BAL JR JALR
-        case 0x28u: case 0x29u: case 0x2Cu: case 0x2Du: case 0x2Eu: case 0x2Fu: // IBxx
-            return true;
-        default:
-            break;
-        }
-        if (opHi != 0x40u)
-            return false;
-        if (funct == 0x30u || funct == 0x31u || funct == 0x32u || funct == 0x34u || funct == 0x35u) // IADD ... IOR
-            return true;
-        return funct >= 0x3Cu && (funct2 == 0x30u || funct2 == 0x31u || funct2 == 0x34u || funct2 == 0x35u ||
-                                  funct2 == 0x3Bu || funct2 == 0x38u || funct2 == 0x3Cu || funct2 == 0x3Du);
-    }
-    // Inferiores en línea que escriben VF[ft]: LQ, MOVE, MR32, LQI y MFIR. ¿Lo hacen en VF0?
-    constexpr bool lowerInlineWritesVf0(uint32_t instr)
-    {
-        const uint32_t opHi = (instr >> 25) & 0x7Fu;
-        const uint32_t funct = instr & 0x3Fu;
-        const uint32_t funct2 = (instr & 0x3u) | ((instr >> 4) & 0x7Cu);
-        if (((instr >> 16) & 0x1Fu) != 0u || instr == 0x00000000u || instr == 0x8000033Cu)
-            return false;
-        if (opHi == 0x00u)
-            return true;
-        return opHi == 0x40u && funct >= 0x3Cu && (funct2 == 0x30u || funct2 == 0x31u || funct2 == 0x34u || funct2 == 0x3Du);
-    }
-    // ¿Puede la instrucción superior escribir VF0? (FMAC con fd = 0, ITOF/FTOI/ABS con ft = 0 o execUpper.)
-    constexpr bool upperMayWriteVf0(uint32_t upper)
-    {
-        const UpperInfo info = classify(upper);
-        if (info.kind == Kind::Nop)
-            return false;
-        if (const uint32_t special = simpleSpecial(upper); special != 0u)
-            return special != 0x1Fu && ((upper >> 16) & 0x1Fu) == 0u; // CLIP no escribe VF
-        if (info.kind == Kind::Other)
-            return true;
-        return !info.toAcc && ((upper >> 6) & 0x1Fu) == 0u;
-    }
-    // El generador indica con T::clearBranchBackup = false que el par anterior del bloque no guardó un VI para
-    // un salto (m_viBranchBackupValid ya es falso).
-    template <class T>
-    constexpr bool clearBranchBackup()
-    {
-        if constexpr (requires { T::clearBranchBackup; })
-            return T::clearBranchBackup;
-        else
-            return true;
-    }
 }
 
 // Una componente de una operación FMAC: calcula como execUpper (operandos normalizados, mismas expresiones
@@ -434,19 +306,19 @@ VU1_STEP_INLINE void VU1Interpreter::fmacLaneT(float &result, uint8_t &laneFlags
                 return;
             }
         }
-        double exact = 0.0; // GOW-Port: double como en MSVC (ver calculateFmacExactResult)
+        long double exact = 0.0L;
         if constexpr (cross && C == 3u)
-            exact = 0.0;
+            exact = 0.0L;
         else if constexpr (info.kind == vu1c::Kind::Add)
-            exact = static_cast<double>(vs) + static_cast<double>(right);
+            exact = static_cast<long double>(vs) + static_cast<long double>(right);
         else if constexpr (info.kind == vu1c::Kind::Sub)
-            exact = static_cast<double>(vs) - static_cast<double>(right);
+            exact = static_cast<long double>(vs) - static_cast<long double>(right);
         else if constexpr (info.kind == vu1c::Kind::Madd)
-            exact = static_cast<double>(acc) + static_cast<double>(vs) * static_cast<double>(right);
+            exact = static_cast<long double>(acc) + static_cast<long double>(vs) * static_cast<long double>(right);
         else if constexpr (info.kind == vu1c::Kind::Msub || info.kind == vu1c::Kind::Opmsub)
-            exact = static_cast<double>(acc) - static_cast<double>(vs) * static_cast<double>(right);
+            exact = static_cast<long double>(acc) - static_cast<long double>(vs) * static_cast<long double>(right);
         else
-            exact = static_cast<double>(vs) * static_cast<double>(right);
+            exact = static_cast<long double>(vs) * static_cast<long double>(right);
         laneFlags = normalizeFmacExactResult(result, exact);
     }
 }
@@ -455,14 +327,14 @@ template <uint32_t Upper, bool DeadFlags>
 VU1_STEP_INLINE void VU1Interpreter::upperT()
 {
     constexpr vu1c::UpperInfo info = vu1c::classify(Upper);
-    // GOW-Port: sin escribir m_currentUpperInstruction en NOP ni en los especiales: solo lo leen las funciones
-    // de la ruta escalar de FMAC, y fmacScalarT y execUpper lo asignan antes.
     if constexpr (info.kind == vu1c::Kind::Nop)
     {
+        m_currentUpperInstruction = Upper;
     }
     else if constexpr (constexpr uint32_t special = vu1c::simpleSpecial(Upper); special != 0u)
     {
         // Copia de los casos de execUpper (ps2_vu1_upper.cpp) con los campos resueltos.
+        m_currentUpperInstruction = Upper;
         constexpr uint32_t dest = (Upper >> 21) & 0xFu;
         constexpr uint32_t ft = (Upper >> 16) & 0x1Fu;
         constexpr uint32_t fs = (Upper >> 11) & 0x1Fu;
@@ -480,18 +352,6 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
                 std::memcpy(&orderedBits, &bits, sizeof(orderedBits));
                 return orderedBits > limit;
             };
-#if VU1C_SIMD
-            // GOW-Port: las seis comparaciones con dos cmpgt sobre x, y, z (bits con y sin el signo invertido) y
-            // los dos movemask intercalados con una tabla (bit c -> bit 2c). Igual que exceeds() carril a carril.
-            (void)exceeds;
-            static constexpr uint8_t kSpread[8] = {0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15};
-            const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[fs]));
-            const __m128i lim = _mm_set1_epi32(limit);
-            const int above = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(bits, lim))) & 7;
-            const int below = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(
-                _mm_xor_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u))), lim))) & 7;
-            const uint32_t flags = kSpread[above] | (static_cast<uint32_t>(kSpread[below]) << 1);
-#else
             uint32_t flags = 0u;
             if (exceeds(m_state.vf[fs][0], 0x00000000u)) flags |= 0x01u;
             if (exceeds(m_state.vf[fs][0], 0x80000000u)) flags |= 0x02u;
@@ -499,58 +359,8 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
             if (exceeds(m_state.vf[fs][1], 0x80000000u)) flags |= 0x08u;
             if (exceeds(m_state.vf[fs][2], 0x00000000u)) flags |= 0x10u;
             if (exceeds(m_state.vf[fs][2], 0x80000000u)) flags |= 0x20u;
-#endif
-            if (m_flagCount < kMaxFlagEntries) [[likely]]
-            {
-                // GOW-Port: queueClip + pushFlagEntry en línea (mismos campos).
-                m_workingClip = ((m_workingClip << 6) | flags) & 0xFFFFFFu;
-                FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + m_flagCount) % kMaxFlagEntries];
-                ++m_flagCount;
-                entry.mac = entry.status = entry.extraSticky = 0u;
-                entry.clip = m_workingClip;
-                entry.valid = true;
-                entry.writesMac = entry.writesStatus = entry.writesSticky = false;
-                entry.writesClip = true;
-                entry.issueCycle = m_cycle;
-                entry.readyCycle = m_cycle + kFmacLatency;
-            }
-            else
-                queueClip(flags);
+            queueClip(flags);
         }
-#if VU1C_SIMD
-        else if constexpr (dest != 0u)
-        {
-            // GOW-Port: ITOF/FTOI/ABS en los cuatro carriles. Mismo resultado que el bucle de abajo: el escalado
-            // es por una potencia de dos (exacto salvo desbordar, y desbordado sigue siendo >= 2^31 o <= -2^31),
-            // cvt usa el redondeo del MXCSR igual que static_cast, y cvtt da INT_MIN fuera de rango; se corrige
-            // a INT_MAX en el lado positivo como vu1c::floatToInt (2147483647 en double equivale a 2^31 en float).
-            const __m128 src = _mm_loadu_ps(m_state.vf[fs]);
-            __m128 r;
-            if constexpr (special <= 0x13u) // ITOF
-            {
-                r = _mm_cvtepi32_ps(_mm_castps_si128(src));
-                if constexpr (special == 0x11u)
-                    r = _mm_div_ps(r, _mm_set1_ps(16.0f));
-                else if constexpr (special == 0x12u)
-                    r = _mm_div_ps(r, _mm_set1_ps(4096.0f));
-                else if constexpr (special == 0x13u)
-                    r = _mm_div_ps(r, _mm_set1_ps(32768.0f));
-            }
-            else if constexpr (special <= 0x17u) // FTOI
-            {
-                constexpr float scale = special == 0x14u ? 1.0f : special == 0x15u ? 16.0f : special == 0x16u ? 4096.0f : 32768.0f;
-                // Modo rápido: sin normalize4 (DAZ anula los subnormales; Inf sigue saturando a INT_MAX/INT_MIN).
-                const __m128 scaled = _mm_mul_ps(kVu1Rapido ? src : vu1c::normalize4(src), _mm_set1_ps(scale));
-                const __m128i truncated = _mm_cvttps_epi32(scaled);
-                const __m128 positiveOverflow = _mm_cmpge_ps(scaled, _mm_set1_ps(2147483648.0f));
-                r = _mm_blendv_ps(_mm_castsi128_ps(truncated), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)), positiveOverflow);
-            }
-            else // ABS
-                r = _mm_and_ps(vu1c::normalize4(src), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
-            float *target = m_state.vf[ft];
-            _mm_storeu_ps(target, _mm_blend_ps(_mm_loadu_ps(target), r, vu1c::laneBits(dest)));
-        }
-#endif
         else
         {
             float result[4];
@@ -589,75 +399,10 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
     }
     else
     {
-        // GOW-Port: m_currentUpperInstruction solo lo leen las funciones de la ruta escalar: se asigna en
-        // fmacScalarT y no en cada FMAC del camino rápido.
+        m_currentUpperInstruction = Upper;
         constexpr uint32_t dest = (Upper >> 21) & 0xFu;
         constexpr uint32_t fd = (Upper >> 6) & 0x1Fu;
 #if VU1C_SIMD
-        // GOW-Port: modo rápido (kVu1Rapido): la FMAC en SSE sin cribas de rango ni ruta escalar.
-#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
-        if constexpr (dest != 0u && info.kind != vu1c::Kind::Max && info.kind != vu1c::Kind::Mini &&
-                      !((info.kind == vu1c::Kind::Opmsub || info.kind == vu1c::Kind::Opmula) && (dest & 1u) != 0u))
-        {
-            constexpr bool crossR = info.kind == vu1c::Kind::Opmsub || info.kind == vu1c::Kind::Opmula;
-            constexpr uint32_t fs = (Upper >> 11) & 0x1Fu;
-            constexpr uint32_t ft = (Upper >> 16) & 0x1Fu;
-            constexpr int lanes = vu1c::laneBits(dest);
-            constexpr bool productSum = info.kind == vu1c::Kind::Madd || info.kind == vu1c::Kind::Msub ||
-                                        info.kind == vu1c::Kind::Opmsub;
-            __m128 vs = _mm_loadu_ps(m_state.vf[fs]);
-            if constexpr (crossR)
-                vs = _mm_shuffle_ps(vs, vs, _MM_SHUFFLE(3, 0, 2, 1));
-            __m128 right;
-            if constexpr (info.source == vu1c::Source::Q)
-                right = _mm_set1_ps(m_state.q);
-            else if constexpr (info.source == vu1c::Source::I)
-                right = _mm_set1_ps(m_state.i);
-            else
-            {
-                right = _mm_loadu_ps(m_state.vf[ft]);
-                if constexpr (crossR)
-                    right = _mm_shuffle_ps(right, right, _MM_SHUFFLE(3, 1, 0, 2));
-                else if constexpr (info.source == vu1c::Source::Broadcast)
-                    right = _mm_shuffle_ps(right, right, _MM_SHUFFLE(info.bc, info.bc, info.bc, info.bc));
-            }
-            __m128 r;
-            if constexpr (info.kind == vu1c::Kind::Add)
-                r = _mm_add_ps(vs, right);
-            else if constexpr (info.kind == vu1c::Kind::Sub)
-                r = _mm_sub_ps(vs, right);
-            else if constexpr (productSum)
-            {
-                const __m128 product = _mm_mul_ps(vs, right);
-                r = info.kind == vu1c::Kind::Madd ? _mm_add_ps(_mm_loadu_ps(m_state.acc), product)
-                                                  : _mm_sub_ps(_mm_loadu_ps(m_state.acc), product);
-            }
-            else
-                r = _mm_mul_ps(vs, right); // Mul, Opmula
-            // Como el modo "Normal" de PCSX2: el resultado se limita a ±máximo (un operando con exponente 255 daría
-            // Inf o NaN; con redondeo hacia cero las operaciones finitas nunca desbordan a Inf). NaN -> -máximo.
-            r = _mm_min_ps(_mm_max_ps(r, _mm_set1_ps(-3.40282346638528859812e+38f)), _mm_set1_ps(3.40282346638528859812e+38f));
-            // Flags: el estado no se calcula (ningún microprograma del juego lo lee: no hay FSAND/FSEQ/FSOR/FSSET en el
-            // código compilado). Con DeadFlags (el generador sabe que otra FMAC del bloque reescribe el MAC antes de
-            // que nadie lo lea) tampoco el MAC. Si no, MAC perezoso: Z y S van a una cola pequeña con el ciclo en que
-            // se ven y FMEQ/FMAND/FMOR lo resuelven al leerlo (vu1RapidoResolverMacT, ps2_vu1_step.inl).
-            if constexpr (!DeadFlags)
-            {
-                const uint32_t signs = static_cast<uint32_t>(_mm_movemask_ps(r)) & static_cast<uint32_t>(lanes);
-                const uint32_t zeros = static_cast<uint32_t>(_mm_movemask_ps(_mm_cmpeq_ps(r, _mm_setzero_ps()))) & static_cast<uint32_t>(lanes);
-                Vu1MacRapido &cola = g_vu1MacRapido;
-                const uint32_t i = cola.n++ & (Vu1MacRapido::kN - 1u);
-                cola.listo[i] = m_cycle + kFmacLatency;
-                cola.mac[i] = vu1c::kMacStatus.v[zeros | (signs << 4)] & 0xFFu;
-            }
-            float *target = info.toAcc ? m_state.acc : m_state.vf[fd];
-            if constexpr (dest == 0xFu)
-                _mm_storeu_ps(target, r);
-            else
-                _mm_storeu_ps(target, _mm_blend_ps(_mm_loadu_ps(target), r, lanes));
-            return;
-        }
-#endif
         // Los cuatro carriles con SSE. Mismas operaciones en float que fmacLaneT (cada producto y suma se
         // redondea por separado con el MXCSR del VU), así que el resultado es el mismo bit a bit. Si algún
         // carril activo saldría del camino rápido de los flags (resultado o producto cerca de cero, de los
@@ -674,12 +419,10 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
             if constexpr (cross)
                 vs = _mm_shuffle_ps(vs, vs, _MM_SHUFFLE(3, 0, 2, 1));
             __m128 right;
-            // GOW-Port: en VU1, Q solo lo escribe la FDIV (normalizeResult en queueQ; empieza en 1,0) e I solo
-            // LOI con normalizeOperand: ya están normalizados.
             if constexpr (info.source == vu1c::Source::Q)
-                right = _mm_set1_ps(m_state.q);
+                right = _mm_set1_ps(normalizeOperand(m_state.q));
             else if constexpr (info.source == vu1c::Source::I)
-                right = _mm_set1_ps(m_state.i);
+                right = _mm_set1_ps(normalizeOperand(m_state.i));
             else
             {
                 right = vu1c::normalize4(_mm_loadu_ps(m_state.vf[ft]));
@@ -706,75 +449,54 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
                     r = _mm_sub_ps(vs, right);
                 else if constexpr (productSum)
                 {
-                    // GOW-Port: ACC solo lo escriben resultados de FMAC ya normalizados (camino rápido con exponente
-                    // 1..0xFD o cero, ruta escalar y el intérprete con normalizeFmacResult; empieza en 0), así que
-                    // normalize4 sobre ACC no cambia nada.
-                    accValue = _mm_loadu_ps(m_state.acc);
+                    accValue = vu1c::normalize4(_mm_loadu_ps(m_state.acc));
                     product = _mm_mul_ps(vs, right);
                     r = info.kind == vu1c::Kind::Madd ? _mm_add_ps(accValue, product) : _mm_sub_ps(accValue, product);
                 }
                 else
                     r = _mm_mul_ps(vs, right); // Mul, Opmula
+                const __m128i er = vu1c::exponent4(r);
                 const __m128i absMask = _mm_set1_epi32(0x7FFFFFFF);
-                // GOW-Port: los rangos de exponente se comprueban sobre |bits| con una suma y una comparación con
-                // signo (rango sin signo desplazado a 0x80000000) en vez de extraer el exponente y comparar dos veces.
-                // |r| en [0x01000000, 0x7EFFFFFF] <=> exponente 2..0xFD; en [0x00800000, 0x7EFFFFFF] <=> 1..0xFD.
-                const __m128i absR = _mm_and_si128(_mm_castps_si128(r), absMask);
                 // Un operando normalizado es cero: el producto exacto es cero con signo (como el redondeado).
-                // GOW-Port: comparación en float con 0: los operandos están normalizados (sin subnormales ni
-                // NaN), así que solo ±0 es igual a 0 (igual que |bits| == 0, con una operación menos).
-                const __m128i opZero = _mm_castps_si128(_mm_or_ps(_mm_cmpeq_ps(vs, _mm_setzero_ps()),
-                                                                  _mm_cmpeq_ps(right, _mm_setzero_ps())));
+                const __m128i opZero = _mm_or_si128(
+                    _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(vs), absMask), _mm_setzero_si128()),
+                    _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(right), absMask), _mm_setzero_si128()));
                 __m128i ok;
                 if constexpr (productSum)
                 {
                     // productSumFlagsFast (exponente del resultado 2..0xFD y no mucho menor que el del producto)
                     // y productStickyFlags (exponente del producto 2..0xFD, o producto exactamente cero).
-                    const __m128i absP = _mm_and_si128(_mm_castps_si128(product), absMask);
-                    const __m128i erNormal = _mm_cmpgt_epi32(_mm_set1_epi32(static_cast<int>(0xFE000000u)),
-                                                             _mm_add_epi32(absR, _mm_set1_epi32(0x7F000000)));
-                    const __m128i epOk = _mm_cmpgt_epi32(_mm_set1_epi32(static_cast<int>(0xFE000000u)),
-                                                         _mm_add_epi32(absP, _mm_set1_epi32(0x7F000000)));
-                    // er > ep - 21 <=> |r| + 20*2^23 >= (|p| sin mantisa). Con er >= 0xEB la suma desborda y da falso:
-                    // el carril va a la ruta escalar (exacta); solo pasa con resultados de 2^108 o más.
-                    const __m128i notSmaller = _mm_cmpgt_epi32(_mm_add_epi32(absR, _mm_set1_epi32(0x0A000001)),
-                                                               _mm_and_si128(absP, _mm_set1_epi32(0x7F800000)));
+                    const __m128i ep = vu1c::exponent4(product);
+                    ok = _mm_and_si128(_mm_cmpgt_epi32(er, _mm_set1_epi32(1)), _mm_cmplt_epi32(er, _mm_set1_epi32(0xFE)));
+                    ok = _mm_and_si128(ok, _mm_cmpgt_epi32(er, _mm_sub_epi32(ep, _mm_set1_epi32(21))));
+                    const __m128i epOk = _mm_and_si128(_mm_cmpgt_epi32(ep, _mm_set1_epi32(1)), _mm_cmplt_epi32(ep, _mm_set1_epi32(0xFE)));
+                    ok = _mm_and_si128(ok, _mm_or_si128(epOk, opZero));
                     // GOW-Port: con un factor cero, ACC ∓ 0 es exacto en float (ACC es cero o normal), así que el
                     // carril vale también con resultado cero o en los extremos; sus flags son Z (si es cero) y S.
-                    ok = _mm_or_si128(_mm_and_si128(_mm_and_si128(erNormal, notSmaller), epOk), opZero);
-                    const __m128i rZero = _mm_cmpeq_epi32(absR, _mm_setzero_si128());
-                    // GOW-Port: primera criba barata. Si todos los carriles pasan ya aquí (lo normal), la
-                    // comprobación de factor ±1 de abajo no cambia nada: un carril que pasa con resultado cero solo
-                    // puede hacerlo por un factor cero (exponente 0 no está en 2..0xFD), así que Z = resultado cero.
-                    if ((_mm_movemask_ps(_mm_castsi128_ps(ok)) & lanes) == lanes) [[likely]]
-                    {
-                        zeroLanes = _mm_movemask_ps(_mm_castsi128_ps(rZero)) & lanes;
-                        zeroProduct = _mm_movemask_ps(_mm_castsi128_ps(opZero)) & lanes;
-                    }
-                    else
-                    {
-                        // GOW-Port: con un factor ±1 el producto es exacto (el otro factor normalizado), así que el
-                        // resultado en float es la suma exacta redondeada una vez: con exponente 2..0xFD no cambia y
-                        // sus flags son el signo, y si ACC cancela exactamente el producto es un cero exacto (+0, Z).
-                        const __m128i one = _mm_set1_epi32(0x3F800000);
-                        const __m128i exactProduct = _mm_or_si128(
-                            _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(vs), absMask), one),
-                            _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(right), absMask), one));
-                        const __m128 cancelled = info.kind == vu1c::Kind::Madd
-                            ? _mm_cmpeq_ps(accValue, _mm_xor_ps(product, _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u)))))
-                            : _mm_cmpeq_ps(accValue, product);
-                        const __m128i exactZero = _mm_and_si128(exactProduct, _mm_and_si128(rZero, _mm_castps_si128(cancelled)));
-                        ok = _mm_or_si128(ok, _mm_and_si128(exactProduct, _mm_or_si128(erNormal, exactZero)));
-                        zeroLanes = _mm_movemask_ps(_mm_castsi128_ps(_mm_and_si128(_mm_or_si128(opZero, exactZero), rZero))) & lanes;
-                        zeroProduct = _mm_movemask_ps(_mm_castsi128_ps(opZero)) & lanes;
-                    }
+                    ok = _mm_or_si128(ok, opZero);
+                    const __m128i rZero = _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(r), absMask), _mm_setzero_si128());
+                    // GOW-Port: con un factor ±1 el producto es exacto (el otro factor normalizado), así que el
+                    // resultado en float es la suma exacta redondeada una vez: con exponente 2..0xFD no cambia y
+                    // sus flags son el signo, y si ACC cancela exactamente el producto es un cero exacto (+0, Z).
+                    const __m128i one = _mm_set1_epi32(0x3F800000);
+                    const __m128i exactProduct = _mm_or_si128(
+                        _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(vs), absMask), one),
+                        _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(right), absMask), one));
+                    const __m128 cancelled = info.kind == vu1c::Kind::Madd
+                        ? _mm_cmpeq_ps(accValue, _mm_xor_ps(product, _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u)))))
+                        : _mm_cmpeq_ps(accValue, product);
+                    const __m128i exactZero = _mm_and_si128(exactProduct, _mm_and_si128(rZero, _mm_castps_si128(cancelled)));
+                    const __m128i erNormal = _mm_and_si128(_mm_cmpgt_epi32(er, _mm_set1_epi32(1)), _mm_cmplt_epi32(er, _mm_set1_epi32(0xFE)));
+                    ok = _mm_or_si128(ok, _mm_and_si128(exactProduct, _mm_or_si128(erNormal, exactZero)));
+                    zeroLanes = _mm_movemask_ps(_mm_castsi128_ps(_mm_and_si128(_mm_or_si128(opZero, exactZero), rZero))) & lanes;
+                    zeroProduct = _mm_movemask_ps(_mm_castsi128_ps(opZero)) & lanes;
                 }
                 else
                 {
                     // Add, Sub, Mul: exponente del resultado 1..0xFD, o cero exacto.
                     // GOW-Port: con FTZ, r==0 tambien puede ocultar una cancelacion subnormal.
                     // Comprobar operandos opuestos/iguales conserva su flag U en el camino escalar.
-                    ok = _mm_cmpgt_epi32(_mm_set1_epi32(static_cast<int>(0xFE800000u)), _mm_add_epi32(absR, _mm_set1_epi32(0x7F800000)));
+                    ok = _mm_and_si128(_mm_cmpgt_epi32(er, _mm_setzero_si128()), _mm_cmplt_epi32(er, _mm_set1_epi32(0xFE)));
                     __m128i exactZero;
                     if constexpr (info.kind == vu1c::Kind::Add)
                         exactZero = _mm_castps_si128(_mm_cmpeq_ps(vs, _mm_xor_ps(right,
@@ -792,44 +514,18 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
             {
                 if constexpr (info.kind != vu1c::Kind::Max && info.kind != vu1c::Kind::Mini)
                 {
+                    const int signs = _mm_movemask_ps(r) & lanes;
+                    const uint32_t productSticky =
+                        productSum ? ((_mm_movemask_ps(product) & lanes) != 0 ? 0x2u : 0u) | (zeroProduct != 0 ? 0x1u : 0u) : 0u;
                     if (DeadFlags && m_statusQuiet)
-                    {
-                        // GOW-Port: solo los bits pegajosos. S: algún signo en el resultado o en el producto (un
-                        // movemask del OR de los dos); Z: algún resultado o producto cero. Igual que antes.
-                        const int anySign = _mm_movemask_ps(productSum ? _mm_or_ps(r, product) : r) & lanes;
-                        const int anyZero = zeroLanes | zeroProduct;
-                        m_state.status |= (static_cast<uint32_t>(anySign != 0) << 7) | (static_cast<uint32_t>(anyZero != 0) << 6);
-                    }
-                    else if (m_flagCount < kMaxFlagEntries)
-                    {
-                        const int signs = _mm_movemask_ps(r) & lanes;
-                        const uint32_t productSticky =
-                            productSum ? ((_mm_movemask_ps(product) & lanes) != 0 ? 0x2u : 0u) | (zeroProduct != 0 ? 0x1u : 0u) : 0u;
-                        // GOW-Port: updateFmacFlags + pushFlagEntry en línea (era ~6 % del hilo del juego). En el
-                        // camino rápido solo hay Z y S. Máscara SSE: bit 0 = x; MAC: bit 3 = x (orden invertido).
-                        static constexpr uint8_t kReverse4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
-                        FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + m_flagCount) % kMaxFlagEntries];
-                        ++m_flagCount;
-                        entry.mac = kReverse4[zeroLanes] | (static_cast<uint32_t>(kReverse4[signs]) << 4u);
-                        entry.status = (zeroLanes != 0 ? 0x1u : 0u) | (signs != 0 ? 0x2u : 0u);
-                        entry.extraSticky = productSticky;
-                        entry.clip = 0u;
-                        entry.valid = true;
-                        entry.writesMac = entry.writesStatus = true;
-                        entry.writesSticky = entry.writesClip = false;
-                        entry.issueCycle = m_cycle;
-                        entry.readyCycle = m_cycle + kFmacLatency;
-                    }
+                        m_state.status |= ((signs != 0 ? 0x2u : 0u) | (zeroLanes != 0 ? 0x1u : 0u) | productSticky) << 6;
                     else
                     {
-                        const int signs = _mm_movemask_ps(r) & lanes;
-                        const uint32_t productSticky =
-                            productSum ? ((_mm_movemask_ps(product) & lanes) != 0 ? 0x2u : 0u) | (zeroProduct != 0 ? 0x1u : 0u) : 0u;
                         // Mismo MAC y status que updateFmacFlags con los flags por carril (Z = bit 0, S = bit 1).
                         const uint32_t z = static_cast<uint32_t>(zeroLanes) & static_cast<uint32_t>(lanes);
                         const uint32_t sg = static_cast<uint32_t>(signs) & static_cast<uint32_t>(lanes);
-                        const uint32_t macStatus = vu1c::kMacStatus.v[z | (sg << 4)];
-                        pushFmacFlags(macStatus & 0xFFu, macStatus >> 8, productSticky);
+                        pushFmacFlags(vu1c::reverse4(z) | (vu1c::reverse4(sg) << 4),
+                                      (sg != 0u ? 0x2u : 0u) | (z != 0u ? 0x1u : 0u), productSticky);
                     }
                 }
                 float *target = info.toAcc ? m_state.acc : m_state.vf[fd];
@@ -848,7 +544,6 @@ VU1_STEP_INLINE void VU1Interpreter::upperT()
 template <uint32_t Upper, bool DeadFlags>
 VU1C_NOINLINE void VU1Interpreter::fmacScalarT()
 {
-    m_currentUpperInstruction = Upper;
     constexpr vu1c::UpperInfo info = vu1c::classify(Upper);
     constexpr uint32_t dest = (Upper >> 21) & 0xFu;
     constexpr uint32_t fd = (Upper >> 6) & 0x1Fu;
@@ -867,8 +562,7 @@ VU1C_NOINLINE void VU1Interpreter::fmacScalarT()
                 // antes de que nadie pueda leer estos. Con m_statusQuiet solo cuentan sus bits pegajosos,
                 // que el estado acumula en cualquier orden (y quedan igual al final del bloque).
                 // GOW-Port: no leer status ahora no hace muertos sus bits persistentes.
-                constexpr bool isProductSum = info.kind == vu1c::Kind::Madd || info.kind == vu1c::Kind::Msub || info.kind == vu1c::Kind::Opmsub;
-                const uint32_t productSticky = isProductSum ? calculateFmacProductSticky(static_cast<uint8_t>(dest)) : 0u;
+                const uint32_t productSticky = (productFlags[0] | productFlags[1] | productFlags[2] | productFlags[3]) & 0xFu;
                 if (DeadFlags && m_statusQuiet)
                     m_state.status |= static_cast<uint32_t>((laneFlags[0] | laneFlags[1] | laneFlags[2] | laneFlags[3] | productSticky) & 0xFu) << 6;
                 else
@@ -888,7 +582,10 @@ VU1C_NOINLINE void VU1Interpreter::fmacScalarT()
             }
         }
         float *target = info.toAcc ? m_state.acc : m_state.vf[fd];
-        vu1c::applyDestT<dest>(target, result);
+        if constexpr ((dest & 8u) != 0u) target[0] = result[0];
+        if constexpr ((dest & 4u) != 0u) target[1] = result[1];
+        if constexpr ((dest & 2u) != 0u) target[2] = result[2];
+        if constexpr ((dest & 1u) != 0u) target[3] = result[3];
 }
 
 // Instrucciones inferiores frecuentes especializadas. Cada caso es copia exacta del de execLower
@@ -934,8 +631,6 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
         {
             uint32_t words[4]{};
             std::memcpy(words, m_state.vf[fs], sizeof(words));
-            if (m_xgkick.active)
-                xgkickAdvanceTo(m_cycle); // GOW-Port: PATH1 copia antes de que la VU escriba en su memoria
             vu1c::storeT<dest>(vuData + addr, words);
         }
     }
@@ -960,8 +655,6 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
         {
             const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viT] & 0xFFFF));
             const uint32_t words[4] = {val, val, val, val};
-            if (m_xgkick.active)
-                xgkickAdvanceTo(m_cycle); // GOW-Port: PATH1 copia antes de que la VU escriba en su memoria
             vu1c::storeT<dest>(vuData + addr, words);
         }
     }
@@ -976,96 +669,31 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
                 m_state.vi[viT] = static_cast<int16_t>(m_state.vi[viS] - imm);
         }
     }
-    // GOW-Port: lectores de flags, BAL, JR y JALR, copias de execLower (ps2_vu1_lower.cpp). Eran el 85 % de las
-    // llamadas a execLower desde el código compilado.
-    else if constexpr (opHi == 0x12u) // FCAND
-    {
-        // GOW-Port: flags listos en este ciclo (sin llamada si la cabeza de la cola aún no está lista).
-        if (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
-            commitReadyFlags();
-        constexpr uint32_t imm24 = instr & 0xFFFFFFu;
-        m_state.vi[1] = ((m_state.clip & imm24) != 0u) ? 1 : 0;
-    }
-    else if constexpr (opHi == 0x18u) // FMEQ
-    {
-        if (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
-            commitReadyFlags();
-#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
-        vu1RapidoResolverMacT(m_state.mac, m_cycle); // MAC perezoso (ps2_vu1_step.inl)
-#endif
-        if constexpr (viT != 0)
-            m_state.vi[viT] = ((m_state.mac & 0xFFFFu) == static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS]))) ? 1 : 0;
-    }
-    else if constexpr (opHi == 0x1Au) // FMAND
-    {
-        if (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
-            commitReadyFlags();
-#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
-        vu1RapidoResolverMacT(m_state.mac, m_cycle); // MAC perezoso (ps2_vu1_step.inl)
-#endif
-        if constexpr (viT != 0)
-            m_state.vi[viT] = static_cast<int32_t>(m_state.mac & static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS])));
-    }
-    else if constexpr (opHi == 0x1Cu) // FCGET
-    {
-        if (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
-            commitReadyFlags();
-        if constexpr (viT != 0)
-            m_state.vi[viT] = static_cast<int32_t>(m_state.clip & 0x0FFFu);
-    }
-    else if constexpr (opHi == 0x21u) // BAL
-    {
-        const uint32_t target = (m_state.pc + 8 + imm11 * 8) & 0x3FFFu /* GOW-Port: VU1 (el código compilado solo corre en VU1) */;
-        if constexpr (viT != 0)
-            m_state.vi[viT] = static_cast<int32_t>((m_state.pc + 16) / 8);
-        m_state.branchPending = true;
-        m_state.branchTarget = target;
-        m_state.branchDelay = 1;
-    }
-    else if constexpr (opHi == 0x24u || opHi == 0x25u) // JR / JALR
-    {
-        // JR/JALR leen el VI actual; el valor retrasado se usa solo en las ramas condicionales.
-        const uint32_t target = (static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS])) * 8u) & 0x3FFFu /* GOW-Port: VU1 (el código compilado solo corre en VU1) */;
-        if constexpr (opHi == 0x25u && viT != 0)
-            m_state.vi[viT] = static_cast<int32_t>((m_state.pc + 16) / 8);
-        m_state.branchPending = true;
-        m_state.branchTarget = target;
-        m_state.branchDelay = 1;
-    }
     else if constexpr (opHi == 0x20u) // B
     {
-        const uint32_t target = (m_state.pc + 8 + imm11 * 8) & 0x3FFFu /* GOW-Port: VU1 (el código compilado solo corre en VU1) */;
+        const uint32_t target = (m_state.pc + 8 + imm11 * 8) & microAddressMask();
         m_state.branchPending = true;
         m_state.branchTarget = target;
         m_state.branchDelay = 1;
     }
     else if constexpr (opHi == 0x28u || opHi == 0x29u || (opHi >= 0x2Cu && opHi <= 0x2Fu)) // IBxx
     {
-        // GOW-Port: readBranchVi en línea (está en ps2_vu1_core.cpp y cada salto de bucle era una llamada).
-        const auto readBranchViInline = [this](uint32_t reg) -> int32_t
-        {
-            if (reg == 0u)
-                return 0;
-            if (m_viBranchBackupValid && m_viBranchBackupReg == reg)
-                return m_viBranchBackupValue;
-            return m_state.vi[reg];
-        };
         bool taken;
         if constexpr (opHi == 0x28u)
-            taken = static_cast<int16_t>(readBranchViInline(viS)) == static_cast<int16_t>(readBranchViInline(viT));
+            taken = static_cast<int16_t>(readBranchVi(viS)) == static_cast<int16_t>(readBranchVi(viT));
         else if constexpr (opHi == 0x29u)
-            taken = static_cast<int16_t>(readBranchViInline(viS)) != static_cast<int16_t>(readBranchViInline(viT));
+            taken = static_cast<int16_t>(readBranchVi(viS)) != static_cast<int16_t>(readBranchVi(viT));
         else if constexpr (opHi == 0x2Cu)
-            taken = static_cast<int16_t>(readBranchViInline(viS)) < 0;
+            taken = static_cast<int16_t>(readBranchVi(viS)) < 0;
         else if constexpr (opHi == 0x2Du)
-            taken = static_cast<int16_t>(readBranchViInline(viS)) > 0;
+            taken = static_cast<int16_t>(readBranchVi(viS)) > 0;
         else if constexpr (opHi == 0x2Eu)
-            taken = static_cast<int16_t>(readBranchViInline(viS)) <= 0;
+            taken = static_cast<int16_t>(readBranchVi(viS)) <= 0;
         else
-            taken = static_cast<int16_t>(readBranchViInline(viS)) >= 0;
+            taken = static_cast<int16_t>(readBranchVi(viS)) >= 0;
         if (taken)
         {
-            const uint32_t target = (m_state.pc + 8 + imm11 * 8) & 0x3FFFu /* GOW-Port: VU1 (el código compilado solo corre en VU1) */;
+            const uint32_t target = (m_state.pc + 8 + imm11 * 8) & microAddressMask();
             m_state.branchPending = true;
             m_state.branchTarget = target;
             m_state.branchDelay = 1;
@@ -1129,8 +757,6 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
         {
             uint32_t words[4]{};
             std::memcpy(words, m_state.vf[fs], sizeof(words));
-            if (m_xgkick.active)
-                xgkickAdvanceTo(m_cycle); // GOW-Port: PATH1 copia antes de que la VU escriba en su memoria
             vu1c::storeT<dest>(vuData + addr, words);
         }
         if constexpr (viT != 0)
@@ -1141,6 +767,7 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
     }
     else if constexpr (opHi == 0x40u && funct >= 0x3Cu && funct2 == 0x38u) // DIV
     {
+        // GOW-Port: DIV resuelto en compilacion; misma normalizacion, flags D/I y latencia que el interprete.
         constexpr int fsf = (instr >> 21) & 0x3;
         constexpr int ftf = (instr >> 23) & 0x3;
         const float num = normalizeOperand(m_state.vf[fs][fsf]);
@@ -1157,22 +784,9 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
         {
             result = num / den;
         }
-        // GOW-Port: normalizeResult y queueQ en línea (eran dos llamadas por DIV, una por vértice en la
-        // perspectiva): exponente 0 -> cero con signo, 255 -> máximo con signo; queueQ volvía a normalizar un
-        // valor ya normalizado (no cambia).
-        uint32_t bits = 0u;
-        std::memcpy(&bits, &result, sizeof(bits));
-        const uint32_t exponent = (bits >> 23) & 0xFFu;
-        if (exponent == 0u)
-            bits &= 0x80000000u;
-        else if (exponent == 0xFFu)
-            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
-        std::memcpy(&result, &bits, sizeof(bits));
-        m_fdiv.valid = true;
-        m_fdiv.readyCycle = m_cycle + 7u;
-        m_nextCommitCycle = std::min(m_nextCommitCycle, m_fdiv.readyCycle);
-        m_fdiv.value = result;
-        m_fdiv.statusDi = statusDi & 0x30u;
+        uint32_t ignoredFlags = 0u;
+        result = normalizeResult(result, ignoredFlags);
+        queueQ(result, 7u, statusDi);
     }
     else if constexpr (opHi == 0x40u && funct >= 0x3Cu && funct2 == 0x3Cu) // MTIR
     {
@@ -1194,8 +808,6 @@ VU1_STEP_INLINE void VU1Interpreter::lowerT(StepContext &context, uint32_t upper
     }
     else
     {
-        if (m_xgkick.active)
-            xgkickAdvanceTo(m_cycle); // GOW-Port: puede escribir en la memoria de datos o iniciar un XGKICK
         execLower(instr, vuData, dataSize, *context.gs, context.memory, upperInstr);
     }
 }
@@ -1232,8 +844,7 @@ inline bool VU1Interpreter::blockPreconditions(StepContext &context, uint32_t pc
 {
     if (m_state.branchPending || m_state.ebit || m_state.haltAfterDelaySlot || m_stopRequested)
         return false;
-    const uint64_t maxBlockCycles = (bytes / 8u) * 4u + 64u;
-    if (m_cycle + maxBlockCycles >= context.budgetEnd || pc + bytes > context.codeSize)
+    if (m_cycle + 16384u >= context.budgetEnd || pc + bytes > context.codeSize)
         return false;
     return std::memcmp(context.vuCode + pc, words, bytes) == 0;
 }
@@ -1263,8 +874,9 @@ VU1_STEP_INLINE uint64_t VU1Interpreter::readyCycleT() const
     }                                                                                            \
     if constexpr ((k.USAGE.viRead & 0xFFFEu) != 0u)                                              \
     {                                                                                            \
-        for (uint32_t pending = (k.USAGE.viRead & 0xFFFEu); pending != 0u; pending &= pending - 1u) \
-            ready = std::max(ready, m_viReady[std::countr_zero(pending)]);                      \
+        for (uint32_t r = 1; r < 16u; ++r)                                                       \
+            if ((k.USAGE.viRead & (1u << r)) != 0u)                                              \
+                ready = std::max(ready, m_viReady[r]);                                           \
     }                                                                                            \
     if constexpr ((k.USAGE.accRead & 8u) != 0u) ready = std::max(ready, m_accReady[0]);          \
     if constexpr ((k.USAGE.accRead & 4u) != 0u) ready = std::max(ready, m_accReady[1]);          \
@@ -1294,42 +906,30 @@ VU1_STEP_INLINE uint64_t VU1Interpreter::readyCycleT() const
     return ready;
 }
 
-template <class T, bool DeadFlags, bool Plain, bool Chained>
+template <class T, bool DeadFlags, bool Plain>
 VU1_STEP_INLINE bool VU1Interpreter::stepPairT(StepContext &context)
 {
     constexpr const DecodedInstructionPair &k = T::value;
 
     // Igual que compiledPrologue + stepPair.
-    // GOW-Port: Chained = par que no es el primero de su bloque. El par anterior acaba de confirmar los
-    // pipelines en este mismo ciclo, y blockPreconditions dejó al entrar 16384 ciclos de margen hasta el
-    // final del presupuesto (las esperas de abajo lo siguen comprobando).
-    if constexpr (Chained)
-    {
-        if (m_stopRequested)
-            return false;
-    }
-    else
-    {
-        if (m_cycle >= context.budgetEnd || m_stopRequested)
-            return false;
-        if (m_cycle >= m_nextCommitCycle)
-            commitReadyPipelines();
-    }
+    if (m_cycle >= context.budgetEnd || m_stopRequested)
+        return false;
+    if (m_cycle >= m_nextCommitCycle)
+        commitReadyPipelines();
 
-    if constexpr (k.lowerUsage.pipeline == PipelineXgkick)
-    {
-        if (m_xgkick.active)
-            xgkickAdvanceTo(m_cycle); // GOW-Port: saber si el envío anterior sigue activo
-    }
     uint64_t readyCycle = readyCycleT<T>();
     if (readyCycle > m_cycle)
     {
-        if (readyCycle >= context.budgetEnd)
+        while (readyCycle > m_cycle)
         {
-            advanceTo(context.budgetEnd);
-            return false;
+            if (readyCycle >= context.budgetEnd)
+            {
+                advanceTo(context.budgetEnd);
+                break;
+            }
+            advanceTo(readyCycle);
+            readyCycle = readyCycleT<T>();
         }
-        advanceTo(readyCycle);
         if (m_cycle >= context.budgetEnd)
             return false;
     }
@@ -1368,8 +968,7 @@ VU1_STEP_INLINE bool VU1Interpreter::stepPairT(StepContext &context)
             lowerT<k.lower>(context, k.upper);
     }
 
-    if constexpr (vu1c::clearBranchBackup<T>())
-        m_viBranchBackupValid = false;
+    m_viBranchBackupValid = false;
     if constexpr (writtenVi != 0u)
         m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
 
@@ -1396,8 +995,9 @@ VU1_STEP_INLINE bool VU1Interpreter::stepPairT(StepContext &context)
         if constexpr (viWrites != 0u)
         {
             constexpr uint32_t latency = k.lowerUsage.viLatency != 0u ? k.lowerUsage.viLatency : k.lowerUsage.latency;
-            for (uint32_t pending = viWrites; pending != 0u; pending &= pending - 1u)
-                m_viReady[std::countr_zero(pending)] = m_cycle + latency;
+            for (uint32_t r = 1; r < 16u; ++r)
+                if ((viWrites & (1u << r)) != 0u)
+                    m_viReady[r] = m_cycle + latency;
         }
         constexpr uint32_t accWrite = k.upperUsage.accWrite;
         if constexpr ((accWrite & 8u) != 0u) m_accReady[0] = m_cycle + kAccForwardLatency;
@@ -1406,336 +1006,135 @@ VU1_STEP_INLINE bool VU1Interpreter::stepPairT(StepContext &context)
         if constexpr ((accWrite & 1u) != 0u) m_accReady[3] = m_cycle + kAccForwardLatency;
     }
     if constexpr (writtenVi != 0u && k.lowerUsage.delaysNextBranchRead)
-    {
-        // GOW-Port: recordViWriteForBranch en línea (era una llamada en cada par que escribe un VI).
-        m_viBranchBackupValue = oldVi;
-        m_viBranchBackupReg = static_cast<uint8_t>(writtenVi);
-        m_viBranchBackupValid = true;
-    }
+        recordViWriteForBranch(static_cast<uint8_t>(writtenVi), oldVi);
 
-    // GOW-Port: como stepPair, siempre. addVfWrite no registra escrituras a VF0 (la condición anterior, por
-    // vfWrite.reg == 0, nunca se cumplía) y execUpper/execLower escriben VF0/VI0 sin comprobarlo: en una
-    // racha de pares compilados VF0/VI0 quedaban con basura (VI0 es la base de casi todos los LQ/SQ).
-    // Un solo store de 16 bytes: la lectura de 16 bytes de VF0 en el par siguiente no puede reenviarse desde
-    // cuatro stores de 4 bytes.
-    // GOW-Port (KIexster, vu1-static-stores): solo si el par puede haber escrito VF0 o VI0 (las inferiores en
-    // línea nunca escriben VI0).
-    constexpr bool mayWriteVf0 = vu1c::upperMayWriteVf0(k.upper) ||
-                                 (!k.iBit && (!vu1c::lowerInline(k.lower) || vu1c::lowerInlineWritesVf0(k.lower)));
-    constexpr bool mayWriteVi0 = !k.iBit && !vu1c::lowerInline(k.lower);
-    if constexpr (mayWriteVf0)
-        vu1StoreVf0(m_state.vf[0]);
-    if constexpr (mayWriteVi0)
-        m_state.vi[0] = 0;
+    m_state.vf[0][0] = 0.0f;
+    m_state.vf[0][1] = 0.0f;
+    m_state.vf[0][2] = 0.0f;
+    m_state.vf[0][3] = 1.0f;
+    m_state.vi[0] = 0;
+
+    // Plain: par intermedio de un bloque que no salta ni termina. blockPreconditions garantiza que al
+    // entrar no había salto, bit E ni final pendientes, y solo el último par del bloque puede crearlos, así
+    // que basta con avanzar el PC (el par siguiente está en el bloque, sin pasar del final de la memoria).
+    if constexpr (Plain)
+    {
+        m_state.pc += 8u;
+        ++m_cycle;
+        m_state.cycles = m_cycle;
+        if (m_cycle >= m_nextCommitCycle)
+            commitReadyPipelines();
+        if (m_xgkick.active)
+            progressXgkick();
+        return true;
+    }
 
     uint32_t nextPc = m_state.pc + 8u;
     if (nextPc >= context.codeSize)
         nextPc = 0u;
     m_state.pc = nextPc;
 
-    if constexpr (!Plain)
+    if (m_state.branchPending)
     {
-        if (m_state.branchPending)
+        if (m_state.branchDelay == 0u)
         {
-            if (m_state.branchDelay == 0u)
-            {
-                m_state.pc = m_state.branchTarget & 0x3FFFu /* GOW-Port: VU1 (el código compilado solo corre en VU1) */;
-                m_state.branchPending = false;
-            }
-            else
-            {
-                --m_state.branchDelay;
-            }
+            m_state.pc = m_state.branchTarget & microAddressMask();
+            m_state.branchPending = false;
         }
+        else
+        {
+            --m_state.branchDelay;
+        }
+    }
 
-        const bool dHalt = k.dBit && m_state.dBitEnabled;
-        const bool tHalt = k.tBit && m_state.tBitEnabled;
-        const bool haltBit = dHalt || tHalt;
-        const bool haltBranch = haltBit && k.lowerUsage.pipeline == PipelineBranch;
+    const bool dHalt = k.dBit && m_state.dBitEnabled;
+    const bool tHalt = k.tBit && m_state.tBitEnabled;
+    const bool haltBit = dHalt || tHalt;
+    const bool haltBranch = haltBit && k.lowerUsage.pipeline == PipelineBranch;
 
-        if (m_state.haltAfterDelaySlot)
-        {
-            m_state.stoppedByD = m_pendingHaltD;
-            m_state.stoppedByT = m_pendingHaltT;
-            context.programEnded = true;
-        }
-        else if (m_state.ebit)
-            context.programEnded = true;
-        else if (haltBit && !haltBranch)
-        {
-            m_state.stoppedByD = dHalt;
-            m_state.stoppedByT = tHalt;
-            context.programEnded = true;
-        }
-        else if (k.eBit)
-            m_state.ebit = true;
-        else if (haltBranch)
-        {
-            m_state.haltAfterDelaySlot = true;
-            m_pendingHaltD = dHalt;
-            m_pendingHaltT = tHalt;
-        }
+    if (m_state.haltAfterDelaySlot)
+    {
+        m_state.stoppedByD = m_pendingHaltD;
+        m_state.stoppedByT = m_pendingHaltT;
+        context.programEnded = true;
+    }
+    else if (m_state.ebit)
+        context.programEnded = true;
+    else if (haltBit && !haltBranch)
+    {
+        m_state.stoppedByD = dHalt;
+        m_state.stoppedByT = tHalt;
+        context.programEnded = true;
+    }
+    else if (k.eBit)
+        m_state.ebit = true;
+    else if (haltBranch)
+    {
+        m_state.haltAfterDelaySlot = true;
+        m_pendingHaltD = dHalt;
+        m_pendingHaltT = tHalt;
     }
 
     // advanceOneCycle con las comprobaciones en línea.
     ++m_cycle;
-    // GOW-Port: m_state.cycles lo fija run() al terminar; nada lo lee durante la ejecución.
+    m_state.cycles = m_cycle;
     if (m_cycle >= m_nextCommitCycle)
         commitReadyPipelines();
-    if (m_cycle >= m_xgkickEvent)
-        xgkickAdvanceTo(m_cycle); // GOW-Port: PATH1 solo en sus eventos
+    if (m_xgkick.active)
+        progressXgkick();
     return !context.programEnded;
 }
 
 // Acceso del código generado (repartido en varios archivos) a lo que necesita del intérprete.
-// GOW-Port: versión de la micromemoria para el despachador compilado (definida en ps2_vu1_core.cpp).
-extern std::atomic<uint64_t> g_vu1CompiledEpoch;
-
 struct VU1CompiledAccess
 {
     using P = VU1Interpreter::DecodedInstructionPair;
     using C = VU1Interpreter::StepContext;
     using Pipeline = VU1Interpreter::Pipeline;
-    template <class T, bool DeadFlags, bool Plain = false, bool Chained = false>
-    static VU1_STEP_INLINE bool step(VU1Interpreter &vu, C &c) { return vu.stepPairT<T, DeadFlags, Plain, Chained>(c); }
+    template <class T, bool DeadFlags, bool Plain = false>
+    static VU1_STEP_INLINE bool step(VU1Interpreter &vu, C &c)
+    {
+        const bool more = vu.stepPairT<T, DeadFlags, Plain>(c);
+        if (vu.m_verifyLeft != 0u && (--vu.m_verifyLeft == 0u || !more))
+        {
+            vu.m_verifyLeft = 0u;
+            vu.verifyBlockEnd(c);
+        }
+        return more;
+    }
     static bool interpret(VU1Interpreter &vu, C &c) { return vu.stepInterpreted(c); }
     static uint32_t pc(const VU1Interpreter &vu) { return vu.m_state.pc; }
     static bool block(const VU1Interpreter &vu, C &c, uint32_t pc, const uint32_t *words, size_t bytes)
     {
-        return vu.blockPreconditions(c, pc, words, bytes);
-    }
-    // GOW-Port: blockPreconditions sin comparar las palabras; el despachador generado ya comprobó que
-    // coinciden con la micromemoria en esta versión (epoch).
-    static VU1_STEP_INLINE bool blockReady(const VU1Interpreter &vu, C &c, uint32_t pc, size_t bytes)
-    {
-        if (vu.m_state.branchPending || vu.m_state.ebit || vu.m_state.haltAfterDelaySlot || vu.m_stopRequested)
+        if (!vu.blockPreconditions(c, pc, words, bytes))
             return false;
-        const uint64_t maxBlockCycles = (bytes / 8u) * 4u + 64u;
-        return vu.m_cycle + maxBlockCycles < c.budgetEnd && pc + bytes <= c.codeSize;
-    }
-    // GOW-Port: cambia cuando puede haber cambiado la micromemoria (compiledProgramFor: nueva versión o
-    // nuevo intérprete); invalida las resoluciones del despachador generado.
-    static uint64_t epoch() { return g_vu1CompiledEpoch.load(std::memory_order_relaxed); }
-
-    // GOW-Port: bloques con tiempos estáticos (etapa 1 del recompilador de VU1). El generador calcula, para cada
-    // par del bloque, el ciclo en que se emite (Issue, relativo al ciclo de entrada E) con las mismas reglas que
-    // readyCycleT: latencias de VF/VI/ACC y de FDIV escritas dentro del bloque. El bloque solo entra por aquí si
-    // lo que lee de fuera (registros escritos antes del bloque y el FDIV pendiente) ya está listo en el ciclo en
-    // que lo leería (guardas generadas); entonces cada par se emite en E + Issue, igual que en el modelo
-    // dinámico. Sin la carga de m_cycle y de los ciclos "listo" en cada par: estos se escriben al salir
-    // (flushS), con el mismo valor que habría dejado markPairWrites.
-    static VU1_STEP_INLINE uint64_t cycle(const VU1Interpreter &vu) { return vu.m_cycle; }
-    static VU1_STEP_INLINE uint64_t vfReadyAt(const VU1Interpreter &vu, uint32_t reg, uint32_t lane) { return vu.m_vfReady[reg][lane]; }
-    static VU1_STEP_INLINE uint64_t viReadyAt(const VU1Interpreter &vu, uint32_t reg) { return vu.m_viReady[reg]; }
-    static VU1_STEP_INLINE uint64_t accReadyAt(const VU1Interpreter &vu, uint32_t lane) { return vu.m_accReady[lane]; }
-    static VU1_STEP_INLINE uint64_t fdivReadyCycle(const VU1Interpreter &vu) { return vu.m_fdiv.valid ? vu.m_fdiv.readyCycle : 0u; }
-    // Espera del primer par antes de entrar en el bloque estático: lo mismo que stepPairT (comprobación de
-    // confirmaciones en el ciclo de entrada y advanceTo hasta el ciclo listo).
-    [[gnu::noinline]] static void stallTo(VU1Interpreter &vu, C &, uint64_t target)
-    {
-        if (vu.m_cycle >= vu.m_nextCommitCycle)
-            vu.commitReadyPipelines();
-        vu.advanceTo(target);
-    }
-    static VU1_STEP_INLINE bool fdivReadyBy(const VU1Interpreter &vu, uint64_t limit)
-    {
-        return !vu.m_fdiv.valid || vu.m_fdiv.readyCycle <= limit;
-    }
-    // Escrituras de los "listo" del bloque: {par, tipo (0 VF, 1 VI, 2 ACC), registro, componente, desplazamiento}.
-    // Se aplican en orden las de los pares < limit (la última de cada hueco gana, como en markPairWrites).
-    // Salidas normales: el generador escribe en línea solo el último valor de cada hueco (setReady*); flushS
-    // queda para las salidas a mitad de bloque (raras).
-    static VU1_STEP_INLINE void setVfReadyAt(VU1Interpreter &vu, uint32_t reg, uint32_t lane, uint64_t v) { vu.m_vfReady[reg][lane] = v; }
-    // GOW-Port: los cuatro componentes de un VF a la vez (un store / una comparación de 32 bytes).
-    static VU1_STEP_INLINE void setVfReady4(VU1Interpreter &vu, uint32_t reg, uint64_t v)
-    {
-#if defined(__AVX2__)
-        _mm256_storeu_si256(reinterpret_cast<__m256i *>(vu.m_vfReady[reg].data()), _mm256_set1_epi64x(static_cast<long long>(v)));
-#else
-        vu.m_vfReady[reg] = {v, v, v, v};
-#endif
-    }
-    static VU1_STEP_INLINE bool vfReady4After(const VU1Interpreter &vu, uint32_t reg, uint64_t limit)
-    {
-#if defined(__AVX2__)
-        // Los ciclos caben de sobra en 63 bits: la comparación con signo vale.
-        const __m256i r = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(vu.m_vfReady[reg].data()));
-        return _mm256_movemask_epi8(_mm256_cmpgt_epi64(r, _mm256_set1_epi64x(static_cast<long long>(limit)))) != 0;
-#else
-        const auto &r = vu.m_vfReady[reg];
-        return std::max(std::max(r[0], r[1]), std::max(r[2], r[3])) > limit;
-#endif
-    }
-    static VU1_STEP_INLINE void setViReadyAt(VU1Interpreter &vu, uint32_t reg, uint64_t v) { vu.m_viReady[reg] = v; }
-    static VU1_STEP_INLINE void setAccReadyAt(VU1Interpreter &vu, uint32_t lane, uint64_t v) { vu.m_accReady[lane] = v; }
-    static VU1_STEP_INLINE void syncCycles(VU1Interpreter &vu) { vu.m_state.cycles = vu.m_cycle; }
-    template <class Table>
-    [[gnu::noinline, gnu::cold]] static void flushS(VU1Interpreter &vu, uint64_t entry, uint32_t limit)
-    {
-        for (uint32_t i = 0; i < Table::N; ++i)
-        {
-            const auto &e = Table::e[i];
-            if (e[0] >= limit)
-                break;
-            const uint64_t value = entry + e[4];
-            if (e[1] == 0u)
-                vu.m_vfReady[e[2]][e[3]] = value;
-            else if (e[1] == 1u)
-                vu.m_viReady[e[2]] = value;
-            else
-                vu.m_accReady[e[3]] = value;
-        }
-        vu.m_state.cycles = vu.m_cycle;
-    }
-    // stepPairT con el ciclo de emisión estático. Devuelve 0 (sigue), 1 (parado antes de ejecutar el par) o
-    // 2 (ejecutado y fin del programa).
-    template <class T, bool DeadFlags, bool Plain, bool Chained, uint32_t Issue, bool Stall, uint32_t Pc, bool ClearBackup = true>
-    static VU1_STEP_INLINE int stepS(VU1Interpreter &vu, C &context, uint64_t entry)
-    {
-        constexpr const P &k = T::value;
-        // GOW-Port: par "libre de PC": intermedio (Plain) y con las dos instrucciones en línea (FMAC/especiales y
-        // las inferiores de lowerInline, ninguna lee m_state.pc ni puede terminar el programa). No escribe el PC
-        // (el último par del bloque nunca es Plain y lo deja bien; si se para antes de ejecutarse lo escribe la
-        // salida) ni mira programEnded. ClearBackup = false: el par anterior del bloque no guardó un VI para un
-        // salto (el generador lo sabe), así que m_viBranchBackupValid ya es falso.
-        constexpr vu1c::UpperInfo upperInfo = vu1c::classify(k.upper);
-        constexpr bool upperInline = upperInfo.kind != vu1c::Kind::Other || vu1c::simpleSpecial(k.upper) != 0u;
-        constexpr bool lowerNopS = k.lower == 0x00000000u || k.lower == 0x8000033Cu;
-        constexpr bool pcFree = Plain && upperInline && (k.iBit || lowerNopS || vu1c::lowerInline(k.lower));
-        if constexpr (!Chained)
-        {
-            if (vu.m_stopRequested)
+        // GOW-Port: GOW_VU1C_EXCLUIR=xgkick|flags (diagnostico): no usar bloques con XGKICK o con lectores de
+        // flags MAC/estado (FMEQ/FMAND/FMOR/FSEQ/FSAND/FSOR); esos pares van sueltos.
+        static const int exclude = [] {
+            const char *v = std::getenv("GOW_VU1C_EXCLUIR");
+            return !v ? 0 : std::strcmp(v, "xgkick") == 0 ? 1 : std::strcmp(v, "flags") == 0 ? 2 : 0;
+        }();
+        if (exclude != 0)
+            for (size_t i = 0; i < bytes / 8u; ++i)
             {
-                vu.m_state.pc = Pc;
-                return 1;
+                const uint32_t lower = words[i * 2u], upper = words[i * 2u + 1u];
+                if ((upper & 0x80000000u) != 0u)
+                    continue;
+                const uint32_t op = lower >> 25;
+                if (exclude == 1 && op == 0x40u && (lower & 0x7FFu) == 0x6FCu)
+                    return false;
+                if (exclude == 2 && (op == 0x14u || op == 0x16u || op == 0x17u || op == 0x18u || op == 0x1Au || op == 0x1Bu))
+                    return false;
             }
-            if (vu.m_cycle >= vu.m_nextCommitCycle)
-                vu.commitReadyPipelines();
-        }
-        else
-        {
-            if (vu.m_stopRequested)
-            {
-                vu.m_state.pc = Pc;
-                return 1;
-            }
-        }
-        if constexpr (Stall)
-            vu.advanceTo(entry + Issue);
-        if constexpr (!pcFree)
-            vu.m_state.pc = Pc;
-
-        constexpr uint32_t viWrites = k.lowerUsage.viWrite & 0xFFFEu;
-        constexpr uint32_t writtenVi = viWrites != 0u ? static_cast<uint32_t>(std::countr_zero(viWrites)) : 0u;
-        int32_t oldVi = 0;
-        if constexpr (writtenVi != 0u)
-            oldVi = vu.m_state.vi[writtenVi];
-
-        constexpr bool lowerNop = k.lower == 0x00000000u || k.lower == 0x8000033Cu;
-        if constexpr (k.iBit)
-        {
-            vu.template upperT<k.upper, DeadFlags>();
-            float immediate = 0.0f;
-            constexpr uint32_t lowerBits = k.lower;
-            std::memcpy(&immediate, &lowerBits, sizeof(immediate));
-            vu.m_state.i = vu.normalizeOperand(immediate);
-        }
-        else if constexpr (k.upperVfShadowReg != 0u)
-        {
-            constexpr uint32_t sh = k.upperVfShadowReg;
-            float oldVf[4];
-            float upperVf[4];
-            std::memcpy(oldVf, vu.m_state.vf[sh], sizeof(oldVf));
-            vu.template upperT<k.upper, DeadFlags>();
-            std::memcpy(upperVf, vu.m_state.vf[sh], sizeof(upperVf));
-            std::memcpy(vu.m_state.vf[sh], oldVf, sizeof(oldVf));
-            vu.template lowerT<k.lower>(context, k.upper);
-            std::memcpy(vu.m_state.vf[sh], upperVf, sizeof(upperVf));
-        }
-        else
-        {
-            vu.template upperT<k.upper, DeadFlags>();
-            if constexpr (!lowerNop)
-                vu.template lowerT<k.lower>(context, k.upper);
-        }
-
-        if constexpr (ClearBackup)
-            vu.m_viBranchBackupValid = false;
-        if constexpr (writtenVi != 0u)
-            vu.m_state.vi[writtenVi] = static_cast<int16_t>(vu.m_state.vi[writtenVi]);
-        if constexpr (writtenVi != 0u && k.lowerUsage.delaysNextBranchRead)
-        {
-            vu.m_viBranchBackupValue = oldVi;
-            vu.m_viBranchBackupReg = static_cast<uint8_t>(writtenVi);
-            vu.m_viBranchBackupValid = true;
-        }
-
-        // GOW-Port: como stepPairT, solo si el par puede haber escrito VF0 / VI0.
-        constexpr bool mayWriteVf0 = vu1c::upperMayWriteVf0(k.upper) ||
-                                     (!k.iBit && (!vu1c::lowerInline(k.lower) || vu1c::lowerInlineWritesVf0(k.lower)));
-        constexpr bool mayWriteVi0 = !k.iBit && !vu1c::lowerInline(k.lower);
-        if constexpr (mayWriteVf0)
-            vu1StoreVf0(vu.m_state.vf[0]);
-        if constexpr (mayWriteVi0)
-            vu.m_state.vi[0] = 0;
-
-        if constexpr (!pcFree)
-            vu.m_state.pc = (Pc + 8u) & 0x3FFFu; // micromemoria de VU1: 16 KB (el código compilado solo corre ahí)
-
-        if constexpr (!Plain)
-        {
-            if (vu.m_state.branchPending)
-            {
-                if (vu.m_state.branchDelay == 0u)
-                {
-                    vu.m_state.pc = vu.m_state.branchTarget & 0x3FFFu /* GOW-Port: VU1 (el código compilado solo corre en VU1) */;
-                    vu.m_state.branchPending = false;
-                }
-                else
-                {
-                    --vu.m_state.branchDelay;
-                }
-            }
-
-            const bool dHalt = k.dBit && vu.m_state.dBitEnabled;
-            const bool tHalt = k.tBit && vu.m_state.tBitEnabled;
-            const bool haltBit = dHalt || tHalt;
-            const bool haltBranch = haltBit && k.lowerUsage.pipeline == VU1Interpreter::PipelineBranch;
-
-            if (vu.m_state.haltAfterDelaySlot)
-            {
-                vu.m_state.stoppedByD = vu.m_pendingHaltD;
-                vu.m_state.stoppedByT = vu.m_pendingHaltT;
-                context.programEnded = true;
-            }
-            else if (vu.m_state.ebit)
-                context.programEnded = true;
-            else if (haltBit && !haltBranch)
-            {
-                vu.m_state.stoppedByD = dHalt;
-                vu.m_state.stoppedByT = tHalt;
-                context.programEnded = true;
-            }
-            else if (k.eBit)
-                vu.m_state.ebit = true;
-            else if (haltBranch)
-            {
-                vu.m_state.haltAfterDelaySlot = true;
-                vu.m_pendingHaltD = dHalt;
-                vu.m_pendingHaltT = tHalt;
-            }
-        }
-
-        const uint64_t next = entry + Issue + 1u;
-        vu.m_cycle = next;
-        if (next >= vu.m_nextCommitCycle)
-            vu.commitReadyPipelines();
-        if (next >= vu.m_xgkickEvent)
-            vu.xgkickAdvanceTo(next); // GOW-Port: PATH1 solo en sus eventos (como stepPairT)
-        if constexpr (pcFree)
-            return 0;
-        else
-            return context.programEnded ? 2 : 0;
+        // GOW_VU1C_VERIFICAR=<N>: verifica uno de cada N bloques (copiar el interprete es caro).
+        static const unsigned long verifyEvery = [] {
+            const char *v = std::getenv("GOW_VU1C_VERIFICAR");
+            return v ? std::max(1ul, std::strtoul(v, nullptr, 10)) : 0ul;
+        }();
+        static unsigned long verifyCount = 0;
+        if (verifyEvery != 0ul && ++verifyCount % verifyEvery == 0ul)
+            const_cast<VU1Interpreter &>(vu).verifyBlockStart(c, pc, words, bytes);
+        return true;
     }
 };
 

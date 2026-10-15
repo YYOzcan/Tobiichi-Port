@@ -469,8 +469,8 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMULTH(const Instruction &inst)
     {
-        // GOW-Port: ocho productos separados y ambos pares HI/LO, incluso con rd=0.
-        return fmt::format("ps2_pmulth(ctx, GPR_VEC(ctx, {}), GPR_VEC(ctx, {}), {});",
+        // GOW-Port: exact PMULTH (eight separate halfword products in HI/LO/Rd); see ps2PmulthExec in ps2_runtime.cpp.
+        return fmt::format("{{ extern void ps2PmulthExec(R5900Context *ctx, int rs, int rt, int rd); ps2PmulthExec(ctx, {}, {}, {}); }}",
                            inst.rs, inst.rt, inst.rd);
     }
 

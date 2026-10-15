@@ -1,10 +1,15 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+bool ps2PadWindowsRumble(uint8_t large, bool small); // ps2_pad_rumble_win.cpp
+#endif
 
 namespace
 {
@@ -201,8 +206,34 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
-    constexpr int kGamepad = 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+    // GOW-Port: GLFW can list racing gear (handbrake, pedals) as gamepads before the real pad. The pad whose
+    // button was pressed last becomes the active one (press edges, so idle devices never take over);
+    // until then, the first available slot.
+    static int s_activeGamepad = -1;
+    for (int i = 0; i < 4; ++i)
+    {
+        if (i == s_activeGamepad || !IsGamepadAvailable(i))
+            continue;
+        for (int button = GAMEPAD_BUTTON_LEFT_FACE_UP; button <= GAMEPAD_BUTTON_RIGHT_THUMB; ++button)
+            if (IsGamepadButtonPressed(i, button))
+            {
+                s_activeGamepad = i;
+                break;
+            }
+    }
+    if (s_activeGamepad >= 0 && !IsGamepadAvailable(s_activeGamepad))
+        s_activeGamepad = -1;
+    int kGamepad = s_activeGamepad;
+    for (int i = 0; i < 4 && kGamepad < 0; ++i)
+        if (IsGamepadAvailable(i))
+            kGamepad = i;
+    const bool useGamepad = kGamepad >= 0;
+    static int s_loggedGamepad = -2;
+    if (kGamepad != s_loggedGamepad)
+    {
+        s_loggedGamepad = kGamepad;
+        std::fprintf(stderr, "[pad] gamepad slot %d: %s\n", kGamepad, useGamepad ? GetGamepadName(kGamepad) : "none (keyboard)");
+    }
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
 
@@ -388,7 +419,45 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
+
+    if (kGamepad != m_activeGamepad)
+    {
+        m_activeGamepad = kGamepad;
+        applyRumble(false); // the new gamepad takes over the current actuator state
+    }
+    else
+        applyRumble(true);
     return true;
+}
+
+void PSPadBackend::setActuators(int port, bool small, uint8_t large)
+{
+    if (port != 0 || (small == m_small && large == m_large))
+        return;
+    m_small = small;
+    m_large = large;
+    applyRumble(false);
+}
+
+// refresh = periodic call from readState: only backends whose rumble times out need it resent.
+void PSPadBackend::applyRumble(bool refresh)
+{
+#ifdef _WIN32
+    // raylib's GLFW backend has no vibration: XInput and Sony HID pads directly. Both keep the motors running until changed.
+    if (refresh)
+        return;
+    ps2PadWindowsRumble(m_large, m_small);
+#else
+    // Other platforms (SDL, Switch): raylib's rumble, which stops after at most 2 s, so it is resent every second.
+    if (m_activeGamepad < 0 || !IsWindowReady())
+        return;
+    const bool on = m_small || m_large;
+    const double now = GetTime();
+    if (refresh && (!on || now - m_rumbleSentAt < 1.0))
+        return;
+    m_rumbleSentAt = now;
+    SetGamepadVibration(m_activeGamepad, m_large / 255.0f, m_small ? 1.0f : 0.0f, on ? 2.0f : 0.1f); // zero motors with any duration stop it
+#endif
 }
 
 // GOW-Port: rótulos de los iconos de botones (gow_iconos.cpp). Para una acción ("cross", "l1", "up", "li_arriba"...)

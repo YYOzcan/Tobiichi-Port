@@ -1227,10 +1227,6 @@ namespace
     constexpr std::array<uint32_t, 10> kDmaChannelBases = {
         0x10008000u, 0x10009000u, 0x1000A000u, 0x1000B000u, 0x1000B400u,
         0x1000C000u, 0x1000C400u, 0x1000C800u, 0x1000D000u, 0x1000D400u};
-    std::mutex g_dmaStubMutex;
-    std::unordered_map<uint32_t, uint32_t> g_dmaPendingPolls;
-    uint32_t g_dmaStubLogCount = 0;
-    constexpr uint32_t kMaxDmaStubLogs = 64;
 
     bool isKnownDmaChannelBase(uint32_t value)
     {
@@ -1262,37 +1258,6 @@ namespace
             return std::min<uint32_t>((value + 15u) >> 4u, 0xFFFFu);
         }
         return value & 0xFFFFu;
-    }
-
-    struct ParsedDmaTag
-    {
-        bool valid = false;
-        uint32_t qwc = 0;
-        uint32_t id = 0;
-        uint32_t addr = 0;
-    };
-
-    ParsedDmaTag tryParseDmaTag(uint8_t *rdram, uint32_t guestAddr)
-    {
-        ParsedDmaTag out;
-        if (guestAddr == 0)
-        {
-            return out;
-        }
-
-        const uint8_t *ptr = getConstMemPtr(rdram, guestAddr);
-        if (!ptr)
-        {
-            return out;
-        }
-
-        uint64_t tag = 0;
-        std::memcpy(&tag, ptr, sizeof(tag));
-        out.valid = true;
-        out.qwc = static_cast<uint32_t>(tag & 0xFFFFu);
-        out.id = static_cast<uint32_t>((tag >> 28) & 0x7u);
-        out.addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFFu);
-        return out;
     }
 
     uint32_t resolveDmaChannelBase(uint8_t *rdram, uint32_t chanArg)
@@ -1335,6 +1300,9 @@ namespace
         return 0;
     }
 
+    // GOW-Port: native DMA data path (docs/native-port.md, step 2): the packets go straight to VIF0 / VIF1 / GIF
+    // (PS2Memory::sendDma*), complete when this returns, and the channel's DMA-end handlers run now. Channels without a
+    // packet consumer (IPU, SIF, SPR) are not sent through sceDmaSend by the game.
     int32_t submitDmaSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool preferNormalCount)
     {
         if (!runtime)
@@ -1342,142 +1310,37 @@ namespace
             return -1;
         }
 
-        const uint32_t chanArg = getRegU32(ctx, 4);
-        const uint32_t payloadArg = getRegU32(ctx, 5);
-        const uint32_t countArg = getRegU32(ctx, 6);
-        const uint32_t channelBase = resolveDmaChannelBase(rdram, chanArg);
-        if (channelBase == 0)
+        const uint32_t channelBase = resolveDmaChannelBase(rdram, getRegU32(ctx, 4));
+        const uint32_t payload = toDmaPhys(getRegU32(ctx, 5));
+        PS2Memory::DmaPath path;
+        uint32_t cause;
+        switch (channelBase)
         {
+        case 0x10008000u: path = PS2Memory::DmaPath::Vif0; cause = 0u; break;
+        case 0x10009000u: path = PS2Memory::DmaPath::Vif1; cause = 1u; break;
+        case 0x1000A000u: path = PS2Memory::DmaPath::Gif; cause = 2u; break;
+        default:
+        {
+            static unsigned reports = 0u;
+            if (++reports <= 20u)
+                std::fprintf(stderr, "[sceDmaSend] channel %08x has no native consumer\n", channelBase);
             return -1;
         }
+        }
 
-        const uint32_t payloadPhys = toDmaPhys(payloadArg);
-        uint32_t madr = 0;
-        uint32_t qwc = 0;
-        uint32_t tadr = payloadPhys;
         PS2Memory &mem = runtime->memory();
-
-        const uint32_t configuredChcr = mem.readIORegister(channelBase + 0x00u);
-        const uint32_t transferTagEnable = configuredChcr & 0x00000040u;
-        uint32_t chcr = 0x00000181u | transferTagEnable; // DIR=1, TIE=1, STR=1 (normal mode).
-
         if (preferNormalCount)
-        {
-            qwc = normalizeQwcFromArg(countArg);
-            madr = payloadPhys;
-        }
+            mem.sendDma(path, payload, normalizeQwcFromArg(getRegU32(ctx, 6)));
         else
-        {
-            chcr = 0x00000185u | transferTagEnable; // MODE=1 chain, DIR=1, TIE=1, STR=1.
-        }
-
-        mem.writeIORegister(channelBase + 0x20u, qwc & 0xFFFFu);
-        mem.writeIORegister(channelBase + 0x10u, madr);
-        mem.writeIORegister(channelBase + 0x30u, tadr);
-        mem.writeIORegister(channelBase + 0x00u, chcr);
-        mem.processPendingTransfers();
-
-        std::vector<uint32_t> completedCauses = mem.consumeCompletedDmacCauses();
-        if (completedCauses.empty() && (mem.readIORegister(channelBase + 0x00u) & 0x100u) == 0u)
-        {
-            if (channelBase == 0x10008000u)
-            {
-                completedCauses.push_back(0u);
-            }
-            else if (channelBase == 0x10009000u)
-            {
-                completedCauses.push_back(1u);
-            }
-            else if (channelBase == 0x1000A000u)
-            {
-                completedCauses.push_back(2u);
-            }
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(g_dmaStubMutex);
-            g_dmaPendingPolls[channelBase] = 1;
-            if (g_dmaStubLogCount < kMaxDmaStubLogs)
-            {
-                RUNTIME_LOG("[sceDmaSend] ch=0x" << std::hex << channelBase
-                                                 << " madr=0x" << madr
-                                                 << " qwc=0x" << qwc
-                                                 << " tadr=0x" << tadr
-                                                 << " chcr=0x" << chcr << std::dec << std::endl);
-
-                if (!preferNormalCount && (channelBase == 0x10009000u || channelBase == 0x1000A000u))
-                {
-                    if (const uint8_t *tagPtr = getConstMemPtr(rdram, tadr))
-                    {
-                        uint64_t tagLo = 0u;
-                        std::memcpy(&tagLo, tagPtr, sizeof(tagLo));
-                        uint32_t w2 = 0u;
-                        uint32_t w3 = 0u;
-                        std::memcpy(&w2, tagPtr + 8u, sizeof(w2));
-                        std::memcpy(&w3, tagPtr + 12u, sizeof(w3));
-                        RUNTIME_LOG("[sceDmaSend:head] ch=0x" << std::hex << channelBase
-                                                              << " tagQwc=0x" << static_cast<uint32_t>(tagLo & 0xFFFFu)
-                                                              << " id=0x" << static_cast<uint32_t>((tagLo >> 28u) & 0x7u)
-                                                              << " irq=0x" << static_cast<uint32_t>((tagLo >> 31u) & 0x1u)
-                                                              << " addr=0x" << static_cast<uint32_t>((tagLo >> 32u) & 0x7FFFFFFFu)
-                                                              << " w2=0x" << w2
-                                                              << " w3=0x" << w3
-                                                              << std::dec << std::endl);
-                    }
-                }
-                ++g_dmaStubLogCount;
-            }
-        }
-
-        for (const uint32_t completedCause : completedCauses)
-        {
-            ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, completedCause);
-        }
-
+            mem.sendDmaChain(path, payload);
+        ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, cause);
         return 0;
     }
 
+    // Transfers are complete when sceDmaSend returns: never busy.
     int32_t submitDmaSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        if (!runtime)
-        {
-            return -1;
-        }
-
-        const uint32_t chanArg = getRegU32(ctx, 4);
-        const uint32_t mode = getRegU32(ctx, 5);
-        const uint32_t channelBase = resolveDmaChannelBase(rdram, chanArg);
-        if (channelBase == 0)
-        {
-            return -1;
-        }
-
-        bool modelBusy = false;
-        {
-            std::lock_guard<std::mutex> lock(g_dmaStubMutex);
-            auto it = g_dmaPendingPolls.find(channelBase);
-            if (it != g_dmaPendingPolls.end() && it->second > 0)
-            {
-                modelBusy = true;
-                if (mode != 0)
-                {
-                    --it->second;
-                    if (it->second == 0)
-                    {
-                        g_dmaPendingPolls.erase(it);
-                    }
-                }
-                else
-                {
-                    // Blocking mode: complete immediately in this runtime.
-                    g_dmaPendingPolls.erase(it);
-                }
-            }
-        }
-
-        const uint32_t chcr = runtime->memory().readIORegister(channelBase + 0x00u);
-        const bool hwBusy = (chcr & 0x100u) != 0;
-        return ((modelBusy || hwBusy) && mode != 0) ? 1 : 0;
+        return (runtime && resolveDmaChannelBase(rdram, getRegU32(ctx, 4)) != 0u) ? 0 : -1;
     }
 
 }
@@ -1892,6 +1755,7 @@ namespace
     {
         if (!runtime || !pairs || !runtime->syncCoreSubsystems())
             return;
+        runtime->memory().syncGsWorker(); // GOW-Port: GS writes from the EE go after queued GS work
         for (size_t i = 0; i < pairCount; ++i)
         {
             runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);

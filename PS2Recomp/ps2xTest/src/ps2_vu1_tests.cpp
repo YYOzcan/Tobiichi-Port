@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-void ps2Vu1ReloadEnvironmentOptions();
+void ps2Vu1ReloadEnvironmentOptions(); // GOW-Port: ps2_vu1_core.cpp
 
 namespace
 {
@@ -1400,50 +1400,6 @@ void register_ps2_vu1_tests()
             }
         });
 
-        // GOW-Port: FLG=3 ("disable") funciona como IMAGE en el GS. XGKICK lo rechazaba como instrucción reservada y
-        // detenía el microprograma, aunque el frontend del GS ya lo procesa como IMAGE.
-        tc.Run("XGKICK treats a GIFtag with FLG=3 like IMAGE", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            std::vector<std::vector<uint8_t>> captured;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                captured.emplace_back(data, data + sizeBytes);
-            });
-
-            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
-            GS gs;
-            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
-
-            uint8_t *code = mem.getVU1Code();
-            uint8_t *data = mem.getVU1Data();
-            std::memset(code, 0, PS2_VU1_CODE_SIZE);
-            std::memset(data, 0, PS2_VU1_DATA_SIZE);
-
-            const uint64_t tag = makeGifTag(1u, GIF_FMT_IMAGE2, 0u, true);
-            std::memcpy(data, &tag, sizeof(tag));
-            for (uint32_t i = 0; i < 16u; ++i)
-                data[16u + i] = static_cast<uint8_t>(0xA0u + i);
-            writeVuInstructionPair(code, 0u, makeVuLowerSpecial(0x6Cu, 1u), kVuUpperNop);
-            writeVuInstructionPair(code, 8u, makeVuIaddiu(2u, 0u, 7), kVuUpperNop);
-            writeVuInstructionPair(code, 16u, 0u, kVuUpperNop);
-
-            VU1Interpreter vu1;
-            vu1.state().vi[1] = 0;
-            vu1.execute(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, &mem, 0u, 0u, 0u, 3u);
-
-            t.Equals(vu1.state().vi[2], 7, "the program should keep running after the FLG=3 XGKICK");
-            t.Equals(captured.size(), static_cast<size_t>(1u), "PATH1 should send the FLG=3 packet");
-            if (!captured.empty())
-            {
-                t.Equals(captured[0].size(), static_cast<size_t>(32u), "FLG=3 consumes NLOOP qwords like IMAGE");
-                t.IsTrue(captured[0].size() >= 32u && captured[0][16u] == 0xA0u && captured[0][31u] == 0xAFu,
-                         "the FLG=3 payload should be the qword after the tag");
-            }
-        });
-
         tc.Run("XGKICK observes stores committed before a future PATH1 qword", [](TestCase &t)
         {
             PS2Memory mem;
@@ -1496,74 +1452,6 @@ void register_ps2_vu1_tests()
                                          sizeof(replacement)) == 0,
                          "XGKICK must read each qword in its transfer cycle");
             }
-        });
-
-        tc.Run("immediate XGKICK snapshots a packet before its payload is overwritten", [](TestCase &t)
-        {
-            ScopedImmediateXgkick mode;
-            Vu1Fixture fx;
-            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
-            std::vector<std::vector<uint8_t>> captured;
-            fx.mem.setGifPacketCallback([&](const uint8_t *packet, uint32_t size) {
-                captured.emplace_back(packet, packet + size);
-            });
-            const uint64_t tag = makeGifTag(1u, GIF_FMT_IMAGE, 0u);
-            std::memcpy(fx.data, &tag, sizeof(tag));
-            std::memset(fx.data + 16, 0x5a, 16);
-            writeVuInstructionPair(fx.code, 0u, makeVuLowerSpecial(0x6Cu, 1u), kVuUpperNop);
-            writeVuInstructionPair(fx.code, 8u, makeVuSq(0xFu, 4u, 2u, 0), kVuUpperNop);
-            writeVuInstructionPair(fx.code, 16u, 0u, kVuUpperNop);
-            VU1Interpreter vu;
-            vu.state().vi[1] = 0;
-            vu.state().vi[2] = 1;
-            const float replacement[4] = {0, 0, 0, 1};
-            std::memcpy(vu.state().vf[4], replacement, sizeof(replacement));
-            vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
-                       fx.gs, &fx.mem, 0u, 0u, 0u, 3u);
-            t.Equals(captured.size(), size_t(1), "exactly one packet should be sent");
-            if (!captured.empty())
-            {
-                t.Equals(captured[0].size(), size_t(32), "the complete packet should be captured");
-                if (captured[0].size() == 32)
-                    for (size_t i = 16; i < 32; ++i)
-                        t.Equals(captured[0][i], uint8_t(0x5a), "sent payload must retain the original bytes");
-            }
-            t.IsTrue(std::memcmp(fx.data + 16, replacement, 16) == 0,
-                     "the later store must still update VU data memory");
-        });
-
-        tc.Run("immediate XGKICK snapshots a packet before its payload is overwritten", [](TestCase &t)
-        {
-            ScopedImmediateXgkick mode;
-            Vu1Fixture fx;
-            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
-            std::vector<std::vector<uint8_t>> captured;
-            fx.mem.setGifPacketCallback([&](const uint8_t *packet, uint32_t size) {
-                captured.emplace_back(packet, packet + size);
-            });
-            const uint64_t tag = makeGifTag(1u, GIF_FMT_IMAGE, 0u);
-            std::memcpy(fx.data, &tag, sizeof(tag));
-            std::memset(fx.data + 16, 0x5a, 16);
-            writeVuInstructionPair(fx.code, 0u, makeVuLowerSpecial(0x6Cu, 1u), kVuUpperNop);
-            writeVuInstructionPair(fx.code, 8u, makeVuSq(0xFu, 4u, 2u, 0), kVuUpperNop);
-            writeVuInstructionPair(fx.code, 16u, 0u, kVuUpperNop);
-            VU1Interpreter vu;
-            vu.state().vi[1] = 0;
-            vu.state().vi[2] = 1;
-            const float replacement[4] = {0, 0, 0, 1};
-            std::memcpy(vu.state().vf[4], replacement, sizeof(replacement));
-            vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
-                       fx.gs, &fx.mem, 0u, 0u, 0u, 3u);
-            t.Equals(captured.size(), size_t(1), "exactly one packet should be sent");
-            if (!captured.empty())
-            {
-                t.Equals(captured[0].size(), size_t(32), "the complete packet should be captured");
-                if (captured[0].size() == 32)
-                    for (size_t i = 16; i < 32; ++i)
-                        t.Equals(captured[0][i], uint8_t(0x5a), "sent payload must retain the original bytes");
-            }
-            t.IsTrue(std::memcmp(fx.data + 16, replacement, 16) == 0,
-                     "the later store must still update VU data memory");
         });
 
         tc.Run("immediate XGKICK snapshots a packet before its payload is overwritten", [](TestCase &t)

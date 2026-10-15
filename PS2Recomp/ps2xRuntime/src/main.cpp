@@ -1,4 +1,8 @@
 #include "ps2_runtime.h"
+
+void ps2InstallEeDiff(PS2Runtime &runtime); // src/lib/ee_ref/ee_diff.cpp
+void ps2InstallEeWatch(PS2Runtime &runtime);
+void ps2InstallEePageWatch(PS2Runtime &runtime);
 #include "games_database.h"
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "ps2_debug_panel.h"
@@ -213,9 +217,11 @@ int main(int argc, char *argv[])
                 static_cast<PS2DebugPanel *>(userData)->shutdown();
             },
             &debugPanel);
-        // GOW-Port: TOBIICHI_PANEL=0 (lanzador) arranca con el panel de depuración oculto; F1 lo muestra.
-        if (const char *panel = std::getenv("TOBIICHI_PANEL"); panel && panel[0] == '0')
-            debugPanel.setVisible(false);
+        // GOW-Port: el panel de depuración arranca oculto (F1 lo muestra); TOBIICHI_PANEL=1 (lanzador) lo abre.
+        {
+            const char *panel = std::getenv("TOBIICHI_PANEL");
+            debugPanel.setVisible(panel && panel[0] == '1');
+        }
 #endif
         if (!runtime.initialize(windowTitle.c_str()))
         {
@@ -229,6 +235,9 @@ int main(int argc, char *argv[])
             return 1;
         }
 
+        ps2InstallEeDiff(runtime);
+        ps2InstallEeWatch(runtime);
+        ps2InstallEePageWatch(runtime);
         runtime.run();
 
 #ifdef _DEBUG

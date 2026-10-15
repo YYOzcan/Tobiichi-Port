@@ -29,6 +29,7 @@ namespace ps2x::iop::detail
         uint32_t size = 0;
         uint32_t entry = 0;
         uint32_t gp = 0;
+        uint32_t textSize = 0; // code bytes from the IRX .iopmod header (0 = unknown)
         uint32_t nextModuleCursor = 0;
         bool relocationsComplete = true;
 

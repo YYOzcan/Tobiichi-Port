@@ -1,35 +1,55 @@
 #include "iop_memory.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <utility>
 
 namespace ps2x::iop::detail
 {
-    uint64_t spu2AdmaRetardo(const Spu2 &spu2, uint32_t core); // GOW-Port: spu2.cpp
-
     namespace
     {
-        constexpr uint32_t kDmaSpu0Chcr = 0x1F8010C8u;
-        constexpr uint32_t kDmaSpu1Chcr = 0x1F801508u;
-        constexpr uint32_t kDmaStart = 1u << 24u;
-        constexpr int kDmaSpu0Irq = 0x24;
-        constexpr int kDmaSpu1Irq = 0x28;
-        constexpr uint32_t kDmaSio2InChcr = 0x1F801548u;  // GOW-Port: DMA 11
-        constexpr uint32_t kDmaSio2OutChcr = 0x1F801558u; // GOW-Port: DMA 12
-        constexpr uint64_t kSio2TransferCycles = 256u;
 
         uint32_t alignUp(uint32_t value, uint32_t alignment)
         {
             return (value + alignment - 1u) & ~(alignment - 1u);
+        }
+
+        // GOW-Port: GOW_IOP_IO_HIST=<s>: IOP hardware register accesses (op, address) for <s> seconds after the first
+        // one, then printed once; each new register is also reported when first touched. The IOP counterpart of GOW_IO_HIST (docs/native-port.md, hardware access inventory).
+        void iopIoHist(char op, uint32_t address)
+        {
+            static const double window = [] { const char *v = std::getenv("GOW_IOP_IO_HIST"); return v ? std::atof(v) : 0.0; }();
+            if (window <= 0.0)
+                return;
+            static std::mutex mutex;
+            static std::map<std::pair<char, uint32_t>, uint64_t> counts;
+            static std::chrono::steady_clock::time_point start;
+            static bool done = false;
+            std::lock_guard<std::mutex> lock(mutex);
+            if (done)
+                return;
+            const auto now = std::chrono::steady_clock::now();
+            if (counts.empty())
+                start = now;
+            if (++counts[{op, address}] == 1u) // each new register at once, so sparse accesses are seen too
+                std::fprintf(stderr, "[iop-io-first] %c %08x\n", op, address);
+            if (std::chrono::duration<double>(now - start).count() < window)
+                return;
+            done = true;
+            for (const auto &[key, count] : counts)
+                std::fprintf(stderr, "[iop-io-hist] %c %08x n=%llu\n", key.first, key.second, static_cast<unsigned long long>(count));
+            std::fflush(stderr);
         }
     }
 
     IopMemory::IopMemory()
         : m_ram(RamSize), m_owned(RamSize), m_scratch(ScratchSize)
     {
-        const char *sio2 = std::getenv("GOW_SIO2");
-        m_sio2Enabled = sio2 == nullptr || sio2[0] != '0';
         reset();
     }
 
@@ -45,8 +65,8 @@ namespace ps2x::iop::detail
         m_interruptMask = 0;
         m_interruptControl = 1;
         m_dmaStart.reset();
-        m_spu2.reset();
-        m_sio2.reset();
+        m_sound.reset();
+        m_cards.reset();
     }
 
     uint8_t IopMemory::read8(uint32_t address) const
@@ -56,8 +76,6 @@ namespace ps2x::iop::detail
             return m_ram[phys];
         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
             return m_scratch[phys - ScratchBase];
-        if (m_sio2Enabled && phys == Sio2::RegFifoOut) // GOW-Port: lectura de un byte de la respuesta
-            return m_sio2.readFifo();
         const uint32_t value = readHardware32(phys & ~3u);
         return static_cast<uint8_t>(value >> ((phys & 3u) * 8u));
     }
@@ -112,19 +130,6 @@ namespace ps2x::iop::detail
             m_scratch[phys - ScratchBase] = value;
             return;
         }
-        if (Spu2::contains(phys)) // GOW-Port: los registros del SPU2 son de 16 bits
-        {
-            const uint32_t half = phys & ~1u;
-            const uint32_t shift = (phys & 1u) * 8u;
-            const uint16_t current = m_spu2.read16(half);
-            m_spu2.write16(half, static_cast<uint16_t>((current & ~(0xFFu << shift)) | (static_cast<uint32_t>(value) << shift)));
-            return;
-        }
-        if (m_sio2Enabled && phys == Sio2::RegFifoIn) // GOW-Port: un byte del comando
-        {
-            m_sio2.writeFifo(value);
-            return;
-        }
         const uint32_t aligned = phys & ~3u;
         uint32_t current = readHardware32(aligned);
         const uint32_t shift = (phys & 3u) * 8u;
@@ -139,11 +144,6 @@ namespace ps2x::iop::detail
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
             markOwned(phys, sizeof(value));
-            return;
-        }
-        if (Spu2::contains(phys) && (phys & 1u) == 0u) // GOW-Port: una sola escritura de 16 bits (KON, puerto de datos...)
-        {
-            m_spu2.write16(phys, value);
             return;
         }
         write8(address, static_cast<uint8_t>(value));
@@ -162,12 +162,6 @@ namespace ps2x::iop::detail
         if ((phys & 3u) == 0u && phys >= ScratchBase && phys + 3u < ScratchBase + ScratchSize)
         {
             std::memcpy(m_scratch.data() + (phys - ScratchBase), &value, sizeof(value));
-            return;
-        }
-        if ((phys & 3u) == 0u && Spu2::contains(phys))
-        {
-            m_spu2.write16(phys, static_cast<uint16_t>(value));
-            m_spu2.write16(phys + 2u, static_cast<uint16_t>(value >> 16u));
             return;
         }
         if ((phys & 3u) == 0u)
@@ -244,10 +238,7 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
-        if (Spu2::contains(address))
-            return m_spu2.read16(address) | (static_cast<uint32_t>(m_spu2.read16(address + 2u)) << 16u);
-        if (m_sio2Enabled && Sio2::contains(address))
-            return m_sio2.read32(address);
+        iopIoHist('R', address);
         const auto value = m_hardware.find(address);
         if (value != m_hardware.end())
             return value->second;
@@ -266,6 +257,7 @@ namespace ps2x::iop::detail
 
     void IopMemory::writeHardware32(uint32_t address, uint32_t value)
     {
+        iopIoHist('W', address);
         switch (address)
         {
         case 0x1F801070u:
@@ -280,78 +272,8 @@ namespace ps2x::iop::detail
         default:
             break;
         }
-        if (m_sio2Enabled && Sio2::contains(address))
-        {
-            m_sio2.write32(address, value);
-            if (m_sio2.takeTransferStarted())
-                m_dmaStart = DmaStart{Sio2::IopInterrupt, kSio2TransferCycles};
-            return;
-        }
-        if (m_sio2Enabled && (address == kDmaSio2InChcr || address == kDmaSio2OutChcr) && (value & kDmaStart) != 0u)
-        {
-            startSio2Dma(address, value);
-            return;
-        }
 
-        m_hardware[address] = value;
-        if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
-            return;
-
-        const bool secondCore = address == kDmaSpu1Chcr;
-        m_hardware[address] = value & ~kDmaStart;
-        const uint32_t core = secondCore ? 1u : 0u;
-
-        const uint32_t blockControlAddress = address - sizeof(uint32_t);
-        uint32_t blockControl = 0u;
-        if (const auto current = m_hardware.find(blockControlAddress); current != m_hardware.end())
-            blockControl = current->second;
-        const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
-        const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
-        const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
-
-        // GOW-Port: copiar los datos de verdad entre la RAM del IOP (MADR) y la RAM de sonido (TSA del nucleo).
-        // CHCR bit 0 = 1: de memoria al SPU2. El estado (STATX 0x80) y la interrupcion diferida no cambian.
-        uint32_t madr = 0u;
-        if (const auto current = m_hardware.find(address - 8u); current != m_hardware.end())
-            madr = physicalAddress(current->second) & (RamSize - 1u);
-        const size_t bytes = static_cast<size_t>(std::min<uint64_t>(transferWords * 4u, RamSize - madr));
-        uint64_t retardoAdma = 0u;
-        if ((value & 1u) != 0u)
-        {
-            (void)m_spu2.dmaWrite(core, m_ram.data() + madr, bytes);
-            // GOW-Port: en ADMA el SPU2 consume el DMA a 48 kHz; termina cuando lee el último bloque (spu2.cpp).
-            retardoAdma = spu2AdmaRetardo(m_spu2, core);
-        }
-        else if (m_spu2.dmaRead(core, m_ram.data() + madr, bytes))
-            markOwned(madr, bytes);
-        m_spu2.markDmaReady(core);
-        m_dmaStart = DmaStart{
-            secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
-            retardoAdma != 0u ? retardoAdma : std::max<uint64_t>(transferWords * 2u, 64u),
-        };
-    }
-
-    // GOW-Port: DMA 11 (memoria -> SIO2) y 12 (SIO2 -> memoria). Bloques de BCR&0xFFFF palabras, BCR>>16 bloques.
-    // Terminan en el acto: sio2man solo espera la interrupcion del SIO2.
-    void IopMemory::startSio2Dma(uint32_t chcrAddress, uint32_t value)
-    {
-        m_hardware[chcrAddress] = value & ~kDmaStart;
-        uint32_t madr = 0u, blockControl = 0u;
-        if (const auto current = m_hardware.find(chcrAddress - 8u); current != m_hardware.end())
-            madr = physicalAddress(current->second) & (RamSize - 1u);
-        if (const auto current = m_hardware.find(chcrAddress - 4u); current != m_hardware.end())
-            blockControl = current->second;
-        const size_t blockBytes = static_cast<size_t>(blockControl & 0xFFFFu) * 4u;
-        const size_t blocks = std::max<uint32_t>(blockControl >> 16u, 1u);
-        const size_t bytes = std::min<size_t>(blockBytes * blocks, RamSize - madr);
-        if (chcrAddress == kDmaSio2InChcr)
-            m_sio2.dmaIn(m_ram.data() + madr, blockBytes, blockBytes != 0u ? bytes / blockBytes : 0u);
-        else
-        {
-            m_sio2.dmaOut(m_ram.data() + madr, bytes);
-            markOwned(madr, bytes);
-        }
-        m_hardware[chcrAddress - 8u] = madr + static_cast<uint32_t>(bytes);
+        m_hardware[address] = value; // GOW-Port: the SPU DMA channels are gone (LIBSD transfers are native copies)
     }
 
     std::optional<IopMemory::DmaStart> IopMemory::takeDmaStart() noexcept

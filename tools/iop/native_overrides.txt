@@ -1,0 +1,29 @@
+# IRX functions replaced by native C++ (ps2xIOP/src/native/iop_native_overrides.cpp).
+# <module ident> <offset hex from the module base> <name>
+mc2_d_irx 0c8c read_page
+mc2_d_irx 0fdc write_page
+mc2_d_irx 0a98 erase_block
+mc2_d_irx 13a8 get_specs
+mc2_d_irx 0650 init_card
+mc2_d_irx 164c probe
+mc2_d_irx 08d8 probe_f3
+sio2d_irx 0978 probe_pad
+sio2d_irx 0a1c probe_card
+libsd_irx 456c sceSdInit
+libsd_irx 3670 sceSdSetParam
+libsd_irx 36cc sceSdGetParam
+libsd_irx 372c sceSdSetSwitch
+libsd_irx 3764 sceSdGetSwitch
+libsd_irx 379c sceSdSetAddr
+libsd_irx 3800 sceSdGetAddr
+libsd_irx 3cbc sceSdSetCoreAttr
+libsd_irx 18a0 sceSdVoiceTrans
+libsd_irx 1c30 sceSdBlockTrans
+libsd_irx 1af0 sceSdVoiceTransStatus
+libsd_irx 1e4c sceSdBlockTransStatus
+libsd_irx 0c3c sceSdSetEffectAttr
+libsd_irx 3e3c sceSdSetTransIntrHandler
+libsd_irx 0984 sceSdSetEffectWorkArea
+sio2man_irx 0000 ctrl_set
+sio2man_irx 0014 ctrl_get
+libsd_irx 1560 bus_setup

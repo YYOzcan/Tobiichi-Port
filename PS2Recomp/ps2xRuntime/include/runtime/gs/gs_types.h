@@ -290,6 +290,8 @@ struct GSPresentationRequest
     GSFrameReg preferredSource{};
     uint32_t preferredDestFbp = 0;
     bool hasPreferredSource = false;
+    // GOW-Port: solo las capturas explicitas descargan pixeles en modo compartido.
+    bool forceReadback = false;
 };
 
 struct PresentationFrame

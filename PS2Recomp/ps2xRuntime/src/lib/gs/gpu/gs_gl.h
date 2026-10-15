@@ -63,6 +63,7 @@ namespace GSGL
     constexpr GLbitfield kClientStorageBit = 0x0200;
     constexpr GLenum kTimeElapsed = 0x88BF;
     constexpr GLenum kQueryResult = 0x8866;
+    constexpr GLenum kQueryResultAvailable = 0x8867; // GOW-Port: consulta sin espera.
     constexpr GLenum kTimestamp = 0x8E28;
     constexpr GLenum kTexture2D = 0x0DE1;
     constexpr GLenum kRgba8 = 0x8058;
@@ -74,6 +75,7 @@ namespace GSGL
     constexpr GLenum kTextureWrapS = 0x2802;
     constexpr GLenum kTextureWrapT = 0x2803;
     constexpr GLint kLinear = 0x2601;
+    constexpr GLint kNearest = 0x2600;
     constexpr GLint kClampToEdge = 0x812F;
 
     struct Api
@@ -143,6 +145,35 @@ namespace GSGL
         void (*BindVertexArray)(GLuint) = nullptr;
         void (*Enable)(GLenum) = nullptr;
         void (*Disable)(GLenum) = nullptr;
+        // GOW-Port: classic raster pipeline used by the render-target renderer (gs_hw_backend).
+        void (*ActiveTexture)(GLenum) = nullptr;
+        void (*FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint) = nullptr;
+        GLenum (*CheckFramebufferStatus)(GLenum) = nullptr;
+        void (*BlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum) = nullptr;
+        void (*BlendEquationSeparate)(GLenum, GLenum) = nullptr;
+        void (*BlendColor)(float, float, float, float) = nullptr;
+        void (*ColorMask)(GLboolean, GLboolean, GLboolean, GLboolean) = nullptr;
+        void (*DepthMask)(GLboolean) = nullptr;
+        void (*DepthFunc)(GLenum) = nullptr;
+        void (*ClearColor)(float, float, float, float) = nullptr;
+        void (*ClearDepth)(double) = nullptr;
+        void (*Clear)(GLbitfield) = nullptr;
+        void (*Scissor)(GLint, GLint, GLsizei, GLsizei) = nullptr;
+        void (*Uniform1i)(GLint, GLint) = nullptr;
+        void (*Uniform1f)(GLint, float) = nullptr;
+        void (*Uniform2f)(GLint, float, float) = nullptr;
+        void (*Uniform4f)(GLint, float, float, float, float) = nullptr;
+        void (*Uniform4i)(GLint, GLint, GLint, GLint, GLint) = nullptr;
+        void (*VertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *) = nullptr;
+        void (*VertexAttribIPointer)(GLuint, GLint, GLenum, GLsizei, const void *) = nullptr;
+        void (*EnableVertexAttribArray)(GLuint) = nullptr;
+        void (*DrawBuffers)(GLsizei, const GLenum *) = nullptr;
+        void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *) = nullptr;
+        void (*BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum) = nullptr;
+        void (*TextureBarrier)() = nullptr;
+        void (*CopyImageSubData)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei) = nullptr;
+        void (*PixelStorei)(GLenum, GLint) = nullptr;
+        bool hwRaster = false;
         void (*MaxShaderCompilerThreads)(GLuint) = nullptr;
         bool graphics = false;
     };
@@ -173,7 +204,12 @@ namespace GSGL
     };
 
     bool PublishShared(const Api &gl, GLuint buffer, uint32_t width, uint32_t height, uint64_t renderSequence,
-                       GLuint hashProgram, GLint hashLocation);
+                       uint32_t displayFbp, uint32_t sourceFbp, bool usedPreferred, bool blank,
+                       uint64_t vsyncTick, GLuint hashProgram, GLint hashLocation);
+    // GOW-Port: GPU copy of a finished presentation texture into a shared slot the host draws (no CPU round trip).
+    // source == 0 publishes a blank frame (PMODE off).
+    bool PublishSharedTexture(const Api &gl, GLuint source, uint32_t width, uint32_t height, uint64_t renderSequence,
+                              uint32_t displayFbp, uint32_t sourceFbp, uint64_t vsyncTick);
     bool SharedAvailable(const Api &gl);
     void DestroyShared(const Api &gl);
 }

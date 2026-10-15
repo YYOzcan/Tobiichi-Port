@@ -3,7 +3,7 @@
 #include "runtime/ee_scheduler.h"
 
 #if !defined(PS2X_HAS_FFMPEG)
-#define PS2X_HAS_FFMPEG 1
+#define PS2X_HAS_FFMPEG 0
 #endif
 
 #if PS2X_HAS_FFMPEG
@@ -14,14 +14,28 @@ extern "C"
 #include <libavutil/log.h>
 #include <libswscale/swscale.h>
 }
+#else
+extern "C"
+{
+#include <mpeg2.h>
+}
 #endif
 
-#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <deque>
+#include <map>
 #include <memory>
 
 #include "Syscalls/Helpers/State.h"
+
+// Audio device position, defined in ps2_runtime.cpp (movie A/V check, GOW_MPEG_DIAG).
+extern std::atomic<uint64_t> g_gowAudioFramesPlayed, g_gowAudioFramesProduced;
+// Time spent in the decoder stubs (movie cost check, printed by the GOW_MPEG_DIAG sync line).
+namespace { double g_mpegGetMs = 0.0, g_mpegDemuxMs = 0.0;
+  struct MpegTimer { double &acc; std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    ~MpegTimer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); } }; }
 
 namespace ps2_stubs
 {
@@ -35,40 +49,6 @@ namespace ps2_stubs
             int64_t pts90k = -1;
             std::vector<uint8_t> rgba;
         };
-
-        // GOW-Port: último cuadro pedido con sceMpegGetPictureRAW8, para el CSC del IPU (ver mpegCuadroParaCsc).
-        struct MpegCscState
-        {
-            std::mutex mutex;
-            MpegDecodedFrame frame;
-            uint32_t nextMacroblock = 0u; // siguiente macrobloque del cuadro (un CSC puede ir en varias tandas)
-            uint64_t serial = 0u;
-        };
-        MpegCscState g_mpegCsc;
-
-        // GOW-Port: último cuadro servido al juego, para presentarlo en la ventana (ps2MpegCuadroPantalla). God of War
-        // muestra los vídeos releyendo la imagen RGB32 como PSMZ16 y redibujándola en franjas de 8 píxeles (truco de
-        // la memoria del GS que nuestro GS no reproduce); la ventana muestra este cuadro mientras dura el vídeo.
-        struct MpegPantalla
-        {
-            std::mutex mutex;
-            std::vector<uint8_t> rgba;
-            int width = 0;
-            int height = 0;
-            uint64_t serial = 0u;
-        };
-        MpegPantalla g_mpegPantalla;
-
-        void publicarCuadroPantalla(const MpegDecodedFrame &frame)
-        {
-            if (frame.width <= 0 || frame.height <= 0 || frame.rgba.size() < static_cast<size_t>(frame.width) * frame.height * 4u)
-                return;
-            std::lock_guard<std::mutex> lock(g_mpegPantalla.mutex);
-            g_mpegPantalla.rgba.assign(frame.rgba.begin(), frame.rgba.begin() + static_cast<std::ptrdiff_t>(frame.width) * frame.height * 4);
-            g_mpegPantalla.width = frame.width;
-            g_mpegPantalla.height = frame.height;
-            ++g_mpegPantalla.serial;
-        }
 
 #if PS2X_HAS_FFMPEG
         std::string ffmpegErrorString(int err)
@@ -480,27 +460,108 @@ namespace ps2_stubs
             bool m_drained = false;
         };
 #else
-        // TODO
+        // GOW-Port: MPEG-2 video decoder on the vendored libmpeg2 (portable C, no FFmpeg; third_party/libmpeg2).
+        // Same interface as the FFmpeg backend: elementary-stream bytes in, RGBA frames (display order) out.
         class MpegFfmpegDecoder
         {
         public:
-            bool feed(const uint8_t *, size_t, std::deque<MpegDecodedFrame> &, int64_t = -1, int64_t = -1)
-            {
-                static bool s_warnedNoFfmpeg = false;
-                if (!s_warnedNoFfmpeg)
-                {
-                    std::cerr << "[MPEG] runtime built without FFmpeg; MPEG video decode is disabled." << std::endl;
-                    s_warnedNoFfmpeg = true;
-                }
-                return false;
-            }
+            MpegFfmpegDecoder() = default;
+            ~MpegFfmpegDecoder() { reset(); }
+            MpegFfmpegDecoder(const MpegFfmpegDecoder &) = delete;
+            MpegFfmpegDecoder &operator=(const MpegFfmpegDecoder &) = delete;
 
-            bool flush(std::deque<MpegDecodedFrame> &)
+            bool feed(const uint8_t *data, size_t size, std::deque<MpegDecodedFrame> &frames, int64_t pts90k = -1, int64_t = -1)
             {
+                if (!data || size == 0)
+                    return true;
+                if (!m_dec && !(m_dec = mpeg2_init()))
+                {
+                    std::cerr << "[MPEG] libmpeg2 init failed" << std::endl;
+                    return false;
+                }
+                m_drained = false;
+                if (pts90k >= 0) // applies to the next picture start code in this data
+                    mpeg2_tag_picture(m_dec, static_cast<uint32_t>(pts90k), static_cast<uint32_t>(static_cast<uint64_t>(pts90k) >> 32));
+                // libmpeg2 reads straight from the buffer until it reports STATE_BUFFER, so the whole input is consumed here.
+                mpeg2_buffer(m_dec, const_cast<uint8_t *>(data), const_cast<uint8_t *>(data) + size);
+                parse(frames);
                 return true;
             }
 
-            void reset() {}
+            bool flush(std::deque<MpegDecodedFrame> &frames)
+            {
+                if (!m_dec || m_drained)
+                    return true;
+                static const uint8_t kSequenceEnd[4] = {0x00, 0x00, 0x01, 0xB7}; // outputs the last reference picture
+                mpeg2_buffer(m_dec, const_cast<uint8_t *>(kSequenceEnd), const_cast<uint8_t *>(kSequenceEnd) + 4);
+                parse(frames);
+                m_drained = true;
+                return true;
+            }
+
+            void reset()
+            {
+                if (m_dec)
+                    mpeg2_close(m_dec);
+                m_dec = nullptr;
+                m_drained = false;
+            }
+
+        private:
+            void parse(std::deque<MpegDecodedFrame> &frames)
+            {
+                const mpeg2_info_t *info = mpeg2_info(m_dec);
+                for (;;)
+                {
+                    const mpeg2_state_t state = mpeg2_parse(m_dec);
+                    if (state == STATE_BUFFER)
+                        return;
+                    if ((state == STATE_SLICE || state == STATE_END || state == STATE_INVALID_END) &&
+                        info->display_fbuf && info->sequence)
+                        emit(*info, frames);
+                }
+            }
+
+            static uint8_t clamp8(int v) { return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v)); }
+
+            // BT.601 limited range YCbCr -> full range RGB (what the FFmpeg backend's swscale produced), alpha 255.
+            void emit(const mpeg2_info_t &info, std::deque<MpegDecodedFrame> &frames)
+            {
+                const mpeg2_sequence_t &seq = *info.sequence;
+                const int w = static_cast<int>(seq.picture_width), h = static_cast<int>(seq.picture_height);
+                if (w <= 0 || h <= 0)
+                    return;
+                const uint8_t *const *buf = info.display_fbuf->buf;
+                const int yStride = static_cast<int>(seq.width), cStride = static_cast<int>(seq.chroma_width);
+                const int cxShift = seq.chroma_width < seq.width ? 1 : 0, cyShift = seq.chroma_height < seq.height ? 1 : 0;
+                MpegDecodedFrame f;
+                f.width = w;
+                f.height = h;
+                const mpeg2_picture_t *pic = info.display_picture;
+                f.repeatPict = pic && pic->nb_fields > 2u ? static_cast<int>(pic->nb_fields) - 2 : 0;
+                f.pts90k = pic && (pic->flags & PIC_FLAG_TAGS) ? static_cast<int64_t>((static_cast<uint64_t>(pic->tag2) << 32) | pic->tag) : -1;
+                f.rgba.resize(static_cast<size_t>(w) * h * 4u);
+                uint8_t *out = f.rgba.data();
+                for (int y = 0; y < h; ++y)
+                {
+                    const uint8_t *yr = buf[0] + y * yStride;
+                    const uint8_t *ur = buf[1] + (y >> cyShift) * cStride;
+                    const uint8_t *vr = buf[2] + (y >> cyShift) * cStride;
+                    for (int x = 0; x < w; ++x, out += 4)
+                    {
+                        const int c = (yr[x] - 16) * 298 + 128;
+                        const int d = ur[x >> cxShift] - 128, e = vr[x >> cxShift] - 128;
+                        out[0] = clamp8((c + 409 * e) >> 8);
+                        out[1] = clamp8((c - 100 * d - 208 * e) >> 8);
+                        out[2] = clamp8((c + 516 * d) >> 8);
+                        out[3] = 255;
+                    }
+                }
+                frames.push_back(std::move(f));
+            }
+
+            mpeg2dec_t *m_dec = nullptr;
+            bool m_drained = false;
         };
 #endif
 
@@ -518,11 +579,7 @@ namespace ps2_stubs
         // NTSC-style fields at ~59.94 Hz to keep MPEG timing yet (29.97 fps).
         constexpr uint64_t kDefaultPictureIntervalQ32 = 2ull * kPictureClockOne;
         constexpr size_t kMpegTimingScanLimit = 4096u;
-        // GOW-Port: 8 cuadros (0,27 s) no bastaban: en tramos en los que el PSS lleva el vídeo por delante del
-        // audio, el demux se paraba antes de llegar a los paquetes de audio y el sonido de God of War se quedaba sin
-        // datos (su anillo del IOP es de 85 ms: se oía un tramo repetido y el audio quedaba retrasado). ~1 s de vídeo
-        // decodificado por delante (30 cuadros 640x480, ~37 MB) da margen al audio.
-        constexpr size_t kMaxDecodedPicturesAhead = 30u;
+        constexpr size_t kMaxDecodedPicturesAhead = 8u;
 
         struct MpegPlaybackState
         {
@@ -534,8 +591,6 @@ namespace ps2_stubs
             bool sawInput = false;
             bool sawSequenceEnd = false;
             bool streamEnded = false;
-            // GOW-Port: el PSS demultiplexado llegó a su código de fin de programa (0x000001B9).
-            bool programEndSeen = false;
             bool decoderFailed = false;
             uint64_t cdStreamGeneration = 0u;
             bool waitingForVideoSequenceHeader = true;
@@ -567,6 +622,7 @@ namespace ps2_stubs
             uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
             uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
             std::vector<MpegRegisteredCallback> callbacks;
+            std::vector<uint8_t> bytes; // audio: the payload, from the demuxer's own copy (see dispatchStreamCallbacks)
         };
 
         struct MpegStubState
@@ -596,8 +652,9 @@ namespace ps2_stubs
         constexpr uint32_t kStubMovieWidth = 320u;
         constexpr uint32_t kStubMovieHeight = 240u;
         constexpr uint32_t kMpegStrM2V = 0u;
-        constexpr uint32_t kMpegStrPCM = 1u;
-        constexpr uint32_t kMpegStrADPCM = 2u;
+        // libmpeg's sceMpegStr* stream types: M2V 0, IPU 1, PCM 2, ADPCM 3, DATA 4
+        constexpr uint32_t kMpegStrPCM = 2u;
+        constexpr uint32_t kMpegStrADPCM = 3u;
         constexpr uint8_t kMpegPackHeader = 0xBAu;
         constexpr uint8_t kMpegSystemHeader = 0xBBu;
         constexpr uint8_t kMpegProgramEnd = 0xB9u;
@@ -1050,9 +1107,13 @@ namespace ps2_stubs
             return result;
         }
 
+        // The video is over at its sequence end code (libmpeg's sceMpegIsEnd reports the end there) or at the PSS
+        // program end, whichever comes first; the demuxer still hands the audio packets after it to the game.
+        bool videoEnded(const MpegPlaybackState &playback) { return playback.streamEnded || playback.sawSequenceEnd; }
+
         void flushDecoderIfEnded(MpegPlaybackState &playback)
         {
-            if (playback.streamEnded && playback.decoder)
+            if (videoEnded(playback) && playback.decoder)
             {
                 playback.decoder->flush(playback.decodedFrames);
             }
@@ -1132,6 +1193,9 @@ namespace ps2_stubs
                 playback.decodedFrames.clear();
             }
 
+            // a sequence header after a sequence end starts a new sequence: the video goes on
+            if (playback.sawSequenceEnd && findMpegSequenceHeader(data, size) != kStartCodeNotFound)
+                playback.sawSequenceEnd = false;
             if (containsMpegSequenceEnd(data, size))
             {
                 playback.sawSequenceEnd = true;
@@ -1250,6 +1314,14 @@ namespace ps2_stubs
 
                 if (start > 0u)
                 {
+                    // GOW_MPEG_DIAG: bytes skipped to find a start code (a well-formed stream never needs it; a
+                    // resync can land on a start code inside audio data)
+                    static const bool s_skipDiag = std::getenv("GOW_MPEG_DIAG") != nullptr;
+                    static unsigned s_skips = 0;
+                    if (s_skipDiag && s_skips++ < 40u)
+                        std::fprintf(stderr, "[MPEG:skip] %zu bytes before a start code at demuxed=%llu (next id %02x)\n", start,
+                                     static_cast<unsigned long long>(playback.demuxedBytes),
+                                     start + 3u < buffer.size() ? buffer[start + 3u] : 0u);
                     erasePssPrefix(playback, start);
                 }
 
@@ -1263,7 +1335,6 @@ namespace ps2_stubs
                 if (streamId == kMpegProgramEnd)
                 {
                     playback.streamEnded = true;
-                    playback.programEndSeen = true; // GOW-Port
                     playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
                     flushDecoderIfEnded(playback);
                     erasePssPrefix(playback, buffer.size());
@@ -1392,22 +1463,33 @@ namespace ps2_stubs
                     const size_t payloadStart = pes.payloadOffset;
                     if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
                     {
+                        // PSS audio: private stream 1 with a 4-byte sub-stream header (FF A0 00 00; 0xAn = PCM channel
+                        // n, otherwise ADPCM) that the game's callback skips. The PCM runs on across packets of odd
+                        // lengths (God of War: 4073 / 4059 data bytes).
+                        const uint8_t subStream = payloadStart + 1u < packetEnd ? buffer[payloadStart + 1u] : 0u;
+                        const bool pcm = streamId == kMpegPrivateStream1 && (subStream & 0xF0u) == 0xA0u;
+                        // A/V check (GOW_MPEG_DIAG): the PTS of each stream's first audio packet
+                        static const bool s_audioPtsDiag = std::getenv("GOW_MPEG_DIAG") != nullptr;
+                        static std::map<uint32_t, bool> s_audioPtsSeen;
+                        if (s_audioPtsDiag && pes.pts90k >= 0 && !s_audioPtsSeen[mpegAddr])
+                        {
+                            s_audioPtsSeen[mpegAddr] = true;
+                            std::fprintf(stderr, "[MPEG:sync] first audio packet mpeg=0x%x pts=%lld\n", mpegAddr,
+                                         static_cast<long long>(pes.pts90k));
+                        }
+                        const size_t before = callbackEvents.size();
                         queueStreamCallbackEvent(
                             mpegAddr,
-                            kMpegStrPCM,
+                            pcm ? kMpegStrPCM : kMpegStrADPCM,
                             playback.pssGuestAddrs[payloadStart],
                             static_cast<uint32_t>(packetEnd - payloadStart),
                             callbackEvents,
                             pes.pts90k,
                             pes.dts90k);
-                        queueStreamCallbackEvent(
-                            mpegAddr,
-                            kMpegStrADPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
-                            callbackEvents,
-                            pes.pts90k,
-                            pes.dts90k);
+                        // a packet can straddle two of the game's reads into the same buffer: its guest bytes are
+                        // gone by the time the callback runs, so audio is handed over from this copy
+                        if (callbackEvents.size() != before)
+                            callbackEvents.back().bytes.assign(buffer.begin() + payloadStart, buffer.begin() + packetEnd);
                     }
                 }
 
@@ -1626,33 +1708,73 @@ namespace ps2_stubs
             return true;
         }
 
-        void dispatchGuestStreamCallback(uint8_t *rdram,
-                                         R5900Context *callerCtx,
-                                         PS2Runtime *runtime,
-                                         const MpegStreamCallbackEvent &event,
-                                         const MpegRegisteredCallback &callback)
+        // Returns the callback's result (libmpeg: 0 = data not taken, demux stops there), or 1 when it could not be
+        // run nested (queued for later, or not callable).
+        int32_t dispatchGuestStreamCallback(uint8_t *rdram,
+                                            R5900Context *callerCtx,
+                                            PS2Runtime *runtime,
+                                            const MpegStreamCallbackEvent &event,
+                                            const MpegRegisteredCallback &callback)
         {
             if (!rdram || !callerCtx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
             {
-                return;
+                return 1;
             }
 
             const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
             if (cbDataAddr == 0u)
             {
-                return;
+                return 1;
             }
             if (!writeMpegCallbackData(rdram, cbDataAddr, event))
             {
                 runtime->guestFree(cbDataAddr);
-                return;
+                return 1;
             }
 
+            static const bool s_cbDiag = std::getenv("GOW_MPEG_DIAG") != nullptr;
+            if (s_cbDiag)
+            {
+                static std::map<uint32_t, uint32_t> counts;
+                if ((counts[callback.func]++ % 500u) == 0u)
+                    std::fprintf(stderr, "[MPEG:diag] stream callback %08x calls=%u\n", callback.func, counts[callback.func]);
+            }
             R5900Context callbackCtx = *callerCtx;
             SET_GPR_U32(&callbackCtx, 4, event.mpegAddr);
             SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
             SET_GPR_U32(&callbackCtx, 6, callback.data);
             SET_GPR_U32(&callbackCtx, 7, 0u);
+
+            // GOW-Port: libmpeg calls the stream callbacks inside sceMpegDemuxPss, on the demuxing thread, before it
+            // returns. God of War relies on that: its .m2 player demuxes the first chunk and then reads the picture
+            // size from the sequence header its callback (0x18A788) just copied into the video ring. Run the callback
+            // here, nested, on the caller's stack (below its frame), until it returns to the sentinel ra 0.
+            {
+                R5900Context nested = callbackCtx;
+                const uint32_t sp = (GPR_U32(callerCtx, 29) - 0x400u) & ~0xFu;
+                SET_GPR_U32(&nested, 29, sp);
+                SET_GPR_U32(&nested, 31, 0u);
+                nested.pc = callback.func;
+                for (uint32_t steps = 0u; nested.pc != 0u && steps < 4096u; ++steps)
+                {
+                    PS2Runtime::RecompiledFunction fn = runtime->lookupFunction(nested.pc);
+                    if (!fn)
+                        break;
+                    fn(rdram, &nested, runtime);
+                }
+                if (nested.pc == 0u)
+                {
+                    runtime->guestFree(cbDataAddr);
+                    const int32_t result = static_cast<int32_t>(getRegU32(&nested, 2));
+                    // GOW_MPEG_DIAG: packets a stream callback refused (its ring is full; the demux stops there)
+                    static unsigned s_refusals = 0;
+                    if (s_cbDiag && result == 0 && s_refusals++ < 40u)
+                        std::fprintf(stderr, "[MPEG:refused] callback %08x type=%u len=%u\n", callback.func, event.streamType, event.len);
+                    return result;
+                }
+                std::fprintf(stderr, "[mpeg] stream callback %08x did not return (pc=%08x); queued instead\n",
+                             callback.func, nested.pc);
+            }
             SET_GPR_U32(&callbackCtx, 29, 0u);
             SET_GPR_U32(&callbackCtx, 31, 0u);
             callbackCtx.pc = callback.func;
@@ -1665,93 +1787,73 @@ namespace ps2_stubs
                 runtime->guestFree(cbDataAddr);
             };
             runtime->eeScheduler().queueInvocation(std::move(invocation));
+            return 1;
+        }
+
+        // GOW-Port: audio packets are handed to the game's callback from the demuxer's own copy of the bytes, through a
+        // guest buffer: the game reads its movie in 16 KB chunks into one buffer, so a packet that straddles two reads
+        // is no longer complete in guest memory when the callback runs. The callback returns 0 when the game's audio ring is full (God of War 0x18A8F8); libmpeg then stops demuxing at
+        // that packet and the game hands the rest in again after it drained the ring. This stub demuxes whole chunks
+        // at once, so refused packets wait here, in order, and go first on the next demux call.
+        struct PendingAudioPacket
+        {
+            MpegStreamCallbackEvent event;
+            std::vector<uint8_t> bytes;
+        };
+        std::map<uint32_t, std::deque<PendingAudioPacket>> g_pendingAudio; // per sceMpeg; demuxing thread only
+
+        uint32_t g_audioQueued = 0u, g_audioTaken = 0u, g_audioRefused = 0u; // GOW_MPEG_DIAG counters
+
+        bool isAudioStreamType(uint32_t type) { return type == kMpegStrPCM || type == kMpegStrADPCM; }
+
+        // Hands one audio packet held in host memory to its callbacks through a guest copy; false when refused.
+        bool deliverPendingAudio(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, PendingAudioPacket &packet)
+        {
+            const uint32_t copyAddr = runtime->guestMalloc(static_cast<uint32_t>(packet.bytes.size()), 16u);
+            if (copyAddr == 0u)
+                return false;
+            std::memcpy(rdram + (copyAddr & 0x1FFFFFFu), packet.bytes.data(), packet.bytes.size());
+            MpegStreamCallbackEvent event = packet.event;
+            event.dataAddr = copyAddr;
+            bool taken = true;
+            for (const MpegRegisteredCallback &callback : event.callbacks)
+                taken = dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback) != 0 && taken;
+            runtime->guestFree(copyAddr);
+            ++(taken ? g_audioTaken : g_audioRefused);
+            return taken;
         }
 
         void dispatchStreamCallbacks(uint8_t *rdram,
                                      R5900Context *ctx,
                                      PS2Runtime *runtime,
+                                     uint32_t mpegAddr,
                                      const std::vector<MpegStreamCallbackEvent> &events)
         {
-            if (events.empty())
-            {
-                return;
-            }
-
+            std::deque<PendingAudioPacket> &pending = g_pendingAudio[mpegAddr];
             for (const MpegStreamCallbackEvent &event : events)
             {
-                for (const MpegRegisteredCallback &callback : event.callbacks)
-                {
-                    dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
-                }
+                if (isAudioStreamType(event.streamType))
+                    pending.push_back(PendingAudioPacket{event, event.bytes}), ++g_audioQueued;
+                else
+                    for (const MpegRegisteredCallback &callback : event.callbacks)
+                        (void)dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
             }
+            while (!pending.empty() && deliverPendingAudio(rdram, ctx, runtime, pending.front()))
+                pending.pop_front();
         }
 
         void dispatchStreamCallbacksUnlocked(uint8_t *rdram,
                                              R5900Context *ctx,
                                              PS2Runtime *runtime,
+                                             uint32_t mpegAddr,
                                              const std::vector<MpegStreamCallbackEvent> &events)
         {
-            if (events.empty())
-            {
-                return;
-            }
-
-            dispatchStreamCallbacks(rdram, ctx, runtime, events);
+            dispatchStreamCallbacks(rdram, ctx, runtime, mpegAddr, events);
         }
 
-        // GOW-Port: como libmpeg, las funciones de flujo (sceMpegAddStrCallback) se ejecutan durante el
-        // demultiplexado, antes de volver a quien llamó a sceMpegDemuxPss(Ring). Encolarlas (dispatchStreamCallbacks)
-        // las dejaba para después: God of War lee la cabecera de secuencia del vídeo (ancho y alto, 0x189E44) justo
-        // tras el primer sceMpegDemuxPss, con su función de vídeo (0x18A788) aún sin ejecutar; quedaba en 0x0, el
-        // juego reservaba un búfer de imagen de 0 bytes y cada cuadro se escribía encima de otros datos (paquetes
-        // GIF rotos, pantalla con basura). Aquí se ejecutan en orden en el hilo actual y después sigue quien llamó
-        // (con el valor de retorno ya puesto en ctx). Si no hay ninguna, vuelve sin más.
-        void dispatchStreamCallbacksNow(uint8_t *rdram,
-                                        R5900Context *ctx,
-                                        PS2Runtime *runtime,
-                                        const std::vector<MpegStreamCallbackEvent> &events)
-        {
-            std::vector<GuestInvocation> invocations;
-            for (const MpegStreamCallbackEvent &event : events)
-            {
-                for (const MpegRegisteredCallback &callback : event.callbacks)
-                {
-                    if (!rdram || !ctx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
-                        continue;
-                    const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
-                    if (cbDataAddr == 0u)
-                        continue;
-                    if (!writeMpegCallbackData(rdram, cbDataAddr, event))
-                    {
-                        runtime->guestFree(cbDataAddr);
-                        continue;
-                    }
-                    R5900Context callbackCtx = *ctx;
-                    SET_GPR_U32(&callbackCtx, 4, event.mpegAddr);
-                    SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
-                    SET_GPR_U32(&callbackCtx, 6, callback.data);
-                    SET_GPR_U32(&callbackCtx, 7, 0u);
-                    SET_GPR_U32(&callbackCtx, 29, 0u);
-                    SET_GPR_U32(&callbackCtx, 31, 0u);
-                    callbackCtx.pc = callback.func;
-                    GuestInvocation invocation{};
-                    invocation.kind = GuestInvocationKind::HleCall;
-                    invocation.context = callbackCtx;
-                    invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
-                    {
-                        runtime->guestFree(cbDataAddr);
-                    };
-                    invocations.push_back(std::move(invocation));
-                }
-            }
-            if (invocations.empty())
-                return;
-            EeScheduler &scheduler = runtime->eeScheduler();
-            scheduler.bindMainContextForSyscall(*ctx, rdram);
-            scheduler.invokeCurrentSequence(std::move(invocations));
-        }
-
-        void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height)
+        // GOW-Port: like libmpeg, at most `capacity` bytes (mbcount macroblocks of 16x16 RGB32 = 1024 bytes) are written:
+        // God of War passes mbcount 0 for its .m2 movies, whose rgb32 buffer is only a few bytes before its GS packet.
+        void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height, size_t capacity)
         {
             if (!rdram || destAddr == 0u)
             {
@@ -1767,6 +1869,8 @@ namespace ps2_stubs
                     static_cast<size_t>(mbx) * static_cast<size_t>(outHeight) * 16u * 4u;
                 for (uint32_t y = 0u; y < outHeight; ++y)
                 {
+                    if (stripOffset + (static_cast<size_t>(y) + 1u) * 16u * 4u > capacity)
+                        break;
                     uint8_t *dst = getMemPtr(
                         rdram,
                         destAddr + static_cast<uint32_t>(stripOffset + static_cast<size_t>(y) * 16u * 4u));
@@ -1785,7 +1889,7 @@ namespace ps2_stubs
             }
         }
 
-        void writeDecodedFrameToGuest(uint8_t *rdram, uint32_t destAddr, const MpegDecodedFrame &frame)
+        void writeDecodedFrameToGuest(uint8_t *rdram, uint32_t destAddr, const MpegDecodedFrame &frame, size_t capacity)
         {
             if (!rdram || destAddr == 0u || frame.rgba.empty() || frame.width <= 0 || frame.height <= 0)
             {
@@ -1804,6 +1908,8 @@ namespace ps2_stubs
                     static_cast<size_t>(mbx) * static_cast<size_t>(outHeight) * 16u * 4u;
                 for (uint32_t y = 0u; y < outHeight; ++y)
                 {
+                    if (stripOffset + (static_cast<size_t>(y) + 1u) * 16u * 4u > capacity)
+                        break;
                     uint8_t *dst = getMemPtr(
                         rdram,
                         destAddr + static_cast<uint32_t>(stripOffset + static_cast<size_t>(y) * 16u * 4u));
@@ -2053,19 +2159,14 @@ namespace ps2_stubs
         const uint32_t callbackFunc = getRegU32(ctx, 7);
         const uint32_t callbackData = readAbiArg4(rdram, ctx);
 
+        if (std::getenv("GOW_MPEG_DIAG"))
+            std::fprintf(stderr, "[MPEG:diag] AddStrCallback type=%u ch=%u func=%08x data=%08x\n", streamType, streamId, callbackFunc, callbackData);
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.initialized = true;
         (void)getPlaybackState(mpegAddr);
         const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
-        // GOW-Port: como en libmpeg, cada flujo (tipo y canal) tiene un solo callback y volver a añadirlo lo sustituye.
-        // God of War los registra antes y después de su segundo sceMpegCreate: cada paquete de audio y vídeo se
-        // entregaba dos veces, el anillo de audio del juego se llenaba al doble de ritmo y rechazaba paquetes.
-        std::vector<MpegRegisteredCallback> &callbacks = g_mpeg_stub_state.callbacksByMpeg[mpegAddr];
-        callbacks.erase(std::remove_if(callbacks.begin(), callbacks.end(),
-                                       [&](const MpegRegisteredCallback &c)
-                                       { return c.stream && c.type == streamType && c.streamId == streamId; }),
-                        callbacks.end());
-        callbacks.push_back(MpegRegisteredCallback{streamType, streamId, callbackFunc, callbackData, handle, true});
+        g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
+            MpegRegisteredCallback{streamType, streamId, callbackFunc, callbackData, handle, true});
         setReturnU32(ctx, 0u);
     }
 
@@ -2132,6 +2233,10 @@ namespace ps2_stubs
                                           existing.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
             if (!keepPendingInput)
                 existing = makeFreshPlaybackState();
+            // libmpeg's sceMpegCreate initialises the sceMpeg, callback table included. God of War registers its
+            // stream callbacks for the first demux before Create and again after it; keeping both delivered every
+            // audio packet twice into its ring (repeated, byte-shifted PCM: the movie sound was noise).
+            g_mpeg_stub_state.callbacksByMpeg.erase(param_1);
         }
 
         const uint32_t puVar4 = uVar3 + 0x108u;
@@ -2165,6 +2270,7 @@ namespace ps2_stubs
             0x48, 0xFC, 0x100, 0x104, 0x70, 0x90, 0xAC};
         for (unsigned off : s_zeroOffsets)
             mpegGuestWrite32(rdram, uVar3 + off, 0u);
+        mpegGuestWrite32(rdram, uVar3 + 0x00, 0u); // isEnd (sceMpegIsEnd reads it)
         mpegGuestWrite64(rdram, uVar3 + 0x78, 0);
         mpegGuestWrite64(rdram, uVar3 + 0x88, 0);
 
@@ -2203,12 +2309,14 @@ namespace ps2_stubs
             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
         }
+        g_pendingAudio.erase(mpegAddr);
         runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_WAIT_DELETE);
         setReturnU32(ctx, 0u);
     }
 
     void sceMpegDemuxPss(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MpegTimer timer{g_mpegDemuxMs};
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
         const uint32_t byteCount = getRegU32(ctx, 6);
@@ -2272,8 +2380,8 @@ namespace ps2_stubs
             });
         }
 
+        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, mpegAddr, callbackEvents);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
-        dispatchStreamCallbacksNow(rdram, ctx, runtime, callbackEvents); // GOW-Port: síncronas, como libmpeg
     }
 
     void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2367,8 +2475,8 @@ namespace ps2_stubs
             });
         }
 
+        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, mpegAddr, callbackEvents);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
-        dispatchStreamCallbacksNow(rdram, ctx, runtime, callbackEvents); // GOW-Port: síncronas, como libmpeg
     }
 
     void sceMpegDispCenterOffX(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2435,14 +2543,9 @@ namespace ps2_stubs
     // GOW-Port: llama a sceMpegCbNodata(mpeg, &cbData{type = Nodata}, data) en el hilo actual y despues vuelve a
     // evaluar sceMpegGetPicture. Si el callback no aporto datos, espera al siguiente VSync antes de reintentar
     // para no acaparar la CPU que necesita el hilo que lee del disco.
-    // GOW-Port: sceMpegGetPicture y sceMpegGetPictureRAW8 comparten la espera del cuadro y su ritmo. Con raw8 el
-    // cuadro no se escribe en la memoria del juego: queda para la conversión de color del IPU (CSC), que el juego
-    // pide después (God of War: RAW8 + CSC a RGB16) y que ps2_memory.cpp resuelve con ps2MpegCsc.
-    static void getPictureImpl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool raw8);
-
     [[noreturn]] static void dispatchNodataCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
                                                     uint32_t mpegAddr, const MpegRegisteredCallback &callback,
-                                                    uint64_t demuxedBefore, bool raw8)
+                                                    uint64_t demuxedBefore)
     {
         EeScheduler &scheduler = runtime->eeScheduler();
         scheduler.bindMainContextForSyscall(*ctx, rdram);
@@ -2463,8 +2566,8 @@ namespace ps2_stubs
         SET_GPR_U32(&invocation.context, 6, callback.data);
         SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
-        invocation.onComplete = [rdram, runtime, mpegAddr, cbDataAddr, demuxedBefore, raw8](const R5900Context &,
-                                                                                            R5900Context &parent)
+        invocation.onComplete = [rdram, runtime, mpegAddr, cbDataAddr, demuxedBefore](const R5900Context &,
+                                                                                      R5900Context &parent)
         {
             if (cbDataAddr != 0u)
             {
@@ -2483,71 +2586,38 @@ namespace ps2_stubs
                 runtime->eeScheduler().waitVSync(
                     runtime->eeScheduler().currentVSyncTick(),
                     -1,
-                    [rdram, runtime, raw8](R5900Context &resumeContext)
+                    [rdram, runtime](R5900Context &resumeContext)
                     {
                         if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
                         {
                             return;
                         }
-                        getPictureImpl(rdram, &resumeContext, runtime, raw8);
+                        sceMpegGetPicture(rdram, &resumeContext, runtime);
                     });
             }
-            getPictureImpl(rdram, &parent, runtime, raw8);
+            sceMpegGetPicture(rdram, &parent, runtime);
         };
         scheduler.invokeCurrent(std::move(invocation));
     }
 
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        getPictureImpl(rdram, ctx, runtime, false);
-    }
-
-    static void getPictureImpl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool raw8)
-    {
+        MpegTimer timer{g_mpegGetMs};
         const uint32_t mpegAddr = getRegU32(ctx, 4);
-        {
-            static const bool diag = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
-            static uint32_t diagCount = 0;
-            if (diag && diagCount++ < 60u)
-            {
-                uint32_t campos[8]{};
-                const uint32_t base = mpegAddr & 0x01FFFFFFu;
-                if (base + 0x60u <= PS2_RAM_SIZE)
-                    std::memcpy(campos, rdram + base + 0x48u, sizeof(campos));
-                std::fprintf(stderr, "[fmv-entrada] mpeg=0x%x a1=0x%x a2=%u ra=0x%x +48..64=%x %x %x %x %x %x %x %x\n", mpegAddr,
-                             getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 31), campos[0], campos[1], campos[2],
-                             campos[3], campos[4], campos[5], campos[6], campos[7]);
-                if (diagCount == 1u && base + 0x100u <= PS2_RAM_SIZE)
-                {
-                    uint32_t punteros[8]{};
-                    std::memcpy(punteros, rdram + base + 0xE8u, sizeof(punteros));
-                    std::fprintf(stderr, "[fmv-entrada] +e8..104=%x %x %x %x %x %x %x %x\n", punteros[0], punteros[1], punteros[2],
-                                 punteros[3], punteros[4], punteros[5], punteros[6], punteros[7]);
-                    for (uint32_t k : {punteros[0], punteros[3], punteros[4]})
-                    {
-                        const uint32_t a = k & 0x01FFFFFFu;
-                        if (a == 0u || a + 64u > PS2_RAM_SIZE)
-                            continue;
-                        std::fprintf(stderr, "[fmv-entrada] 0x%x:", a);
-                        for (uint32_t i = 0; i < 48u; ++i)
-                            std::fprintf(stderr, " %02x", rdram[a + i]);
-                        std::fprintf(stderr, "\n");
-                    }
-                }
-            }
-        }
         const uint32_t imageAddr = getRegU32(ctx, 5);
+        const uint32_t entryMbCount = getRegU32(ctx, 6);
         uint32_t width = kStubMovieWidth;
         uint32_t height = kStubMovieHeight;
         uint32_t frameCount = 0u;
         bool haveFrame = false;
+        bool streamFinished = false;
         MpegDecodedFrame frame;
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
             if (playback.decodedFrames.empty() &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
-                !playback.streamEnded &&
+                !videoEnded(playback) &&
                 !playback.decoderFailed)
             {
                 // GOW-Port: como libmpeg, sin datos se llama primero a sceMpegCbNodata en el hilo que pide la
@@ -2557,7 +2627,7 @@ namespace ps2_stubs
                 {
                     const uint64_t demuxedBefore = playback.demuxedBytes;
                     lock.unlock();
-                    dispatchNodataCallback(rdram, ctx, runtime, mpegAddr, nodata, demuxedBefore, raw8);
+                    dispatchNodataCallback(rdram, ctx, runtime, mpegAddr, nodata, demuxedBefore);
                 }
                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
                 {
@@ -2574,13 +2644,13 @@ namespace ps2_stubs
                     EeWaitReason::Mpeg,
                     kMpegPictureWaitType,
                     mpegAddr,
-                    [rdram, runtime, raw8](R5900Context &resumeContext)
+                    [rdram, runtime](R5900Context &resumeContext)
                     {
                         if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
                         {
                             return;
                         }
-                        getPictureImpl(rdram, &resumeContext, runtime, raw8);
+                        sceMpegGetPicture(rdram, &resumeContext, runtime);
                     });
             }
 
@@ -2606,17 +2676,25 @@ namespace ps2_stubs
                 if (currentTickQ32 < presentationTargetQ32)
                 {
                     const uint64_t eligibleTick = (presentationTargetQ32 + kPictureClockOne - 1u) >> 32u;
+                    // GOW_MPEG_DIAG: a picture held for more than 2 s (its presentation tick is far ahead)
+                    static const bool s_holdDiag = std::getenv("GOW_MPEG_DIAG") != nullptr;
+                    static unsigned s_holds = 0;
+                    if (s_holdDiag && eligibleTick > (currentTickQ32 >> 32u) + 120u && s_holds++ < 20u)
+                        std::fprintf(stderr, "[MPEG:hold] picture %u pts=%lld held until tick %llu (now %llu) firstPts=%lld queued=%zu\n",
+                                     playback.picturesServed, static_cast<long long>(nextFrame.pts90k),
+                                     static_cast<unsigned long long>(eligibleTick), static_cast<unsigned long long>(currentTick),
+                                     static_cast<long long>(playback.firstPresentedPts90k), playback.decodedFrames.size());
                     lock.unlock();
                     runtime->eeScheduler().waitVSync(
                         eligibleTick - 1u,
                         -1,
-                        [rdram, runtime, raw8](R5900Context &resumeContext)
+                        [rdram, runtime](R5900Context &resumeContext)
                         {
                             if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
                             {
                                 return;
                             }
-                            getPictureImpl(rdram, &resumeContext, runtime, raw8);
+                            sceMpegGetPicture(rdram, &resumeContext, runtime);
                         });
                 }
 
@@ -2648,8 +2726,29 @@ namespace ps2_stubs
                 width = playback.width;
                 height = playback.height;
                 frameCount = playback.picturesServed;
+                streamFinished = videoEnded(playback) && playback.decodedFrames.empty();
+                // GOW_MPEG_DIAG: why no picture is handed out (once per second while it lasts)
+                static const bool s_waitDiag = std::getenv("GOW_MPEG_DIAG") != nullptr;
+                static auto s_lastWaitDiag = std::chrono::steady_clock::time_point{};
+                if (s_waitDiag && std::chrono::steady_clock::now() - s_lastWaitDiag > std::chrono::seconds(1))
+                {
+                    s_lastWaitDiag = std::chrono::steady_clock::now();
+                    std::fprintf(stderr, "[MPEG:wait] mpeg=0x%x served=%u ended=%d failed=%d sawInput=%d seqEnd=%d demuxed=%llu pss=%zu cdEof=%d eofPending=%d\n",
+                                 mpegAddr, playback.picturesServed, playback.streamEnded ? 1 : 0, playback.decoderFailed ? 1 : 0,
+                                 playback.sawInput ? 1 : 0, playback.sawSequenceEnd ? 1 : 0,
+                                 static_cast<unsigned long long>(playback.demuxedBytes), playback.pssBuffer.size(),
+                                 g_mpeg_stub_state.currentCdStreamEofSeen ? 1 : 0, g_mpeg_stub_state.cdStreamEofPending ? 1 : 0);
+                }
             }
         }
+
+        // GOW-Port: libmpeg's sceMpegIsEnd (God of War runs the original, 0x26FF70) returns the first word of the
+        // decoder's work area (mp->sys); the decoder sets it when the stream is over. Without it the .m2 player never
+        // leaves its playing state after the last picture.
+        if (streamFinished)
+            if (uint8_t *base = getMemPtr(rdram, mpegAddr))
+                if (uint8_t *sys = getMemPtr(rdram, *reinterpret_cast<uint32_t *>(base + 0x40)))
+                    *reinterpret_cast<uint32_t *>(sys) = 1u;
 
         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
         mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);
@@ -2668,95 +2767,73 @@ namespace ps2_stubs
             }
         }
 
+        // GOW-Port: GOW_MPEG_DIAG=1 traces the first pictures handed to the game (decoder output check).
+        static const bool s_mpegDiag = std::getenv("GOW_MPEG_DIAG") != nullptr;
+        static uint32_t s_mpegDiagCount = 0u;
+        // A/V check: every 30th picture, wall time and the audio device position (ps2_runtime.cpp counters).
+        if (s_mpegDiag && haveFrame && frameCount % 30u == 0u)
         {
-            static const bool diag = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
-            static uint32_t diagCount = 0;
-            const auto diagLeer32 = [](const uint8_t *ram, uint32_t addr)
+            static const auto t0 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr, "[MPEG:sync] frame=%u pts=%llu wall_ms=%.1f audio_played=%llu audio_produced=%llu get_ms=%.1f demux_ms=%.1f\n",
+                         static_cast<unsigned>(frameCount), static_cast<unsigned long long>(frame.pts90k), ms,
+                         static_cast<unsigned long long>(g_gowAudioFramesPlayed.load()),
+                         static_cast<unsigned long long>(g_gowAudioFramesProduced.load()), g_mpegGetMs, g_mpegDemuxMs);
+        }
+        if (s_mpegDiag && s_mpegDiagCount < 400u)
+        {
+            ++s_mpegDiagCount;
+            uint32_t sum = 0u;
+            for (size_t i = 0; i < frame.rgba.size(); i += 4097u)
+                sum += frame.rgba[i];
+            std::cerr << "[MPEG:diag] GetPicture mpeg=0x" << std::hex << mpegAddr << " image=0x" << imageAddr
+                      << " mbcount=0x" << entryMbCount << std::dec << " have=" << haveFrame << " frame=" << frameCount
+                      << " size=" << width << "x" << height << " pts=" << frame.pts90k << " sum=" << sum << std::endl;
+            // the game's movie audio state (USA): sound-stream globals 0x304CEC.. and the movie struct's audio ring
+            const auto word = [rdram](uint32_t a) { return *reinterpret_cast<const uint32_t *>(rdram + (a & 0x1FFFFFFu)); };
+            const uint32_t movie = word(0x304F20u);
+            std::cerr << "[MPEG:diag] audio mode=" << word(0x304D08u) << " iopBuf=0x" << std::hex << word(0x304CECu) << std::dec
+                      << " size=" << word(0x304CF0u) << " started=" << word(0x304CF4u) << " sent=" << word(0x304CF8u)
+                      << " wpos=" << word(0x304CFCu);
+            if (movie != 0u)
+                std::cerr << " ring.mode=" << word(movie + 0x144u) << " ring.size=" << word(movie + 0x100u)
+                          << " ring.rd=" << word(movie + 0x104u) << " ring.fill=" << word(movie + 0x108u)
+                          << " full=" << word(movie + 0x134u);
+            std::cerr << std::endl;
+            if ((s_mpegDiagCount % 50u) == 0u)
             {
-                uint32_t v = 0u;
-                addr &= 0x01FFFFFFu;
-                if (addr + 4u <= PS2_RAM_SIZE)
-                    std::memcpy(&v, ram + addr, 4u);
-                return v;
-            };
-            if (diag && diagCount++ < 400u)
+                std::cerr << "[MPEG:diag] audio packets queued=" << g_audioQueued << " taken=" << g_audioTaken
+                          << " refused=" << g_audioRefused << std::endl;
+            }
+            if (movie != 0u && s_mpegDiagCount == 40u) // the audio stream header the callback kept (+0x10C, 0x28 bytes)
             {
-                const uint32_t pelicula = diagLeer32(rdram, 0x304F20u);
-                std::fprintf(stderr, "[fmv-cuadro] raw8=%d mpeg=0x%x imagen=0x%x hay=%d %ux%u n=%u modo140=%u modo14c=0x%x "
-                             "obj=0x%x 58=%u 5c=%u img=0x%x,0x%x,0x%x,0x%x raw=0x%x,0x%x\n",
-                             raw8 ? 1 : 0, mpegAddr, imageAddr, haveFrame ? 1 : 0, width, height, frameCount,
-                             pelicula ? diagLeer32(rdram, pelicula + 0x140u) : 0u,
-                             pelicula ? diagLeer32(rdram, pelicula + 0x14Cu) : 0u, pelicula,
-                             diagLeer32(rdram, pelicula + 0x58u), diagLeer32(rdram, pelicula + 0x5Cu),
-                             diagLeer32(rdram, pelicula + 0x94u), diagLeer32(rdram, pelicula + 0x98u),
-                             diagLeer32(rdram, pelicula + 0x9Cu), diagLeer32(rdram, pelicula + 0xA0u),
-                             diagLeer32(rdram, pelicula + 0x9Cu), diagLeer32(rdram, pelicula + 0xA0u));
+                std::cerr << "[MPEG:diag] audio header";
+                for (uint32_t i = 0; i < 0x28u; i += 4u)
+                    std::cerr << ' ' << std::hex << word(movie + 0x10Cu + i) << std::dec;
+                std::cerr << std::endl;
             }
         }
-        if (raw8)
+        // GOW_MPEG_PICDUMP=<n>: write decoded picture n of each movie to mpeg_pic_<n>.ppm (decoder output check)
+        static const long s_picDump = std::getenv("GOW_MPEG_PICDUMP") ? std::atol(std::getenv("GOW_MPEG_PICDUMP")) : -1L;
+        if (haveFrame && static_cast<long>(frameCount) == s_picDump && frame.rgba.size() >= static_cast<size_t>(width) * height * 4u)
         {
-            // El CSC posterior usa este cuadro (o uno negro si aún no hay ninguno).
-            std::lock_guard<std::mutex> lock(g_mpegCsc.mutex);
-            if (haveFrame)
+            char name[48];
+            std::snprintf(name, sizeof(name), "mpeg_pic_%ld.ppm", s_picDump);
+            if (FILE *f = std::fopen(name, "wb"))
             {
-                publicarCuadroPantalla(frame);
-                g_mpegCsc.frame = std::move(frame);
+                std::fprintf(f, "P6 %u %u 255 ", static_cast<unsigned>(width), static_cast<unsigned>(height));
+                for (size_t i = 0; i < static_cast<size_t>(width) * height * 4u; i += 4u)
+                    std::fwrite(&frame.rgba[i], 1, 3, f);
+                std::fclose(f);
             }
-            else if (frameCount == 0u)
-            {
-                g_mpegCsc.frame = MpegDecodedFrame{};
-                g_mpegCsc.frame.width = static_cast<int>(width);
-                g_mpegCsc.frame.height = static_cast<int>(height);
-                g_mpegCsc.frame.rgba.assign(static_cast<size_t>(width) * height * 4u, 0u);
-            }
-            g_mpegCsc.nextMacroblock = 0u;
-            ++g_mpegCsc.serial;
         }
-        else if (haveFrame)
+        if (haveFrame)
         {
-            {
-                // GOW-Port: GOW_FMV_DIAG=1: hora de cada cuadro servido (sincronía con el sonido, que registra spu2.cpp).
-                static const bool diagAv = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
-                if (diagAv && (frameCount < 3u || frameCount % 150u == 0u))
-                    std::fprintf(stderr, "[fmv-av] cuadro=%u pts=%lld t_ms=%lld\n", frameCount, static_cast<long long>(frame.pts90k),
-                                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                            std::chrono::steady_clock::now().time_since_epoch())
-                                                            .count()));
-            }
-            writeDecodedFrameToGuest(rdram, imageAddr, frame);
-            publicarCuadroPantalla(frame);
-            // GOW-Port: GOW_FMV_DIAG=1: el cuadro 60 en fmv_cuadro.ppm (FFmpeg) y fmv_guest.ppm (memoria del juego leída
-            // por columnas de 16 píxeles, como la escribe writeDecodedFrameToGuest).
-            static const bool volcar = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
-            if (volcar && frameCount == 60u && frame.width > 0 && frame.height > 0)
-            {
-                const uint32_t w = static_cast<uint32_t>(frame.width), h = static_cast<uint32_t>(frame.height);
-                if (std::FILE *f = std::fopen("fmv_cuadro.ppm", "wb"))
-                {
-                    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
-                    for (uint32_t i = 0; i < w * h; ++i)
-                        std::fwrite(frame.rgba.data() + i * 4u, 1, 3, f);
-                    std::fclose(f);
-                }
-                if (std::FILE *f = std::fopen("fmv_guest.ppm", "wb"))
-                {
-                    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
-                    const uint32_t oh = align16(h);
-                    for (uint32_t y = 0; y < h; ++y)
-                        for (uint32_t x = 0; x < w; ++x)
-                        {
-                            const uint32_t off = (x / 16u) * oh * 64u + y * 64u + (x % 16u) * 4u;
-                            const uint8_t *px = getMemPtr(rdram, imageAddr + off);
-                            const uint8_t zero[3] = {0, 0, 0};
-                            std::fwrite(px ? px : zero, 1, 3, f);
-                        }
-                    std::fclose(f);
-                }
-            }
+            writeDecodedFrameToGuest(rdram, imageAddr, frame, static_cast<size_t>(entryMbCount) * 1024u);
         }
         else if (frameCount == 0u)
         {
-            writeBlankMpegFrame(rdram, imageAddr, width, height);
+            writeBlankMpegFrame(rdram, imageAddr, width, height, static_cast<size_t>(entryMbCount) * 1024u);
         }
 
         setReturnS32(ctx, 0);
@@ -2764,7 +2841,7 @@ namespace ps2_stubs
 
     void sceMpegGetPictureRAW8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        getPictureImpl(rdram, ctx, runtime, true);
+        TODO_NAMED("sceMpegGetPictureRAW8", rdram, ctx, runtime);
     }
 
     void sceMpegGetPictureRAW8xy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2802,12 +2879,9 @@ namespace ps2_stubs
         // Only the producer/demux EOF is authoritative. A sequence_end_code can
         // be observed while more PSS data is still buffered, and a decoder
         // failure before producer EOF may still recover on a later sequence.
-        // GOW-Port: el fin de programa del PSS también es definitivo. God of War lee el PSS con su propio lector
-        // y llama a sceMpegDemuxPss, sin sceCdSt*, así que el productor nunca marca EOF y el vídeo no terminaba.
         const bool producerEnded =
-            playback.programEndSeen ||
-            (g_mpeg_stub_state.currentCdStreamEofSeen &&
-             playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration);
+            g_mpeg_stub_state.currentCdStreamEofSeen &&
+            playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
         const bool ended = producerEnded &&
                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
         const uint64_t presentationEnd = playback.presentationEndTickQ32;
@@ -2917,96 +2991,4 @@ namespace ps2_stubs
         getPlaybackState(mpegAddr).imageBufferAddr = imageBufferAddr;
         setReturnS32(ctx, 0);
     }
-}
-
-// GOW-Port: CSC del IPU (comando 7) con el cuadro de sceMpegGetPictureRAW8. God of War pide RAW8 (YCbCr por
-// macrobloque) y lo convierte con el IPU (DMA a IPU, CSC a RGB16 con tramado, DMA desde IPU). El runtime no emula el
-// IPU: el cuadro ya está decodificado en RGBA (FFmpeg), así que aquí se escriben directamente los macrobloques de
-// salida: 16x16 píxeles en orden de líneas, RGB16 (5:5:5, bit 15 = alfa) o RGB32 (alfa 0x80), en el mismo orden de
-// macrobloques que sceMpegGetPicture (columnas: de arriba abajo y de izquierda a derecha; GOW_FMV_ORDEN=filas para
-// probar el otro). Sin tramado. Devuelve false si no hay cuadro (no se ha llamado a RAW8).
-bool ps2MpegCsc(uint8_t *rdram, uint32_t destAddr, uint32_t maxBytes, uint32_t macroblocks, bool rgb16)
-{
-    using namespace ps2_stubs;
-    std::lock_guard<std::mutex> lock(g_mpegCsc.mutex);
-    if (g_mpegCsc.serial == 0u || !rdram)
-        return false;
-    static const bool porFilas = []
-    {
-        const char *v = std::getenv("GOW_FMV_ORDEN");
-        return v && std::strcmp(v, "filas") == 0;
-    }();
-    const MpegDecodedFrame &frame = g_mpegCsc.frame;
-    static const bool diag = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
-    static uint32_t diagCount = 0;
-    if (diag && diagCount++ < 200u)
-        std::fprintf(stderr, "[fmv-csc] destino=0x%x bytes=%u mb=%u rgb16=%d cuadro=%dx%d serie=%llu siguiente=%u\n", destAddr,
-                     maxBytes, macroblocks, rgb16 ? 1 : 0, frame.width, frame.height,
-                     static_cast<unsigned long long>(g_mpegCsc.serial), g_mpegCsc.nextMacroblock);
-    const uint32_t width = static_cast<uint32_t>(std::max(frame.width, 0));
-    const uint32_t height = static_cast<uint32_t>(std::max(frame.height, 0));
-    const uint32_t mbw = std::max(1u, (width + 15u) / 16u);
-    const uint32_t mbh = std::max(1u, (height + 15u) / 16u);
-    const uint32_t mbBytes = rgb16 ? 512u : 1024u;
-    const bool hayPixeles = frame.rgba.size() >= static_cast<size_t>(width) * height * 4u;
-    for (uint32_t n = 0; n < macroblocks && (n + 1u) * mbBytes <= maxBytes; ++n)
-    {
-        const uint32_t index = g_mpegCsc.nextMacroblock++;
-        const uint32_t mbx = porFilas ? index % mbw : index / mbh;
-        const uint32_t mby = porFilas ? index / mbw : index % mbh;
-        const uint32_t dst = destAddr + n * mbBytes;
-        if (dst + mbBytes > PS2_RAM_SIZE)
-            break;
-        uint8_t *out = rdram + dst;
-        for (uint32_t y = 0; y < 16u; ++y)
-            for (uint32_t x = 0; x < 16u; ++x)
-            {
-                const uint32_t px = mbx * 16u + x, py = mby * 16u + y;
-                uint8_t r = 0, g = 0, b = 0;
-                if (hayPixeles && px < width && py < height)
-                {
-                    const uint8_t *src = frame.rgba.data() + (static_cast<size_t>(py) * width + px) * 4u;
-                    r = src[0];
-                    g = src[1];
-                    b = src[2];
-                }
-                if (rgb16)
-                {
-                    const uint16_t v = static_cast<uint16_t>((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | 0x8000u);
-                    std::memcpy(out + (y * 16u + x) * 2u, &v, 2u);
-                }
-                else
-                {
-                    uint8_t *o = out + (y * 16u + x) * 4u;
-                    o[0] = r;
-                    o[1] = g;
-                    o[2] = b;
-                    o[3] = 0x80u;
-                }
-            }
-    }
-    return true;
-}
-
-// GOW-Port: copia el último cuadro de vídeo servido si es posterior a `serial` (y actualiza `serial`). Devuelve false si
-// no hay uno nuevo. Para la ventana (ps2_runtime.cpp), en el hilo principal.
-bool ps2MpegCuadroPantalla(std::vector<uint8_t> &rgba, int &width, int &height, uint64_t &serial)
-{
-    using namespace ps2_stubs;
-    std::lock_guard<std::mutex> lock(g_mpegPantalla.mutex);
-    if (g_mpegPantalla.serial == serial || g_mpegPantalla.rgba.empty())
-        return false;
-    rgba = g_mpegPantalla.rgba;
-    width = g_mpegPantalla.width;
-    height = g_mpegPantalla.height;
-    serial = g_mpegPantalla.serial;
-    return true;
-}
-
-// GOW-Port: número del último cuadro publicado (0 = ninguno), para no mostrar el final de un vídeo anterior.
-uint64_t ps2MpegSerieCuadroPantalla()
-{
-    using namespace ps2_stubs;
-    std::lock_guard<std::mutex> lock(g_mpegPantalla.mutex);
-    return g_mpegPantalla.serial;
 }

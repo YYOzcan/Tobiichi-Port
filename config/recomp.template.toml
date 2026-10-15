@@ -55,7 +55,7 @@ stubs = [
   # resultado en $v0) y los handlers del runtime usan $f12/$f0 en float: sin devolvía el ángulo
   # y la tabla de senos de 0x52C600 (animaciones de esqueletos y cámara) salía con sin(x) = x.
   "memcmp@0x00289200",
-  "rand@0x0028C0C8",
+  # "rand@0x0028C0C8", # GOW-Port (Waffle): corre el rand del propio juego (31 bits), el stub daba 15
   "strrchr@0x0028D3B8",
   "write@0x002941E8",
   "read@0x00294268",

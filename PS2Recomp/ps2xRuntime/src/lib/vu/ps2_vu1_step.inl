@@ -8,9 +8,6 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
-#if defined(_MSC_VER) || defined(__SSE4_1__)
-#include <immintrin.h>
-#endif
 
 // GOW-Port: la aritmética de VU no depende de /fp:fast. El runtime se compila con /fp:fast, que deja al
 // compilador fusionar a*b+c en FMA según dónde esté el código: el intérprete y el microcódigo compilado
@@ -27,85 +24,9 @@
 #define VU1_STEP_INLINE inline __attribute__((always_inline))
 #endif
 
-// GOW-Port: modo rápido de VU1 (PS2X_VU1_RAPIDO, ver ps2_vu1_compiled.inl): MAC perezoso. Las FMAC compiladas no
-// encolan sus flags en m_flagPipeline (40 bytes por entrada y confirmación en orden): guardan el MAC (Z y S) y el
-// ciclo en que se ve en esta cola. Quien lee el MAC (FMEQ, FMAND, FMOR) toma la entrada más nueva ya visible, si es
-// posterior al último MAC confirmado desde m_flagPipeline (otras FMAC: intérprete, ruta escalar). Como una FMAC
-// emite como mucho una por ciclo y el MAC se ve 4 ciclos después, entre las 8 últimas siempre hay una visible.
-// Un solo VU1: el estado es global (solo lo toca el hilo que ejecuta VU1).
-#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
-struct Vu1MacRapido
-{
-    static constexpr uint32_t kN = 8u;
-    uint64_t listo[kN] = {};
-    uint32_t mac[kN] = {};
-    uint32_t n = 0u;                // escrituras hechas (la última está en (n - 1) % kN)
-    uint64_t listoPrincipal = 0u;   // ciclo "listo" del último MAC confirmado desde m_flagPipeline
-};
-extern Vu1MacRapido g_vu1MacRapido;
-
-VU1_STEP_INLINE void vu1RapidoResolverMacT(uint32_t &mac, uint64_t ciclo)
-{
-    const Vu1MacRapido &cola = g_vu1MacRapido;
-    const uint32_t hay = cola.n < Vu1MacRapido::kN ? cola.n : Vu1MacRapido::kN;
-    for (uint32_t k = 0; k < hay; ++k)
-    {
-        const uint32_t i = (cola.n - 1u - k) & (Vu1MacRapido::kN - 1u);
-        if (cola.listo[i] <= ciclo)
-        {
-            if (cola.listo[i] > cola.listoPrincipal)
-                mac = cola.mac[i];
-            return;
-        }
-    }
-}
-#endif
-
 static constexpr uint8_t vu1StepLane(uint32_t component)
 {
     return static_cast<uint8_t>(1u << (3u - component));
-}
-
-// GOW-Port: escrituras de registros VF/ACC con un único store de 16 bytes. Si un registro se escribe con
-// varios stores de 4 bytes y el par siguiente lo lee con un load de 16 bytes (lo normal en las FMAC con SSE),
-// el reenvío store->load falla y el load espera a que los stores lleguen a la caché. Los carriles se mezclan
-// bit a bit (sin operaciones de coma flotante): el resultado es idéntico.
-VU1_STEP_INLINE void vu1StoreVf0(float *vf0)
-{
-#if defined(_MSC_VER) || defined(__SSE4_1__)
-    _mm_storeu_ps(vf0, _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f));
-#else
-    vf0[0] = 0.0f;
-    vf0[1] = 0.0f;
-    vf0[2] = 0.0f;
-    vf0[3] = 1.0f;
-#endif
-}
-
-// dest: máscara de VU (bit 3 = x ... bit 0 = w).
-VU1_STEP_INLINE void vu1StoreLanes(float *dst, const float *src, uint32_t dest)
-{
-#if defined(_MSC_VER) || defined(__SSE4_1__)
-    alignas(16) static constexpr int32_t kMasks[16][4] = {
-        {0, 0, 0, 0}, {0, 0, 0, -1}, {0, 0, -1, 0}, {0, 0, -1, -1},
-        {0, -1, 0, 0}, {0, -1, 0, -1}, {0, -1, -1, 0}, {0, -1, -1, -1},
-        {-1, 0, 0, 0}, {-1, 0, 0, -1}, {-1, 0, -1, 0}, {-1, 0, -1, -1},
-        {-1, -1, 0, 0}, {-1, -1, 0, -1}, {-1, -1, -1, 0}, {-1, -1, -1, -1}};
-    dest &= 0xFu;
-    if (dest == 0u)
-        return;
-    const __m128 mask = _mm_load_ps(reinterpret_cast<const float *>(kMasks[dest]));
-    _mm_storeu_ps(dst, _mm_blendv_ps(_mm_loadu_ps(dst), _mm_loadu_ps(src), mask));
-#else
-    if (dest & 0x8u)
-        dst[0] = src[0];
-    if (dest & 0x4u)
-        dst[1] = src[1];
-    if (dest & 0x2u)
-        dst[2] = src[2];
-    if (dest & 0x1u)
-        dst[3] = src[3];
-#endif
 }
 
 VU1_STEP_INLINE uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
@@ -190,8 +111,6 @@ VU1_STEP_INLINE void VU1Interpreter::markPairWrites(const DecodedInstructionPair
 
 VU1_STEP_INLINE bool VU1Interpreter::stepPair(const DecodedInstructionPair &decoded, StepContext &context)
 {
-    if (m_xgkick.active)
-        xgkickAdvanceTo(m_cycle); // GOW-Port: PATH1 al día tras código compilado (por eventos)
     uint64_t readyCycle = calculatePairReadyCycle(decoded);
     while (readyCycle > m_cycle)
     {
@@ -323,9 +242,10 @@ VU1_STEP_INLINE bool VU1Interpreter::stepPair(const DecodedInstructionPair &deco
     if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
         recordViWriteForBranch(writtenVi, oldVi);
 
-    // GOW-Port: VF0 con un solo store de 16 bytes: la lectura de 16 bytes de VF0 en el par siguiente
-    // (vf00w = 1.0 es muy frecuente) no puede reenviarse desde cuatro stores de 4 bytes.
-    vu1StoreVf0(m_state.vf[0]);
+    m_state.vf[0][0] = 0.0f;
+    m_state.vf[0][1] = 0.0f;
+    m_state.vf[0][2] = 0.0f;
+    m_state.vf[0][3] = 1.0f;
     m_state.vi[0] = 0;
 
     uint32_t nextPc = m_state.pc + 8u;

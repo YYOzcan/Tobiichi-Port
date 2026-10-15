@@ -63,12 +63,8 @@ namespace ps2_stubs
                         q[10] = (2ULL << 58) | (kClutQwc & 0x7FFF) | (1ULL << 15);
                         q[11] = 0ULL;
                         std::memcpy(pkt + 12u * 8u, clutData, 64u);
-                        constexpr uint32_t GIF_CHANNEL = 0x1000A000;
-                        constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
-                        runtime->memory().writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-                        runtime->memory().writeIORegister(GIF_CHANNEL + 0x20u, kTotalQwc & 0xFFFFu);
-                        runtime->memory().writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
-                        runtime->memory().processPendingTransfers();
+                        runtime->memory().sendDma(PS2Memory::DmaPath::Gif, pktAddr, kTotalQwc);
+                        ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 2u);
                     }
                 }
             }
@@ -209,11 +205,8 @@ namespace ps2_stubs
                     q[11] = 0ULL;
                     std::memcpy(pkt + 12 * 8, imgSrc, imageBytes);
 
-                    constexpr uint32_t GIF_CHANNEL = 0x1000A000;
-                    constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
-                    runtime->memory().writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-                    runtime->memory().writeIORegister(GIF_CHANNEL + 0x20u, totalQwc & 0xFFFFu);
-                    runtime->memory().writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+                    runtime->memory().sendDma(PS2Memory::DmaPath::Gif, pktAddr, totalQwc);
+                    ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 2u);
                 }
             }
         }

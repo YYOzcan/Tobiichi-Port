@@ -11,6 +11,8 @@
 #include "runtime/gs/gs_backend.h"
 #include "runtime/gs/ps2_gif_arbiter.h" // GOW-Port: conservar el origen de cada flujo GIF.
 
+namespace GSSharedPresent { struct Frame; }
+
 struct GSDebugSnapshot
 {
     GSContext ctx[2]{};
@@ -133,6 +135,9 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    // GOW-Port: el host registra la textura adquirida, nunca el request posterior.
+    bool usesSharedPresentation() const;
+    void recordAcquiredSharedFrame(const GSSharedPresent::Frame &frame);
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -163,13 +168,13 @@ private:
                                    uint32_t sizeBytes);
     void vertexKick(bool drawing);
 
-    void recordDebugEventUnlocked(GSDebugHistoryEntry entry);
+    void recordDebugEventUnlocked(GSDebugHistoryEntry entry, uint64_t tickOverride = UINT64_MAX);
     GSDebugHistoryEntry makeDebugEventUnlocked(GSDebugEventKind kind) const;
     void recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint8_t flg, uint32_t nreg);
     void recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value);
     void recordDrawDebugEventUnlocked(int vertexCount);
     void recordTransferDebugEventUnlocked();
-    void recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp, uint32_t width, uint32_t height, bool usedPreferred);
+    void recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp, uint32_t width, uint32_t height, bool usedPreferred, uint64_t tickOverride = UINT64_MAX);
 
     void processImageData(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -206,6 +211,7 @@ private:
 
     uint8_t m_curR = 0x80, m_curG = 0x80, m_curB = 0x80, m_curA = 0x80;
     float m_curQ = 1.0f;
+    float m_packedStQ = 1.0f; // Q of the last PACKED ST write: becomes RGBAQ.Q only at the next PACKED RGBAQ write (GS rule)
     float m_curS = 0.0f, m_curT = 0.0f;
     uint16_t m_curU = 0, m_curV = 0;
     uint8_t m_curFog = 0;
@@ -244,6 +250,14 @@ private:
     uint32_t m_hostPresentationSourceFbp = 0;
     bool m_hostPresentationUsedPreferred = false;
     bool m_hasHostPresentationFrame = false;
+    // GOW-Port: la captura explicita conserva el CRTC del ultimo latch; GL sigue en el worker.
+    GSPresentationRequest m_hostPresentationRequest{};
+    bool m_hasHostPresentationRequest = false;
+    bool m_hostPresentationRequestIsShared = false;
+    uint64_t m_hostPresentationGeneration = 0u;
+    uint64_t m_hostSharedSequence = 0u;
+    mutable PresentationFrame m_hostDiagnosticFrame;
+    mutable uint64_t m_hostDiagnosticGeneration = UINT64_MAX;
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
 

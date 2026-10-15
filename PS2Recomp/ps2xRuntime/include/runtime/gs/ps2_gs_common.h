@@ -44,6 +44,15 @@ static inline uint32_t framePageBaseToBlock(uint32_t fbp)
     return fbp << 5u;
 }
 
+// GOW-Port: FBMSK is written in 32-bit RGBA8888 layout; for 16-bit frame PSMs the GS uses its 5551
+// compression (PCSX2 GSRendererSW.cpp, fpsm == 2), e.g. 0x00003FFF -> 0x00FF, 0xFFFF00FF -> 0xFC1F.
+static inline uint32_t frameMask16(uint32_t fbmsk)
+{
+    const uint32_t rb = fbmsk & 0x00F800F8u;
+    const uint32_t ga = fbmsk & 0x8000F800u;
+    return ((ga >> 16) | (rb >> 9) | (ga >> 6) | (rb >> 3)) & 0xFFFFu;
+}
+
 static inline int clampInt(int v, int lo, int hi)
 {
     if (v < lo) return lo;

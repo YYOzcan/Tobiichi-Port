@@ -1,0 +1,217 @@
+# Status map data (docs/status-map/map.svg and detail.md). After editing, regenerate with:
+#   python tools/status_map.py
+# (the GitHub action "Status map" also does it on every push to main).
+#
+# state: "ok"      = works, native, verified
+#        "partial" = works, but part of it is still a hardware model, unverified or slow
+#        "pending" = not done (missing, skipped or still emulated)
+
+# ---------------------------------------------------------------------------------------------------------
+# Panel 1: the static Sony SDK libraries linked into SCUS_973.99. Each recompiled function is one cell.
+# `functions` = number of functions of the library in the recompiled output (port/output-usa, address range
+# 0x0026F228-0x0029BBA4, library start addresses as in KIexster's god-of-war-recomp status data); entries with
+# the same name are drawn as one library.
+# ---------------------------------------------------------------------------------------------------------
+[[library]]
+name = "libmpeg"
+functions = 103
+state = "ok"
+note = "Movies play at real speed with sound (native libmpeg2 decoder, native sound engine); audio trails picture ~0.1 s, constant"
+
+[[library]]
+name = "libipu"
+functions = 5
+state = "ok"
+note = "Served by the native decoder"
+
+[[library]]
+name = "libgraph"
+functions = 7
+state = "ok"
+note = "Display setup is a native override (GS display state, no GS register access)"
+
+[[library]]
+name = "libdma"
+functions = 8
+state = "ok"
+note = "sceDmaSend feeds VIF/GIF directly; no DMA controller model"
+
+[[library]]
+name = "libcdvd"
+functions = 10
+state = "ok"
+note = "CD reads served from the extracted game files (disc-usa/); the ISO only with GOW_ISO"
+
+[[library]]
+name = "libdbc"
+functions = 11
+state = "ok"
+note = "dbcman RPC answered by native pad services"
+
+[[library]]
+name = "libpad2"
+functions = 13
+state = "ok"
+note = "Native pad read on the EE (keyboard / gamepad)"
+
+[[library]]
+name = "libvib"
+functions = 2
+state = "ok"
+note = "DualShock 2 actuators -> host gamepad rumble (Windows: XInput pads, DualShock 4 / DualSense over USB through HID, Bluetooth opt-in; raylib elsewhere); verified by the user on a real DualShock 4 over USB (2026-10-13)"
+
+[[library]]
+name = "libmc2"
+functions = 90
+state = "ok"
+note = "Native memory-card service; load and save verified (savetest)"
+
+[[library]]
+name = "libscf"
+functions = 14
+state = "ok"
+
+[[library]]
+name = "libgcc"
+functions = 32
+state = "ok"
+
+[[library]]
+name = "C++ EH"
+functions = 34
+state = "ok"
+
+[[library]]
+name = "libm"
+functions = 14
+state = "ok"
+
+[[library]]
+name = "libc"
+functions = 150
+state = "ok"
+
+[[library]]
+name = "libkernel"
+functions = 101
+state = "ok"
+note = "Runs natively; DelayThread on the scheduler, no timer register access"
+
+[[library]]
+name = "sif"
+functions = 24
+state = "ok"
+note = "RPC as direct native calls"
+
+[[library]]
+name = "fileio"
+functions = 15
+state = "ok"
+
+[[library]]
+name = "loadfile"
+functions = 14
+state = "ok"
+
+# ---------------------------------------------------------------------------------------------------------
+# Panel 2: PS2 hardware. Each component is a box of size `weight`; `short` is drawn, `name` is the tooltip and
+# the detail table entry.
+# ---------------------------------------------------------------------------------------------------------
+[[hardware]]
+group = "EE"
+  [[hardware.item]]
+  short = "R5900"
+  name = "R5900 CPU: game code statically recompiled to C++ (6.4k functions)"
+  state = "ok"
+  weight = 5
+  [[hardware.item]]
+  short = "Kernel"
+  name = "Kernel: threads, semaphores, alarms, syscalls (native HLE)"
+  state = "ok"
+  weight = 3
+  [[hardware.item]]
+  short = "FPU/MMI"
+  name = "FPU (COP1) and MMI instructions"
+  state = "ok"
+  weight = 2
+  [[hardware.item]]
+  short = "INTC"
+  name = "INTC: not accessed by game code in gameplay"
+  state = "ok"
+  weight = 2
+  [[hardware.item]]
+  short = "DMAC"
+  name = "DMA controller: no model, packets go straight to VIF/GIF"
+  state = "ok"
+  weight = 2
+  [[hardware.item]]
+  short = "Timers"
+  name = "Timers: native EE clock (game code calls it, counts computed from guest cycles); T2 users (DelayThread) on the scheduler"
+  state = "ok"
+  weight = 1
+
+[[hardware]]
+group = "GS / VU"
+  [[hardware.item]]
+  short = "GS"
+  name = "GS: native OpenGL render-target renderer, 2x internal, 16:9; display registers native"
+  state = "ok"
+  weight = 3
+  [[hardware.item]]
+  short = "VIF1/VU1"
+  name = "VIF1 decoded directly; VU1 microprograms compiled ahead of time to C++"
+  state = "ok"
+  weight = 3
+  [[hardware.item]]
+  short = "Tex/CLUT"
+  name = "Textures and CLUT: native texture store; palettes from render targets read on the GPU"
+  state = "ok"
+  weight = 2
+  [[hardware.item]]
+  short = "GIF"
+  name = "GIF (PATH1-3): the game's GIF tags fed to the renderer"
+  state = "ok"
+  weight = 2
+  [[hardware.item]]
+  short = "IPU"
+  name = "IPU: replaced by the native MPEG-2 decoder (libmpeg2); movies play at real speed with sound"
+  state = "ok"
+  weight = 2
+
+[[hardware]]
+group = "IOP"
+  [[hardware.item]]
+  short = "R3000A"
+  name = "R3000A CPU: no interpreter on the hot path"
+  state = "ok"
+  weight = 3
+  [[hardware.item]]
+  short = "SPU2"
+  name = "SPU2: native sound engine driven by LIBSD's exports"
+  state = "ok"
+  weight = 3
+  [[hardware.item]]
+  short = "IRX"
+  name = "The game's 8 IRX modules compiled ahead of time to C++"
+  state = "ok"
+  weight = 2
+  [[hardware.item]]
+  short = "SIF"
+  name = "SIF: RPC and DMA as direct native calls"
+  state = "ok"
+  weight = 2
+  [[hardware.item]]
+  short = "CDVD"
+  name = "CDVD: the game's reads served from the extracted files (no drive model)"
+  state = "ok"
+  weight = 2
+  [[hardware.item]]
+  short = "Pad"
+  name = "Pad: native service (SIO2 chip model deleted)"
+  state = "ok"
+  weight = 2
+  [[hardware.item]]
+  short = "MC"
+  name = "Memory card: native service, load/save verified"
+  state = "ok"
+  weight = 2

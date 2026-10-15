@@ -28,6 +28,7 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/gs/gs_frontend.h"
+class GSHostPresentation; // GOW-Port: el header público no depende de raylib.
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
@@ -489,6 +490,7 @@ private:
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
     void advanceIopEeCycles(uint64_t eeCycles) noexcept;
     void resetIop();
+    void shutdownHostGraphics(); // GOW-Port: destruir GS antes de cerrar el contexto raylib.
 
     friend class PS2IopTransport;
     friend class EeScheduler;
@@ -497,6 +499,8 @@ private:
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
     GS m_gs;
+    std::unique_ptr<GSHostPresentation> m_hostPresentation;
+    bool m_hostWindowOwned = false;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     PS2AudioBackend m_audioBackend;

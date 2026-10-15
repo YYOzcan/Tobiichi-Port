@@ -5,10 +5,11 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <vector>
 #include <cstdint>
 
 // GOW-Port: las funciones en línea de VU1 usan el mismo modo de coma flotante que ps2_vu1_*.cpp (sin
-// contracción en FMA).
+// /fp:fast); MSVC no las expande en línea si los modos no coinciden.
 #if defined(_MSC_VER)
 #pragma float_control(precise, on, push)
 #pragma fp_contract(off)
@@ -82,9 +83,6 @@ public:
     // presupuesto sí; por eso las pruebas del modelo de latencias lo dejan desactivado.
     void setDirectRegisterWrites(bool enabled);
 
-    // GOW-Port: última ejecución detenida por presupuesto, sin E ni D/T.
-    bool lastRunHitBudget() const { return m_lastRunHitBudget; }
-
     // GOW-Port: microcódigo de VU1 compilado a C++ (tools/vu1/generar_vu1.cpp). El código generado
     // comprueba en cada par que las dos palabras de la micromemoria son las que compiló; si no, interpreta
     // ese par. Ejecuta los mismos pasos que el intérprete (stepPair), con cada par ya decodificado.
@@ -104,6 +102,9 @@ public:
     static uint64_t hashMicrocode(const uint8_t *code, uint32_t size);
     void setCompiledProgramsEnabled(bool enabled) { m_compiledEnabled = enabled; }
 
+    // GOW-Port: última ejecución detenida por presupuesto, sin E ni D/T.
+    bool lastRunHitBudget() const { return m_lastRunHitBudget; }
+
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
 
@@ -112,6 +113,7 @@ private:
     friend struct VU1CompiledProgram;
     friend struct VU1CompiledGenerator;
     friend struct VU1CompiledAccess;
+    friend struct VU1NativeAccess; // GOW-Port: native (ahead-of-time translated) blocks, see ps2_vu1_native.h
 
     enum Pipeline : uint8_t
     {
@@ -263,8 +265,6 @@ private:
     Unit m_unit;
     VU1State m_state;
     std::array<DecodedInstructionPair, kMaxDecodedPairs> m_decodedCodeCache{};
-    // GOW-Port: un bit por par de m_decodedCodeCache; cada par se decodifica la primera vez que se pide.
-    std::array<uint64_t, kMaxDecodedPairs / 64u> m_decodedValid{};
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
@@ -285,7 +285,19 @@ private:
     // GOW-Port: además, nadie escribe el estado con FSSET; el código compilado puede omitir los flags de
     // una FMAC que nadie llega a ver (solo acumula sus bits pegajosos).
     bool m_statusQuiet = false;
-    bool m_lastRunHitBudget = false; // GOW-Port: PR #12
+    // GOW-Port: GOW_VU1C_VERIFICAR=1 ejecuta cada bloque compilado tambien con el interprete y compara (diagnostico).
+    uint32_t m_verifyLeft = 0;
+    uint32_t m_verifyHead = 0;
+    uint32_t m_verifyPairs = 0;
+    uint64_t m_verifyCycle = 0;
+    bool m_verifySilent = false; // la pasada del interprete no envia paquetes XGKICK al GIF
+    uint32_t m_verifyKickBytes = 0;
+    bool m_verifyKickActive = false;
+    std::vector<uint8_t> m_verifyKick;
+    VU1State m_verifyExpected{};
+    std::vector<uint8_t> m_verifyData;
+    void verifyBlockStart(StepContext &context, uint32_t pc, const uint32_t *words, size_t bytes);
+    void verifyBlockEnd(StepContext &context);
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
@@ -294,16 +306,13 @@ private:
     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
+    // GOW-Port: bits de las entradas válidas de cada cola; commitReadyPipelines solo recorre esas
+    // entradas (antes recorría las 48 en cada ciclo, ~30 % del tiempo de VU1).
     uint32_t m_storePending = 0u, m_vfPending = 0u, m_viPending = 0u, m_accPending = 0u;
     // GOW-Port: los flags (MAC/estado/clip) tienen todos la misma latencia, así que se confirman en el orden
     // en que se emiten: una cola circular (cabeza y número de entradas) en lugar de buscar huecos.
     uint32_t m_flagHead = 0u, m_flagCount = 0u;
     XgkickPipeline m_xgkick{};
-    // GOW-Port: PATH1 avanza por eventos. m_xgkickCycle es el ciclo hasta el que se ha contado el crédito de
-    // PATH1; m_xgkickEvent, el próximo ciclo en que PATH1 lee una GIFtag o termina el paquete (~0 si no hay
-    // envío). Entre eventos solo copia carga útil, que se puede aplazar mientras la VU no escriba en su memoria.
-    uint64_t m_xgkickCycle = 0;
-    uint64_t m_xgkickEvent = ~0ull;
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
     std::array<uint64_t, 4> m_accReady{};
@@ -326,6 +335,15 @@ private:
     bool m_stopRequested = false;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
+    bool m_lastRunHitBudget = false; // GOW-Port: PR #12
+    // GOW-Port: native VU1 backend. runNative executes translated basic blocks with immediate (timing-free) semantics;
+    // it returns when the program ended or when the current pc has no native block (the caller then steps the exact
+    // engine). commitEverythingNow retires every in-flight pipeline entry without advancing the cycle counter.
+    struct NativeState;
+    NativeState *m_native = nullptr;
+    bool runNative(StepContext &context);
+    void nativeTiming(const uint8_t *code, uint32_t pc, uint32_t count, std::vector<uint8_t> &cyc);
+    void commitEverythingNow();
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
@@ -377,9 +395,6 @@ private:
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
     void progressXgkick();
-    void xgkickCopy();
-    void xgkickAdvanceTo(uint64_t cycle);
-    void xgkickScheduleEvent();
     void finishXgkick();
     uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;
     void markPairWrites(const DecodedInstructionPair &decoded);
@@ -395,7 +410,7 @@ private:
     void lowerT(StepContext &context, uint32_t upperInstr);
     template <class T>
     uint64_t readyCycleT() const;
-    template <class T, bool DeadFlags, bool Plain = false, bool Chained = false>
+    template <class T, bool DeadFlags, bool Plain = false>
     bool stepPairT(StepContext &context);
     bool blockPreconditions(StepContext &context, uint32_t pc, const uint32_t *words, size_t bytes) const;
     bool stepInterpreted(StepContext &context);
@@ -416,7 +431,7 @@ private:
         std::memcpy(&value, &bits, sizeof(value));
         return value;
     }
-
+    // GOW-Port: atajo de normalizeFmacResult para acc +/- producto. Con el producto y la suma redondeados
     // por separado, |exacto - resultado| < 2^-23 (|producto| + |resultado|). Si el resultado es normal,
     // no está cerca de los extremos (exponente 2..0xFD) y no es mucho menor que el producto (2^-20), el
     // exacto tiene su mismo signo, no es cero y no desborda: el valor no cambia y los flags son el signo.
@@ -425,9 +440,9 @@ private:
         uint32_t r = 0u, p = 0u;
         std::memcpy(&r, &result, sizeof(r));
         std::memcpy(&p, &product, sizeof(p));
-        const uint32_t re = (r >> 23) & 0xFFu;
-        const uint32_t pe = (p >> 23) & 0xFFu;
-        if (re < 2u || re > 0xFDu || (pe > re && (pe - re) > 20u))
+        const int er = static_cast<int>((r >> 23) & 0xFFu);
+        const int ep = static_cast<int>((p >> 23) & 0xFFu);
+        if (er < 2 || er > 0xFD || er < ep - 20)
             return false;
         laneFlags = (r & 0x80000000u) != 0u ? 0x2u : 0u;
         return true;
@@ -472,5 +487,9 @@ private:
     void reportReservedInstruction(bool upper, uint32_t instruction);
     float broadcast(const float *vf, uint8_t bc);
 };
+
+#if defined(_MSC_VER)
+#pragma float_control(pop)
+#endif
 
 #endif

@@ -565,6 +565,16 @@ namespace GSMem
 
 	void WriteNull(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 
+	// GOW-Port: writes `count` pixels of one row (x .. x+count-1, y) in format `psm`, pixel i taken from the packed
+	// source stream at index srcPixel+i (32/24/16/8 bit little endian, 4 bit low nibble first). The format is decided
+	// once per run and the address math is inlined: host->local uploads are the GS worker's hottest path.
+	void WriteRun(u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y, const u8* src, u32 srcPixel, u32 count);
+	// Reads `count` pixels of one row of a paletted format (T8/T8H/T4/T4HL/T4HH) as 8 bit indices.
+	void ReadIndexRun(const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y, u32 count, u8* out);
+	// Reads `count` pixels of one row of a direct-colour or depth format (32/24/16 bit) as raw values (24 bit masked,
+	// 16 bit zero-extended). Returns false for other formats.
+	bool ReadColorRun(const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y, u32 count, u32* out);
+
 	u32 ReadCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y);
 	u32 ReadZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y);
 

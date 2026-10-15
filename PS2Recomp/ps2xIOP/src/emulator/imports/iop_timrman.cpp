@@ -56,23 +56,6 @@ namespace ps2x::iop::detail
         }
         m_holdMode = 0u;
         m_servicing = false;
-        m_earliestValid = false;
-    }
-
-    uint64_t IopTimrman::earliestEventCycle() const noexcept
-    {
-        if (!m_earliestValid)
-        {
-            uint64_t next = UINT64_MAX;
-            for (const Timer &timer : m_timers)
-            {
-                next = std::min(next, timer.compareCycle);
-                next = std::min(next, timer.overflowCycle);
-            }
-            m_earliestEvent = next;
-            m_earliestValid = true;
-        }
-        return m_earliestEvent;
     }
 
     uint32_t IopTimrman::timerId(size_t index) noexcept
@@ -177,7 +160,6 @@ namespace ps2x::iop::detail
         const uint32_t a2 = cpu.gpr[6];
         const uint32_t a3 = cpu.gpr[7];
         const auto setV0 = [&](uint32_t value) { cpu.gpr[2] = value; };
-        m_earliestValid = false; // GOW-Port: las importaciones pueden programar o parar temporizadores
 
         switch (ordinal)
         {
@@ -436,18 +418,12 @@ namespace ps2x::iop::detail
     {
         if (m_servicing)
             return;
-        // GOW-Port: nada vence antes del primer evento programado (el bucle de abajo no haría nada).
-        if (currentCycle < earliestEventCycle())
-            return;
-        m_earliestValid = false;
         m_servicing = true;
         struct ServiceGuard
         {
             bool &flag;
-            bool &earliestValid;
-            // GOW-Port: las retrollamadas pueden consultar el próximo evento a mitad del servicio.
-            ~ServiceGuard() { flag = false; earliestValid = false; }
-        } guard{m_servicing, m_earliestValid};
+            ~ServiceGuard() { flag = false; }
+        } guard{m_servicing};
 
         for (Timer &timer : m_timers)
         {
@@ -489,6 +465,12 @@ namespace ps2x::iop::detail
 
     uint64_t IopTimrman::nextEventCycle(uint64_t fallback) const noexcept
     {
-        return std::min(fallback, earliestEventCycle());
+        uint64_t next = fallback;
+        for (const Timer &timer : m_timers)
+        {
+            next = std::min(next, timer.compareCycle);
+            next = std::min(next, timer.overflowCycle);
+        }
+        return next;
     }
 }

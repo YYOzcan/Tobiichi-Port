@@ -1,14 +1,34 @@
 // GOW-Port: enlaces manuales para God of War (SCUS-97399).
+#include "runtime/ee_scheduler.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "ps2_host_backend.h"
 #include "gow_pad2_packet.h"
 #include "gow_gs_replay.h" // GOW-Port: captura opcional y acotada para comparar backends.
+#include "runtime/gs/gs_display.h" // GOW-Port: native display state + GS FINISH handshake (step 5).
 #include <ps2_recompiled_functions.h>
+void sub_00110E40_0x110e40(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime); // GOW-Port: pose blend entry, for GOW_BLEND_DIAG
+void sub_00116EF0_0x116ef0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime); // GOW-Port: anim controller time update, for GOW_CTRL_DIAG
+void sub_0013DC78_0x13dc78(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime); // GOW-Port: game heap alloc, for GOW_HEAP_ZERO
+// GOW-Port: object guard (heap_guard): operator new/delete and the UI timeline containers
+void sub_0014C278_0x14c278(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0014C2F0_0x14c2f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00147520_0x147520(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0023B6A0_0x23b6a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00149340_0x149340(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void gowDumpBranchRing(const char *why);
+#include <map>
+#include <unordered_map>
+#include <cctype>
+#include <cmath>
+#include <xmmintrin.h>
+#include <thread>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <filesystem>
 #include <array>
 #include <chrono>
@@ -20,6 +40,7 @@
 namespace
 {
     uint32_t readGuest32(const uint8_t *rdram, uint32_t addr);
+    void writeGuest32(uint8_t *rdram, uint32_t addr, uint32_t value);
     void gowDiagPrimPoll(uint8_t *rdram, double seconds);
     // libpad2 uses socket handles and an 18-byte payload, unlike libpad's
     // port/slot API and 32-byte status packet. God of War expects state 1 and
@@ -91,24 +112,201 @@ namespace
         padReturn(ctx, 4u);
     }
 
+    // GOW-Port: GOW_WARP=<zone>[;<zone>...] (debug/test): the game's own level warp. The level scripts' builtins
+    // LoadForWarp(zone) and Warp() (script VM builtin dispatcher 0x1AFAD0, ids 4 and 5) load the zone's WAD next to
+    // the current one (0x1BB7E8) and, once it is loaded, move Kratos to the zone's warp point (0x1B25C8 ->
+    // 0x1B26F0, "Jumping to warp point"). They are called here, from the pad read (main loop, once per frame), with a
+    // scratch VM stack below the guest stack. Zone names are the WAD names without ".WAD" (GODOFWAR.TOC, e.g.
+    // PAND04G). GOW_WARP_DELAY=<s> (default 0.5): gameplay seconds before the first warp; GOW_WARP_STAY=<s> (default
+    // 60): seconds in each zone before the next one. Logs `[gow-warp] request|arrived|timeout|done`.
+    // Warp state (0x29CAB0 slot / -1, 0x29CAB4 zone loaded, 0x29CAB8 warp requested, 0x29CAFC warp due) and the
+    // current zone object (0x29CAC8, name via 0x1A97C8) as decoded from 0x1AFAD0 / 0x1B25C8.
+    void gowRunGuest(uint8_t *rdram, R5900Context &call, PS2Runtime *runtime, uint32_t entry);
+
+    std::string gowCurrentZone(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t zone = readGuest32(rdram, 0x29CAC8u) & 0x01FFFFFFu;
+        if (zone < 0x100000u)
+            { char text[32]; std::snprintf(text, sizeof(text), "?(zone=%x)", readGuest32(rdram, 0x29CAC8u)); return text; }
+        R5900Context call = *ctx;
+        SET_GPR_U32(&call, 4, zone);
+        SET_GPR_U32(&call, 29, (GPR_U32(ctx, 29) - 0x400u) & ~0xFu);
+        gowRunGuest(rdram, call, runtime, 0x001A97C8u);
+        const uint32_t name = GPR_U32((&call), 2) & 0x01FFFFFFu;
+        if (name < 0x100000u)
+        {
+            char text[48];
+            std::snprintf(text, sizeof(text), "?(zone=%x name=%x)", zone, name);
+            return text;
+        }
+        return std::string(reinterpret_cast<const char *>(rdram + name), strnlen(reinterpret_cast<const char *>(rdram + name), 32));
+    }
+
+    // Runs a guest function on a copy of the context to its return: a recompiled function hands control back early at
+    // an EE checkpoint (ctx->pc = where to resume), so the copy is dispatched again until it returns to ra = 0.
+    void gowRunGuest(uint8_t *rdram, R5900Context &call, PS2Runtime *runtime, uint32_t entry)
+    {
+        SET_GPR_U32(&call, 31, 0u);
+        call.pc = entry;
+        for (int steps = 0; call.pc != 0u && steps < 100000 && !runtime->isStopRequested(); ++steps)
+            runtime->lookupFunction(call.pc)(rdram, &call, runtime);
+    }
+
+    // LoadForWarp(zone) (id 4) or Warp() (id 5) through the script VM builtin dispatcher, with a scratch VM stack
+    // (0x140 bytes + depth word), result word and zone name below the guest stack.
+    void gowWarpBuiltin(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t id, const std::string &zone)
+    {
+        const uint32_t vm = (GPR_U32(ctx, 29) - 0x800u) & ~0xFu, result = vm + 0x150u, name = vm + 0x160u;
+        std::memset(rdram + vm, 0, 0x200);
+        std::memcpy(rdram + name, zone.c_str(), std::min<size_t>(zone.size(), 31));
+        writeGuest32(rdram, vm, name);
+        writeGuest32(rdram, vm + 0x140u, zone.empty() ? 0u : 1u);
+        R5900Context call = *ctx;
+        SET_GPR_U32(&call, 4, 0u);
+        SET_GPR_U32(&call, 5, id);
+        SET_GPR_U32(&call, 6, result);
+        SET_GPR_U32(&call, 7, vm);
+        SET_GPR_U32(&call, 29, vm - 0x40u);
+        gowRunGuest(rdram, call, runtime, 0x001AFAD0u);
+    }
+
+    void gowWarpPoll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const std::vector<std::string> zones = [] {
+            std::vector<std::string> list;
+            if (const char *text = std::getenv("GOW_WARP"))
+            {
+                std::string item;
+                std::istringstream stream(text);
+                while (std::getline(stream, item, ';'))
+                    if (!item.empty())
+                        list.push_back(item);
+            }
+            return list;
+        }();
+        if (zones.empty())
+            return;
+        static const double delay = std::getenv("GOW_WARP_DELAY") ? std::atof(std::getenv("GOW_WARP_DELAY")) : 0.5;
+        static const double stay = std::getenv("GOW_WARP_STAY") ? std::atof(std::getenv("GOW_WARP_STAY")) : 60.0;
+        static const auto start = std::chrono::steady_clock::now();
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        static size_t next = 0;
+        static double due = -1.0, requested = -1.0;
+        static bool waiting = false;
+        const bool gameplay = readGuest32(rdram, 0x29E560u) == 11u && readGuest32(rdram, 0x29E574u) == 0u;
+        // two captures per zone (5 s after arrival and half way through the stay): gow_warp_<n>_<zone>_<k>.ppm
+        static double captureAt[2] = {-1.0, -1.0};
+        for (int k = 0; k < 2; ++k)
+            if (captureAt[k] >= 0.0 && now >= captureAt[k])
+            {
+                captureAt[k] = -1.0;
+                std::vector<uint8_t> pixels;
+                uint32_t width = 0, height = 0;
+                if (runtime->gs().copyLatchedHostPresentationFrame(pixels, width, height, nullptr, nullptr, nullptr))
+                {
+                    const std::string name = "gow_warp_" + std::to_string(next) + "_" + zones[next - 1] + "_" + std::to_string(k) + ".ppm";
+                    std::ofstream file(name, std::ios::binary);
+                    file << "P6\n" << width << ' ' << height << "\n255\n";
+                    for (size_t i = 0; i + 3 < pixels.size(); i += 4)
+                        file.write(reinterpret_cast<const char *>(pixels.data() + i), 3);
+                    std::fprintf(stderr, "[gow-warp] capture %s at %.1f s\n", name.c_str(), now);
+                }
+            }
+        if (due < 0.0)
+        {
+            if (gameplay)
+                due = now + delay;
+            return;
+        }
+        if (waiting)
+        {
+            // the warp executor (0x1B25C8) clears the request and the slot when Kratos has been moved
+            const bool done = readGuest32(rdram, 0x29CAB8u) == 0u && static_cast<int32_t>(readGuest32(rdram, 0x29CAB0u)) < 0;
+            // Warp() only makes the warp due when the zone is already loaded; a script calls it again later
+            if (!done && readGuest32(rdram, 0x29CAB4u) != 0u && readGuest32(rdram, 0x29CAFCu) == 0u && gameplay)
+                gowWarpBuiltin(rdram, ctx, runtime, 5u, {});
+            if (done && gameplay)
+            {
+                std::fprintf(stderr, "[gow-warp] arrived %s at %.1f s (%.1f s) zone=%s\n", zones[next - 1].c_str(), now,
+                             now - requested, gowCurrentZone(rdram, ctx, runtime).c_str());
+                waiting = false;
+                due = now + stay;
+                captureAt[0] = now + 5.0;
+                captureAt[1] = now + std::max(6.0, stay / 2.0);
+            }
+            else if (now - requested > 90.0)
+            {
+                std::fprintf(stderr, "[gow-warp] timeout %s at %.1f s (slot=%d loaded=%u request=%u due=%u) zone=%s\n",
+                             zones[next - 1].c_str(), now, static_cast<int32_t>(readGuest32(rdram, 0x29CAB0u)),
+                             readGuest32(rdram, 0x29CAB4u), readGuest32(rdram, 0x29CAB8u), readGuest32(rdram, 0x29CAFCu),
+                             gowCurrentZone(rdram, ctx, runtime).c_str());
+                waiting = false;
+                due = now;
+            }
+            return;
+        }
+        if (now < due || !gameplay)
+            return;
+        if (next >= zones.size())
+        {
+            std::fprintf(stderr, "[gow-warp] done at %.1f s\n", now);
+            due = 1e30;
+            return;
+        }
+        const std::string &zone = zones[next++];
+        const std::string current = gowCurrentZone(rdram, ctx, runtime);
+        std::fprintf(stderr, "[gow-warp] request %s at %.1f s from zone=%s\n", zone.c_str(), now, current.c_str());
+        // LoadForWarp ignores the zone Kratos is in
+        if (std::equal(zone.begin(), zone.end(), current.begin(), current.end(),
+                       [](char a, char b) { return std::toupper(static_cast<unsigned char>(a)) == std::toupper(static_cast<unsigned char>(b)); }))
+        {
+            std::fprintf(stderr, "[gow-warp] arrived %s at %.1f s (0.0 s) zone=%s (already there)\n", zone.c_str(), now, current.c_str());
+            requested = now;
+            due = now + stay;
+            captureAt[0] = now + 5.0;
+            captureAt[1] = now + std::max(6.0, stay / 2.0);
+            return;
+        }
+        requested = now;
+        waiting = true;
+        gowWarpBuiltin(rdram, ctx, runtime, 4u, zone); // LoadForWarp(zone)
+        gowWarpBuiltin(rdram, ctx, runtime, 5u, {});   // Warp()
+    }
+
+    void gowPad2ReadState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+
     void gowPad2Read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        gowPad2ReadState(rdram, ctx, runtime);
+        gowWarpPoll(rdram, ctx, runtime);
+    }
+
+    void gowPad2ReadState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // GOW-Port: always 16:9 (4:3 is not supported any more) — the data part of PCSX2's SCUS-97399_D6385328.pnach
+        // "Widescreen 16:9": the game's own widescreen flag and three 16:9 aspect floats, re-applied every frame like
+        // PCSX2 does. (The pnach's "enhanced" code rewrite of 0x169250-0x16944C is not applied: it needs a recompile.)
+        constexpr bool widescreen = true;
+        if (widescreen)
+        {
+            auto put32 = [rdram](uint32_t addr, uint32_t value) { std::memcpy(rdram + addr, &value, sizeof(value)); };
+            put32(0x0029CC90u, 1u);
+            put32(0x002FD930u, 0x3FE38E39u);
+            put32(0x002FD968u, 0x3FE38E39u);
+            put32(0x0032F1B0u, 0x3FE38E39u);
+        }
         auto *buffer = padBuffer(rdram, GPR_U32(ctx, 5), 18);
         const auto *socket = padSocket(ctx);
         uint8_t state[32]{};
         if (!buffer || !socket || socket->port != 0 || !runtime ||
             !runtime->padBackend().readState(0, 0, state, sizeof(state))) { padReturn(ctx, 0xffffffffu); return; }
-        if (!IsGamepadAvailable(0))
+        // GOW-Port: keyboard sticks only without any gamepad (PSPadBackend uses the first available slot).
+        if (!IsGamepadAvailable(0) && !IsGamepadAvailable(1) && !IsGamepadAvailable(2) && !IsGamepadAvailable(3))
         {
-            // WASD = stick izquierdo; con Ctrl, WASD pasa al stick derecho (esquiva) y el izquierdo queda
-            // centrado. IJKL sigue moviendo el stick derecho.
-            const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
-            const uint8_t x = IsKeyDown(KEY_A) ? 0 : IsKeyDown(KEY_D) ? 255 : 128;
-            const uint8_t y = IsKeyDown(KEY_W) ? 0 : IsKeyDown(KEY_S) ? 255 : 128;
-            state[6] = ctrl ? 128 : x;
-            state[7] = ctrl ? 128 : y;
-            state[4] = ctrl ? x : IsKeyDown(KEY_J) ? 0 : IsKeyDown(KEY_L) ? 255 : 128;
-            state[5] = ctrl ? y : IsKeyDown(KEY_I) ? 0 : IsKeyDown(KEY_K) ? 255 : 128;
+            state[6] = IsKeyDown(KEY_A) ? 0 : IsKeyDown(KEY_D) ? 255 : 128;
+            state[7] = IsKeyDown(KEY_W) ? 0 : IsKeyDown(KEY_S) ? 255 : 128;
+            state[4] = IsKeyDown(KEY_J) ? 0 : IsKeyDown(KEY_L) ? 255 : 128;
+            state[5] = IsKeyDown(KEY_I) ? 0 : IsKeyDown(KEY_K) ? 255 : 128;
         }
         // Opt-in smoke test: advance title/new-game prompts without host UI input.
         // Capture the GS's own presented pixels; normal play never injects input.
@@ -119,12 +317,112 @@ namespace
         static const auto testStart = std::chrono::steady_clock::now();
         if (smokeTest)
         {
+            // the script alone drives the test: a connected gamepad or the keyboard must not leak into it (stick drift
+            // of a real pad changed the save slot picked and the walk of the zone checks)
+            state[2] = state[3] = 0xFF;
+            state[4] = state[5] = state[6] = state[7] = 128;
+            for (size_t i = 8; i < sizeof(state); ++i)
+                state[i] = 0;
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - testStart).count();
+            // GOW-Port: times written "g<s>" in GOW_PAD_GUION / GOW_PAD_CAPTURAS count from the start of gameplay
+            // (first state 11 with nothing pending), so runs at different speeds act at the same point in the game.
+            // They are stored as kGameplayTime + s.
+            constexpr double kGameplayTime = 1.0e6;
+            static double gameplayStart = -1.0;
+            if (gameplayStart < 0.0 && readGuest32(rdram, 0x29E560u) == 11u && readGuest32(rdram, 0x29E574u) == 0u)
+            {
+                gameplayStart = seconds;
+                std::fprintf(stderr, "[gow-pad2:test] gameplay start at %.2f s\n", seconds);
+            }
+            auto parseTime = [](const std::string &text) {
+                return !text.empty() && text[0] == 'g' ? kGameplayTime + std::strtod(text.c_str() + 1, nullptr)
+                                                       : std::strtod(text.c_str(), nullptr);
+            };
+            auto reached = [&](double when) {
+                if (when < kGameplayTime)
+                    return seconds >= when;
+                return gameplayStart >= 0.0 && seconds - gameplayStart >= when - kGameplayTime;
+            };
+            // GOW-Port: GOW_RAM_DUMP=<time>:<file> writes the 32 MB EE RAM once (time as in GOW_PAD_CAPTURAS,
+            // e.g. g5:ram.bin), to compare with eeMemory.bin from a PCSX2 save state at the same point.
+            // GOW-Port: GOW_THREAD_DUMP=<t>: lists the EE threads once (entry, priorities, status, wait).
+            static const char *threadDump = std::getenv("GOW_THREAD_DUMP");
+            static bool threadDumped = false;
+            if (threadDump && !threadDumped && reached(parseTime(threadDump)))
+            {
+                threadDumped = true;
+                const EeKernelSnapshot snapshot = runtime->eeScheduler().snapshot();
+                std::fprintf(stderr, "[gow-threads] running=%d\n", snapshot.runningThreadId);
+                for (const EeThreadSnapshot &t : snapshot.threads)
+                    std::fprintf(stderr, "[gow-threads] id=%d entry=%08x prio=%d/%d status=%d wait=%d/%d pc=%08x ra=%08x\n",
+                                 t.id, t.entry, t.initialPriority, t.currentPriority, int(t.status), int(t.waitReason),
+                                 t.waitId, t.pc, t.ra);
+            }
+            // GOW_RAM_DUMP=<t>[;<t>...]:<file>: one dump per time; with several times the files are <file>.<n>.
+            static const char *ramDump = std::getenv("GOW_RAM_DUMP");
+            static size_t ramDumpIndex = 0;
+            if (ramDump)
+            {
+                const char *colon = std::strchr(ramDump, ':');
+                std::vector<std::string> times;
+                for (const char *c = ramDump; colon && c < colon;)
+                {
+                    const char *e = c;
+                    while (e < colon && *e != ';') ++e;
+                    times.emplace_back(c, e);
+                    c = e < colon ? e + 1 : colon;
+                }
+                if (colon && ramDumpIndex < times.size() && reached(parseTime(times[ramDumpIndex])))
+                {
+                    std::string path = colon + 1;
+                    if (times.size() > 1)
+                        path += "." + std::to_string(ramDumpIndex);
+                    ++ramDumpIndex;
+                    if (std::FILE *file = std::fopen(path.c_str(), "wb"))
+                    {
+                        std::fwrite(rdram, 1, 0x02000000u, file);
+                        std::fclose(file);
+                    }
+                    std::fprintf(stderr, "[gow-pad2:test] RAM dumped to %s at %.2f s\n", path.c_str(), seconds);
+                }
+            }
             // GOW-Port: comprobar el estado durante el perfil sin escribir capturas ni volcados.
             static const bool noCapture = [] {
                 const char *value = std::getenv("GOW_PAD_TEST_NO_CAPTURE");
                 return value && std::strcmp(value, "1") == 0;
             }();
+            // GOW-Port: GOW_PLAYER_TRACE=1 logs once per second Kratos's position (0x2C7790; player
+            // object *0x29E5CC), the game state and the movie state, to steer scripted runs.
+            // GOW_GOD_MODE=1 (test runs only): Kratos's health (creature *0x29D2B4, +0x198 current, +0x19C maximum,
+            // floats) is refilled every poll so long scripted runs are not ended by deaths.
+            static const bool godMode = std::getenv("GOW_GOD_MODE") != nullptr;
+            if (godMode)
+                if (const uint32_t creature = readGuest32(rdram, 0x29D2B4u) & 0x01FFFFFFu; creature >= 0x100000u)
+                {
+                    const uint32_t maximum = readGuest32(rdram, creature + 0x19Cu);
+                    float value = 0;
+                    std::memcpy(&value, &maximum, 4);
+                    if (value > 0.0f && value <= 10000.0f)
+                        writeGuest32(rdram, creature + 0x198u, maximum);
+                }
+            static const bool playerTrace = std::getenv("GOW_PLAYER_TRACE") != nullptr;
+            static double nextPlayerReport = 0;
+            if (playerTrace && seconds >= nextPlayerReport)
+            {
+                nextPlayerReport = seconds + 1;
+                const uint32_t player = readGuest32(rdram, 0x29E5CCu) & 0x01FFFFFFu;
+                // 0x2C7790: a world position vector that follows Kratos's walk (found by RAM diffs while walking).
+                float pos[3]{};
+                std::memcpy(pos, rdram + 0x2C7790u, sizeof(pos));
+                const uint32_t creature = readGuest32(rdram, 0x29D2B4u) & 0x01FFFFFFu;
+                float health = 0;
+                if (creature >= 0x100000u)
+                    std::memcpy(&health, rdram + creature + 0x198u, 4);
+                std::fprintf(stderr, "[gow-player] t=%.1f g=%.1f obj=%x pos=%.1f,%.1f,%.1f hp=%.0f state=%u movie=%u zone=%s\n", seconds,
+                             gameplayStart >= 0.0 ? seconds - gameplayStart : -1.0, player, pos[0], pos[1], pos[2], health,
+                             readGuest32(rdram, 0x29E560u), readGuest32(rdram, 0x29C838u),
+                             gowCurrentZone(rdram, ctx, runtime).c_str());
+            }
             static double nextStateReport = 0;
             static const bool primDiag = [] { const char *diag=std::getenv("GOW_EE_PRIM_DIAG"); return diag && std::strcmp(diag,"1")==0; }();
             if (primDiag)
@@ -140,8 +438,11 @@ namespace
             // GOW_PAD_GUION="5:start,12:abajo,16:x": pulsaciones de 0,7 s en esos segundos (en lugar de la
             // secuencia fija). Botones: start, select, arriba, abajo, izquierda, derecha, x, circulo, cuadrado,
             // triangulo, l1, r1, l2, r2.
-            struct ScriptedPress { double seconds; uint8_t byte; uint8_t mask; };
-            static const std::vector<ScriptedPress> script = [] {
+            // GOW-Port: also left/right stick directions (lup, ldown, lleft, lright, rup, rdown, rleft, rright),
+            // and "*<s>" sets how long it is held (default 0.7 s), e.g. "140:lup*6".
+            // For a stick, byte = state index of the axis and mask = the axis value to hold.
+            struct ScriptedPress { double seconds; uint8_t byte; uint8_t mask; double hold = 0.7; bool axis = false; };
+            static const std::vector<ScriptedPress> script = [&] {
                 std::vector<ScriptedPress> presses;
                 const char *text = std::getenv("GOW_PAD_GUION");
                 if (!text)
@@ -158,18 +459,42 @@ namespace
                     const size_t colon = item.find(':');
                     if (colon == std::string::npos)
                         continue;
-                    const std::string name = item.substr(colon + 1);
+                    std::string name = item.substr(colon + 1);
+                    double hold = 0.7;
+                    if (const size_t star = name.find('*'); star != std::string::npos)
+                    {
+                        hold = std::strtod(name.c_str() + star + 1, nullptr);
+                        name.resize(star);
+                    }
+                    const double at = parseTime(item.substr(0, colon));
                     for (const auto &[button, bit] : buttons)
                         if (name == button)
-                            presses.push_back({std::strtod(item.c_str(), nullptr), bit.first, bit.second});
+                            presses.push_back({at, bit.first, bit.second, hold, false});
+                    // state[4..7] = RX, RY, LX, LY (0 = left/up, 255 = right/down)
+                    static const std::pair<const char *, std::pair<uint8_t, uint8_t>> sticks[] = {
+                        {"lleft", {6, 0}}, {"lright", {6, 255}}, {"lup", {7, 0}}, {"ldown", {7, 255}},
+                        {"rleft", {4, 0}}, {"rright", {4, 255}}, {"rup", {5, 0}}, {"rdown", {5, 255}}};
+                    for (const auto &[stick, axis] : sticks)
+                        if (name == stick)
+                            presses.push_back({at, axis.first, axis.second, hold, true});
                 }
                 return presses;
             }();
+            static const bool scriptUsesGameplayTime =
+                std::any_of(script.begin(), script.end(), [&](const ScriptedPress &p) { return p.seconds >= kGameplayTime; });
             if (!script.empty())
             {
                 for (const ScriptedPress &press : script)
-                    if (seconds >= press.seconds && seconds < press.seconds + 0.7)
-                        state[press.byte] &= static_cast<uint8_t>(~press.mask);
+                    // With gameplay-relative entries, absolute ones only drive the menus (spare confirm
+                    // presses would otherwise act in gameplay at a different point on faster runs).
+                    if (reached(press.seconds) && !reached(press.seconds + press.hold) &&
+                        !(scriptUsesGameplayTime && press.seconds < kGameplayTime && gameplayStart >= 0.0))
+                    {
+                        if (press.axis)
+                            state[press.byte] = press.mask;
+                        else
+                            state[press.byte] &= static_cast<uint8_t>(~press.mask);
+                    }
             }
             else
             {
@@ -182,8 +507,21 @@ namespace
                     }
             }
             static size_t capture = 0;
-            constexpr double captures[] = {4, 10, 18, 26, 34, 44, 56, 70, 90, 110, 130, 160, 190, 240, 360, 480, 580};
-            if (!noCapture && capture < std::size(captures) && seconds >= captures[capture])
+            // GOW-Port: GOW_PAD_CAPTURAS="t1,t2,..." (seconds, ascending) replaces the default capture times.
+            static const std::vector<double> captures = [&] {
+                std::vector<double> times;
+                if (const char *text = std::getenv("GOW_PAD_CAPTURAS"))
+                {
+                    std::string item;
+                    std::istringstream stream(text);
+                    while (std::getline(stream, item, ','))
+                        times.push_back(parseTime(item));
+                }
+                if (times.empty())
+                    times = {4, 10, 18, 26, 34, 44, 56, 70, 90, 110, 130, 160, 190, 240, 360, 480, 580};
+                return times;
+            }();
+            if (!noCapture && capture < captures.size() && reached(captures[capture]))
             {
                 std::vector<uint8_t> pixels;
                 uint32_t width = 0, height = 0, display = 0, source = 0;
@@ -266,6 +604,16 @@ namespace
             }
         }
         const auto packet = gow_pad2::makePacket(state);
+        // GOW-Port: GOW_PAD_LOG=1 prints the libpad2 packet every 120 reads (buttons are active-low).
+        static const bool padLog = std::getenv("GOW_PAD_LOG") != nullptr;
+        static unsigned padReads = 0;
+        if (padLog && ++padReads % 120u == 0u)
+        {
+            std::fprintf(stderr, "[gow-pad2:packet]");
+            for (uint8_t byte : packet)
+                std::fprintf(stderr, " %02x", byte);
+            std::fprintf(stderr, "\n");
+        }
         std::memcpy(buffer, packet.data(), packet.size());
         const uint16_t buttons = static_cast<uint16_t>(state[2] | (state[3] << 8));
         static unsigned reads = 0;
@@ -285,10 +633,48 @@ namespace
         padReturn(ctx, 18u);
     }
 
-    void gowVibGetProfile(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    // libvib on the DualShock 2's two actuators (profile 0x03): actuator 0 = small motor (1 bit), actuator 1 = large
+    // motor (8 bits). The game (0x17C130) reads the profile once per connection and sends the packed data only when
+    // it changes; the pad backend drives the host gamepad's rumble.
+    constexpr uint8_t kVibProfile = 0x03u;
+
+    // 0x27BF90 sceVibGetProfile(socket, u8 *profile) -> profile size in bytes
+    void gowVibGetProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
     {
-        // No rumble capability yet; the game skips actuator updates for count 0.
-        padReturn(ctx, 0u);
+        auto *profile = padBuffer(rdram, GPR_U32(ctx, 5), 1);
+        const auto *socket = padSocket(ctx);
+        if (!profile || !socket || socket->port != 0) { padReturn(ctx, 0u); return; }
+        profile[0] = kVibProfile;
+        padReturn(ctx, 1u);
+    }
+
+    // 0x27C010 sceVibSetActParam(socket, profileSize, const u8 *profile, dataSize, const u8 *data) -> 1 = sent
+    void gowVibSetActParam(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const auto *socket = padSocket(ctx);
+        const uint32_t profileSize = GPR_U32(ctx, 5), dataSize = GPR_U32(ctx, 7);
+        const auto *profile = padBuffer(rdram, GPR_U32(ctx, 6), profileSize);
+        const auto *data = padBuffer(rdram, GPR_U32(ctx, 8), dataSize);
+        if (!socket || socket->port != 0 || !runtime || !profile || !data || profileSize == 0u || dataSize > 32u)
+        {
+            padReturn(ctx, 0u);
+            return;
+        }
+        // Data bits are packed LSB first in actuator order, for the actuators the profile selects.
+        uint32_t bit = 0u;
+        auto take = [&](uint32_t width) {
+            uint32_t value = 0u;
+            for (uint32_t i = 0; i < width && bit < dataSize * 8u; ++i, ++bit)
+                value |= ((data[bit / 8u] >> (bit % 8u)) & 1u) << i;
+            return value;
+        };
+        const bool small = (profile[0] & 1u) && take(1u) != 0u;
+        const uint32_t large = (profile[0] & 2u) ? take(8u) : 0u;
+        static const bool vibLog = std::getenv("GOW_VIB_LOG") != nullptr;
+        if (vibLog)
+            std::fprintf(stderr, "[gow-vib] small=%u large=%u\n", small ? 1u : 0u, large);
+        runtime->padBackend().setActuators(0, small, static_cast<uint8_t>(large));
+        padReturn(ctx, 1u);
     }
 
     // Sectores de la capa 0 del DVD (donde empieza la capa 1). Medido en la ISO del usuario.
@@ -337,6 +723,358 @@ namespace
     // SCUS-97399 sceIpuInit uses SetD4_CHCR at 0x279588 and tables at
     // 0x2a1610/0x2a1660. The generic stub's hard-coded 0x126428 is a
     // FilteredCopyTile continuation in this ELF, so initialize MMIO directly.
+    // GOW-Port: rand@0x28C0C8 is stubbed in the recompiler config, and the generic stub returned the host's
+    // 15-bit rand(). The game's newlib rand (checked against the ELF code and PCSX2's interpreter with
+    // PS2X_EE_DIFF) keeps its seed at _impure_ptr(0x2A4294)+0x58 and returns 31 bits:
+    // seed = seed * 0x41C64E6D + 0x3039; return seed & 0x7FFFFFFF.
+    // GOW-Port: GOW_HEAP_ZERO=1 zero-fills every block returned by the game heap allocator 0x13DC78 (a0 heap, a1 bytes),
+    // to test whether uninitialised (stale) heap data, which differs from PCSX2 after the allocation-order drift,
+    // reaches the animation code.
+    void gowHeapZeroAlloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t bytes = GPR_U32(ctx, 5);
+        sub_0013DC78_0x13dc78(rdram, ctx, runtime);
+        const uint32_t block = GPR_U32(ctx, 2) & 0x01FFFFFFu;
+        if (block && bytes && bytes < 0x01000000u && block + bytes <= 0x02000000u)
+            std::memset(rdram + block, 0, bytes);
+    }
+
+    // GOW-Port: object guard for the game's operator new (0x14C278, fixed-block pools) and delete (0x14C2F0).
+    // The Flash-style UI player (timeline nodes, vtable 0x2BF4C0: 0x147520 evaluates a node's channels, 0x23B6A0 is
+    // the node destructor, 0x149340 empties a node's duplicated-clip list) can be left holding a child that was already
+    // deleted; the boss/enemy meter HUD (HydraMeter, "_level0/:CheckForGlow2") did it in the user's runs (ship after the
+    // Hydra fights, Cliffs combat). Deleting that child again runs a destructor through whatever now occupies the block
+    // (a string: jump to 0x3F; or a zeroed list: jump to 0) and frees the block a second time, which links it into the
+    // pool's free list twice and hands it to two owners later. The guard tracks every block of operator new, ignores a
+    // second delete of the same block, and drops a stale or NULL child from those three containers before the game
+    // deletes it. Each case is logged ([gow-heapguard], the first ones with the last guest branches) to find the cause.
+    namespace heap_guard
+    {
+        struct Block
+        {
+            bool live = true;
+            uint32_t freedBy = 0; // caller of the delete that freed it
+        };
+        std::unordered_map<uint32_t, Block> blocks;
+        unsigned reports = 0;
+
+        void report(const char *what, uint32_t object, uint32_t where)
+        {
+            if (reports >= 200u)
+                return;
+            ++reports;
+            const auto it = blocks.find(object);
+            std::fprintf(stderr, "[gow-heapguard] %s object=0x%x at=0x%x freed-by=0x%x\n", what, object, where,
+                         it == blocks.end() ? 0u : it->second.freedBy);
+            if (reports <= 3u)
+                gowDumpBranchRing(what);
+        }
+
+        bool stale(uint32_t object)
+        {
+            const auto it = blocks.find(object);
+            return it != blocks.end() && !it->second.live;
+        }
+
+        // A child the game may delete: a live block whose virtual destructor (vtable at +4, entry +0xC) is game code.
+        bool deletable(const uint8_t *rdram, PS2Runtime *runtime, uint32_t object)
+        {
+            if (object == 0u || object >= 0x02000000u || (object & 3u) != 0u || stale(object))
+                return false;
+            const uint32_t vtable = readGuest32(rdram, object + 4u);
+            if (vtable < 0x00100000u || vtable >= 0x02000000u || (vtable & 3u) != 0u)
+                return false;
+            return runtime->hasFunction(readGuest32(rdram, vtable + 0xCu));
+        }
+    }
+
+    // GOW_FLASHQ_WATCH=<hex block> (debug): logs new/delete of that block and every Flash queue append/drain holding it
+    uint32_t flashqWatch()
+    {
+        static const uint32_t watch = std::getenv("GOW_FLASHQ_WATCH") ? std::strtoul(std::getenv("GOW_FLASHQ_WATCH"), nullptr, 16) : 0u;
+        return watch;
+    }
+
+    void gowOperatorNew(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        sub_0014C278_0x14c278(rdram, ctx, runtime);
+        // A recompiled function hands control back early at an EE checkpoint (ctx->pc = where to resume) and is then
+        // resumed through the original's own slots, so v0 is only the new block once the call has returned to ra.
+        // The allocator (0x13DA10 pools, strcmp) never waits: finish it here instead of reading a stale v0, which left
+        // reallocated blocks marked free (false "second delete" reports, and the guard dropping live children).
+        for (int steps = 0; ctx->pc != ra && ctx->pc != 0u && steps < 100000 && !runtime->isStopRequested(); ++steps)
+            runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+        if (ctx->pc != ra)
+            return;
+        if (const uint32_t block = GPR_U32(ctx, 2))
+        {
+            heap_guard::blocks[block] = {};
+            if (block == flashqWatch())
+                std::fprintf(stderr, "[gow-flashq] new 0x%x ra=0x%x\n", block, ra);
+        }
+    }
+
+    void gowOperatorDelete(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t block = GPR_U32(ctx, 4), ra = GPR_U32(ctx, 31);
+        // 0x143C78 (string delete) keeps its caller at 0($sp)
+        const uint32_t caller = ra == 0x00143C8Cu ? readGuest32(rdram, GPR_U32(ctx, 29)) : ra;
+        if (block == flashqWatch())
+            std::fprintf(stderr, "[gow-flashq] delete 0x%x by 0x%x\n", block, caller);
+        const auto it = heap_guard::blocks.find(block);
+        if (it != heap_guard::blocks.end())
+        {
+            if (!it->second.live)
+            {
+                heap_guard::report("second delete ignored", block, caller);
+                ctx->pc = ra;
+                return;
+            }
+            it->second = {false, caller};
+        }
+        sub_0014C2F0_0x14c2f0(rdram, ctx, runtime);
+    }
+
+    // GOW_FLASHQ_WATCH=<hex block> (debug) also wraps the Flash UI player's action queue: 0x1460C0 appends a node
+    // {item, owner, next} (12 bytes, operator new) at the tail (a2 != 0) or the head of the owner's player queue (player
+    // +0xCD8 head, +0xCDC tail); 0x146158 drains it at the end of each player update (0x14A560): each action runs
+    // (0x1452F8), its node is deleted (0x1461AC), and head/tail are cleared after the walk (+0xCFC set: dropped
+    // undeleted). Logged: every append, and every drain whose queue holds the watched block (with the list). The
+    // heap guard's "second delete ... at=0x1461ac" is a node still in a queue after a drain deleted it (docs/game-internals.md).
+    void gowFlashQueueDrain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t player = GPR_U32(ctx, 4), watch = flashqWatch();
+        std::string list;
+        bool has = false;
+        for (uint32_t node = readGuest32(rdram, player + 0xCD8u), n = 0; node && n < 64; node = readGuest32(rdram, node + 8u), ++n)
+        {
+            char text[16];
+            std::snprintf(text, sizeof(text), " %x", node);
+            list += text;
+            has |= node == watch;
+        }
+        if (has)
+            std::fprintf(stderr, "[gow-flashq] drain player 0x%x ra=0x%x tail=0x%x list:%s\n", player, GPR_U32(ctx, 31),
+                         readGuest32(rdram, player + 0xCDCu), list.c_str());
+        sub_00146158_0x146158(rdram, ctx, runtime);
+    }
+
+    void gowFlashQueueAppend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::fprintf(stderr, "[gow-flashq] append item=0x%x owner=0x%x tail=%u ra=0x%x\n", GPR_U32(ctx, 4), GPR_U32(ctx, 5),
+                     GPR_U32(ctx, 6), GPR_U32(ctx, 31));
+        sub_001460C0_0x1460c0(rdram, ctx, runtime);
+    }
+
+    // 0x147520(a0 track header: channel count u16 at +2, a2 channel entries {node, key} of 8 bytes)
+    void gowGuardTimelineChannels(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t header = GPR_U32(ctx, 4), entries = GPR_U32(ctx, 6);
+        if (header != 0u && header < 0x02000000u && entries != 0u && entries < 0x02000000u)
+        {
+            const uint32_t count = readGuest32(rdram, header) >> 16;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint32_t node = readGuest32(rdram, entries + i * 8u);
+                if (node != 0u && !heap_guard::deletable(rdram, runtime, node))
+                {
+                    heap_guard::report("timeline channel holds a deleted node", node, GPR_U32(ctx, 31));
+                    writeGuest32(rdram, entries + i * 8u, 0u);
+                }
+            }
+        }
+        sub_00147520_0x147520(rdram, ctx, runtime);
+    }
+
+    // 0x23B6A0(a0 node): child entries {node, key} at *(node+0x28), count u16 at *(node+0x1C)+2
+    void gowGuardNodeDestructor(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t node = GPR_U32(ctx, 4);
+        const uint32_t definition = node < 0x02000000u ? readGuest32(rdram, node + 0x1Cu) : 0u;
+        const uint32_t entries = node < 0x02000000u ? readGuest32(rdram, node + 0x28u) : 0u;
+        if (definition != 0u && definition < 0x02000000u && entries != 0u && entries < 0x02000000u)
+        {
+            const uint32_t count = readGuest32(rdram, definition) >> 16;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint32_t child = readGuest32(rdram, entries + i * 8u);
+                if (child != 0u && !heap_guard::deletable(rdram, runtime, child))
+                {
+                    heap_guard::report("node destructor: deleted child dropped", child, node);
+                    writeGuest32(rdram, entries + i * 8u, 0u);
+                }
+            }
+        }
+        sub_0023B6A0_0x23b6a0(rdram, ctx, runtime);
+    }
+
+    // 0x149340(a0 list: first index +0x18, count +0x1C, entries {node, key} at +0x20); it has no NULL check, so
+    // missing entries are removed and the rest moved up.
+    void gowGuardCloneList(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t list = GPR_U32(ctx, 4);
+        const uint32_t first = list < 0x02000000u ? readGuest32(rdram, list + 0x18u) : 0u;
+        const int32_t count = list < 0x02000000u ? static_cast<int32_t>(readGuest32(rdram, list + 0x1Cu)) : 0;
+        const uint32_t entries = list < 0x02000000u ? readGuest32(rdram, list + 0x20u) : 0u;
+        if (count > 0 && count < 0x10000 && entries != 0u && entries < 0x02000000u)
+        {
+            uint32_t kept = 0;
+            for (uint32_t i = 0; i < static_cast<uint32_t>(count); ++i)
+            {
+                const uint32_t at = entries + (first + i) * 8u;
+                const uint32_t node = readGuest32(rdram, at);
+                if (!heap_guard::deletable(rdram, runtime, node))
+                {
+                    heap_guard::report("clone list: deleted or missing node dropped", node, list);
+                    continue;
+                }
+                const uint32_t key = readGuest32(rdram, at + 4u), to = entries + (first + kept) * 8u;
+                writeGuest32(rdram, to, node);
+                writeGuest32(rdram, to + 4u, key);
+                ++kept;
+            }
+            writeGuest32(rdram, list + 0x1Cu, kept);
+        }
+        sub_00149340_0x149340(rdram, ctx, runtime);
+    }
+
+    void gowRand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        const uint32_t reent = readGuest32(rdram, 0x002A4294u);
+        const uint32_t seed = readGuest32(rdram, reent + 0x58u) * 0x41C64E6Du + 0x3039u;
+        std::memcpy(rdram + ((reent + 0x58u) & 0x01FFFFFFu), &seed, sizeof(seed));
+        setReturnU32(ctx, seed & 0x7FFFFFFFu);
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    // GOW-Port: GOW_SKEL_DIAG=1 logs each animated object passed to CalcWorldMatrix 0x1303D0 once (KIexster's
+    // layout: object+0x104 skeleton, skeleton+0x60 definition with the joint count at +0x10, skeleton+0x8C joint
+    // matrices, object world matrix at +0x70). GOW_SKEL_OBJECT=<hex> then logs that object's first joints'
+    // local yaw (atan2 of the matrix X row) every call.
+    void gowDiagCalcWorldMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t model = GPR_U32(ctx, 5);
+        sub_00157A60_0x157a60(rdram, ctx, runtime);
+        const uint32_t object = readGuest32(rdram, model + 0x18u) & 0x01FFFFFFu;
+        if (!object)
+            return;
+        static const uint32_t watched = [] { const char *v = std::getenv("GOW_SKEL_OBJECT"); return v ? uint32_t(std::strtoul(v, nullptr, 16)) : 0u; }();
+        auto f32 = [&](uint32_t a) { float v = 0; std::memcpy(&v, rdram + (a & 0x01FFFFFCu), 4); return v; };
+        const uint32_t skeleton = readGuest32(rdram, object + 0x104u) & 0x01FFFFFFu;
+        if (!skeleton)
+            return;
+        const uint32_t definition = readGuest32(rdram, skeleton + 0x60u) & 0x01FFFFFFu;
+        const uint32_t joints = readGuest32(rdram, skeleton + 0x8Cu) & 0x01FFFFFFu;
+        const uint32_t count = definition ? readGuest32(rdram, definition + 0x10u) : 0u;
+        // GOW_SKEL_ANIM=1: per object with a joint palette, report every 90 calls how many joints moved since the previous report.
+        if (std::getenv("GOW_SKEL_ANIM") && joints)
+        {
+            static std::map<uint32_t, std::pair<unsigned, std::vector<float>>> track;
+            auto &t = track[object];
+            if (++t.first % 90u == 1u)
+            {
+                const uint32_t n = (count > 0u && count < 256u) ? count : 125u;
+                std::vector<float> cur(n * 16u);
+                std::memcpy(cur.data(), rdram + (joints & 0x01FFFFFFu), n * 64u);
+                unsigned moved = 0, bad = 0;
+                for (uint32_t i = 0; i < n * 16u; ++i) if (!std::isfinite(cur[i])) { ++bad; break; }
+                if (t.second.size() == cur.size())
+                    for (uint32_t j = 0; j < n; ++j)
+                        for (uint32_t k = 0; k < 16u; ++k)
+                            if (std::fabs(cur[j * 16u + k] - t.second[j * 16u + k]) > 1e-4f) { ++moved; break; }
+                std::fprintf(stderr, "[gow-skelanim] object=%x joints=%x n=%u moved=%u nonfinite=%u j1=%.1f,%.1f,%.1f call=%u\n", object, joints, n, moved, bad,
+                             cur[16 + 12], cur[16 + 13], cur[16 + 14], t.first);
+                t.second = cur;
+            }
+        }
+        static std::set<uint32_t> seen;
+        if (!watched && seen.size() < 600u && seen.insert(object).second)
+            std::fprintf(stderr, "[gow-skel] object=%x skeleton=%x joints=%x count=%u pos=%.1f,%.1f,%.1f\n",
+                         object, skeleton, joints, count, f32(object + 0xA0u), f32(object + 0xA4u), f32(object + 0xA8u));
+        if (watched && (object & 0x01FFFFFFu) == watched && joints)
+        {
+            // GOW_SKEL_DUMP=<file>: append 125 joint matrices (64 bytes each) of the watched object per call.
+            static const char *dumpPath = std::getenv("GOW_SKEL_DUMP");
+            if (dumpPath)
+                if (FILE *df = std::fopen(dumpPath, "ab")) { std::fwrite(rdram + joints, 64, 125, df); std::fclose(df); }
+            if (!(count > 0u && count < 256u)) return;
+            static unsigned calls = 0;
+            if (++calls % 6u != 0u)
+                return;
+            std::fprintf(stderr, "[gow-skel] t=%u yaw", calls);
+            for (uint32_t j = 0; j < count && j < 24u; ++j)
+            {
+                const uint32_t m = joints + j * 64u;
+                std::fprintf(stderr, " %.0f", std::atan2(f32(m + 8u), f32(m)) * 57.29578f);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+
+    // GOW-Port: GOW_CTRL_DIAG=1 wraps the animation controller update 0x116EF0 (this=a0: +8 time, +0xC rate) and every
+    // ~3 s prints, per controller in the animator heap area, calls/time/rate/delta since the last print.
+    void gowDiagController(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t self = GPR_U32(ctx, 4) & 0x01FFFFFFu;
+        auto f32 = [&](uint32_t a) { float v = 0; std::memcpy(&v, rdram + (a & 0x01FFFFFCu), 4); return v; };
+        {
+            static thread_local bool reported = false;
+            if (!reported)
+            {
+                reported = true;
+                std::fprintf(stderr, "[gow-ctrl] host thread %u MXCSR=%08x (rounding mode bits %u)\n", static_cast<unsigned>(std::hash<std::thread::id>()(std::this_thread::get_id()) & 0xFFFFu), _mm_getcsr(), (_mm_getcsr() >> 13) & 3u);
+            }
+        }
+        sub_00116EF0_0x116ef0(rdram, ctx, runtime);
+        struct Info { unsigned calls = 0, lastCalls = 0; float last = 0, rate = 0, prev = 0; };
+        static std::map<uint32_t, Info> info;
+        static unsigned total = 0;
+        Info &i = info[self];
+        ++i.calls; i.last = f32(self + 8u); i.rate = f32(self + 0xCu);
+        {
+            // frame delta (guest 0x29C64C): running stats per print window
+            static float dmin = 1e9f, dmax = 0.f; static double dsum = 0; static unsigned dn = 0;
+            const float d = f32(0x29C64Cu);
+            if (d > 0.f && d < 10.f) { dmin = std::min(dmin, d); dmax = std::max(dmax, d); dsum += d; ++dn; }
+            if (total % 4000u == 3999u && dn)
+            {
+                std::fprintf(stderr, "[gow-delta] min=%.4f max=%.4f mean=%.4f samples=%u\n", dmin, dmax, dsum / dn, dn);
+                dmin = 1e9f; dmax = 0.f; dsum = 0; dn = 0;
+            }
+        }
+        if (++total % 4000u == 0u)
+        {
+            for (auto &kv : info)
+            {
+                if (kv.second.calls == kv.second.lastCalls) continue;
+                std::fprintf(stderr, "[gow-ctrl] %x calls=%u time=%.3f (was %.3f) rate=%.3f\n", kv.first, kv.second.calls - kv.second.lastCalls, kv.second.last, kv.second.prev, kv.second.rate);
+                kv.second.lastCalls = kv.second.calls; kv.second.prev = kv.second.last;
+            }
+        }
+    }
+
+    // GOW-Port: GOW_BLEND_DIAG=1 wraps the pose blend entry 0x110E40 (a0 = blend object): logs each distinct object once
+    // with its mode (+0x58), flags word (*(+0x68)), source pointers (+0x78/+0x7C), joint masks (+0x84/+0x104 halfwords) and count (+0x204).
+    void gowDiagBlend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t self = GPR_U32(ctx, 4) & 0x01FFFFFFu;
+        static std::set<uint32_t> seen;
+        if (seen.size() < 64u && seen.insert(self).second)
+        {
+            auto u16 = [&](uint32_t a) { uint16_t v = 0; std::memcpy(&v, rdram + (a & 0x01FFFFFEu), 2); return v; };
+            const uint32_t flagsPtr = readGuest32(rdram, self + 0x68u) & 0x01FFFFFFu;
+            std::fprintf(stderr, "[gow-blend] %x mode=%u flags=%x src78=%x src7c=%x p60=%x p80=%x cnt204=%x w218=%x masks84:", self, readGuest32(rdram, self + 0x58u), flagsPtr ? readGuest32(rdram, flagsPtr) : 0u,
+                         readGuest32(rdram, self + 0x78u), readGuest32(rdram, self + 0x7Cu), readGuest32(rdram, self + 0x60u), readGuest32(rdram, self + 0x80u), readGuest32(rdram, self + 0x204u), readGuest32(rdram, self + 0x218u));
+            for (uint32_t i = 0; i < 12; ++i) std::fprintf(stderr, " %04x", u16(self + 0x84u + i * 2u));
+            std::fprintf(stderr, " | m104:");
+            for (uint32_t i = 0; i < 12; ++i) std::fprintf(stderr, " %04x", u16(self + 0x104u + i * 2u));
+            std::fprintf(stderr, "\n");
+        }
+        sub_00110E40_0x110e40(rdram, ctx, runtime);
+    }
+
     void gowIpuInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         auto &memory = runtime->memory();
@@ -369,8 +1107,207 @@ namespace
         padReturn(ctx, 0u);
     }
 
+    // GOW-Port: GOW_MOVIE_OVERRIDE=<name>[,<name>...] (debug) plays those movies (e.g. Semo02, BONUS03) instead of the
+    // ones the game loads, one per load: the first replaces the intro, the next ones are started from the title menu by
+    // gowDiagBonusMovie (tools/movies.py plays every movie of the disc in one session this way). 0x188CA0 copies its
+    // name argument (a0) into the movie struct (0x304D10), so the override name is put on the guest stack below sp and
+    // a0 points there; the game's own buffer (the intro's holds 6 characters) is not written.
+    std::vector<std::string> &movieOverrideList()
+    {
+        static std::vector<std::string> list = [] {
+            std::vector<std::string> names;
+            if (const char *value = std::getenv("GOW_MOVIE_OVERRIDE"))
+            {
+                std::string text(value);
+                for (size_t start = 0; start <= text.size();)
+                {
+                    const size_t end = std::min(text.find(',', start), text.size());
+                    if (end > start && end - start <= 31)
+                        names.push_back(text.substr(start, end - start));
+                    start = end + 1;
+                }
+            }
+            return names;
+        }();
+        return list;
+    }
+    size_t g_movieOverrideNext = 0;
+
+    void gowMovieOverrideLoad(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const std::vector<std::string> &list = movieOverrideList();
+        if (g_movieOverrideNext >= list.size())
+        {
+            // GOW_MPEG_DIAG: the movies the game loads itself (tools/movies.py --new-game tells them apart by this line)
+            if (const uint8_t *name = padBuffer(rdram, GPR_U32(ctx, 4), 1))
+                std::fprintf(stderr, "[gow-fmv] load %.31s\n", reinterpret_cast<const char *>(name));
+            sub_00188CA0_0x188ca0(rdram, ctx, runtime);
+            return;
+        }
+        const std::string &override = list[g_movieOverrideNext++];
+        const uint32_t sp = GPR_U32(ctx, 29);
+        const uint32_t name = sp - 32u;
+        uint8_t *buffer = padBuffer(rdram, name, 32);
+        const uint8_t *old = padBuffer(rdram, GPR_U32(ctx, 4), 1);
+        std::fprintf(stderr, "[gow-fmv] override %zu/%zu %s -> %s\n", g_movieOverrideNext, list.size(),
+                     old ? reinterpret_cast<const char *>(old) : "?", override.c_str());
+        std::memset(buffer, 0, 32);
+        std::memcpy(buffer, override.data(), override.size());
+        SET_GPR_U32(ctx, 4, name);
+        SET_GPR_U32(ctx, 29, name);
+        sub_00188CA0_0x188ca0(rdram, ctx, runtime);
+        SET_GPR_U32(ctx, 29, sp);
+    }
+
+    // GOW-Port: GOW_BONUS_MOVIE=<NN> (debug) plays bonus movie NN (BONUS03, 06, 10, 12, 14, 16, 17, 18, 24, 25) from
+    // the main menu the way the Treasures menu does, without unlocking it: its command handler 0x1BA2C8 writes the two
+    // digits into the game's "BonusXX" buffer (0x29CC00) and sets the menu object's movie name (+0x1518) and +0x1520;
+    // the menu update 0x1BA4F8 then starts it with 0x1B2D20(name, 3, 1) and returns to the menu when it ends. The
+    // request is made once, GOW_BONUS_MOVIE_DELAY seconds (default 10) after the menu update first runs. With a
+    // GOW_MOVIE_OVERRIDE list, a request is made each time the movie thread is idle again (3 s after the previous movie
+    // ended) while list entries remain; the load override then plays the next entry instead of the bonus movie.
+    void gowDiagBonusMovie(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const char *movie = [] { const char *v = std::getenv("GOW_BONUS_MOVIE"); return v ? v : "24"; }();
+        static const double delay = [] { const char *v = std::getenv("GOW_BONUS_MOVIE_DELAY"); return v ? std::atof(v) : 10.0; }();
+        static auto readyAt = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                                        std::chrono::duration<double>(delay));
+        static bool done = false, inFlight = false;
+        const bool listMode = movieOverrideList().size() > 1;
+        const uint32_t movieState = readGuest32(rdram, 0x0029C838u);
+        const bool wanted = listMode ? g_movieOverrideNext < movieOverrideList().size() : !done;
+        if (wanted && !inFlight && movieState == 0u && std::chrono::steady_clock::now() >= readyAt)
+        {
+            done = true;
+            uint8_t *name = padBuffer(rdram, 0x0029CC00u, 8);
+            uint8_t *menu = padBuffer(rdram, GPR_U32(ctx, 4), 0x1528);
+            if (name && menu && std::strlen(movie) == 2 && std::memcmp(name, "Bonus", 5) == 0)
+            {
+                name[5] = static_cast<uint8_t>(movie[0]);
+                name[6] = static_cast<uint8_t>(movie[1]);
+                const uint32_t address = 0x0029CC00u, one = 1u;
+                std::memcpy(menu + 0x1518, &address, 4);
+                std::memcpy(menu + 0x1520, &one, 4);
+                inFlight = true;
+                std::fprintf(stderr, "[gow-fmv] bonus request %.7s (menu %08x)\n", reinterpret_cast<char *>(name),
+                             GPR_U32(ctx, 4));
+            }
+        }
+        // movie thread state (0x29C838: 10 loaded, 11 playing, 0 idle) as seen by the menu, for the test scripts
+        static uint32_t lastState = 0u;
+        if (done && movieState != lastState)
+        {
+            std::fprintf(stderr, "[gow-fmv] menu sees movie state %u -> %u\n", lastState, movieState);
+            if (movieState == 0u && inFlight)
+            {
+                inFlight = false;
+                readyAt = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            }
+            lastState = movieState;
+        }
+        sub_001BA4F8_0x1ba4f8(rdram, ctx, runtime);
+    }
+
+    // GOW-Port: the movie thread never blocks: it polls its stream service (0x188B80, called only by the movie
+    // player 0x188848) as fast as it can. Guest time only advances by executed cycles, and the recompiled poll costs
+    // more host time per guest cycle than a real EE, so guest time, the IOP and the movie sound fell to ~0.72x real
+    // time (pictures at ~22 fps instead of 30). Each poll counts the host time that has passed as guest time.
+    // GOW_MPEG_DIAG (debug): the movie's stream reads (0x17AFE0(stream, buffer, size, ...)): size asked, file size and
+    // position, and the size returned, for reads close to the end of the file
+    void gowDiagStreamRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t stream = GPR_U32(ctx, 4), asked = GPR_U32(ctx, 6);
+        const uint32_t size = readGuest32(rdram, stream + 8u), position = readGuest32(rdram, stream + 0xCu);
+        sub_0017AFE0_0x17afe0(rdram, ctx, runtime);
+        // near the end of a file, or every read of a big stream (a movie) with GOW_MPEG_DIAG=2
+        static const bool allReads = [] { const char *v = std::getenv("GOW_MPEG_DIAG"); return v && v[0] == '2'; }();
+        if (size - position < 0x10000u || (allReads && size > 0x100000u))
+            std::fprintf(stderr, "[gow-fmv-read] stream=%x asked=%x size=%x position=%x -> %x flags=%x\n", stream, asked, size,
+                         position, GPR_U32(ctx, 2), readGuest32(rdram, stream + 4u));
+    }
+
+    // GOW_SND_CALLLOG=1 (debug): the game's sound-group pause/continue (0x175148(pause, mask)) with its caller
+    void gowDiagSoundGroups(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::fprintf(stderr, "[gow-snd-groups] pause=%u mask=%04x ra=%x\n", GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 31));
+        sub_00175148_0x175148(rdram, ctx, runtime);
+    }
+
+    // GOW-Port: the movie player's video ring (player struct *0x304F20: +0xE8 base, +0xEC size, +0xF0 write, +0xF4/+0xF8
+    // the block sent to the IPU) treats a write pointer at the ring's end as data: once the IPU block pointer wraps to
+    // the base, "available = write - block end" is the whole ring, so the no-data callback (0x18AAA8) keeps sending
+    // the old ring and never asks for more data, and the movie stops while its sound plays on (P04MP05 after 203
+    // pictures: the demuxed video filled the ring exactly to its end). The end and the base are the same position;
+    // the write pointer is moved to the base before the readers look at it: at the start of the no-data callback
+    // (where "available" is computed) and around the writer (stream callback 0x18A788). Only code before a guest call
+    // is reliable in a wrapper: a call can return early at an EE checkpoint and be finished later through the
+    // original's own slots.
+    void gowNormaliseVideoRing(uint8_t *rdram)
+    {
+        if (const uint32_t movie = readGuest32(rdram, 0x00304F20u); movie != 0u)
+        {
+            const uint32_t base = readGuest32(rdram, movie + 0xE8u), size = readGuest32(rdram, movie + 0xECu);
+            if (size != 0u && readGuest32(rdram, movie + 0xF0u) == base + size)
+                writeGuest32(rdram, movie + 0xF0u, base);
+        }
+    }
+
+    void gowMovieVideoRingWrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == 0x0018A788u) // not a resume inside the original
+            gowNormaliseVideoRing(rdram);
+        sub_0018A788_0x18a788(rdram, ctx, runtime);
+    }
+
+    void gowMovieNodata(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == 0x0018AAA8u)
+            gowNormaliseVideoRing(rdram);
+        sub_0018AAA8_0x18aaa8(rdram, ctx, runtime);
+    }
+
+    void gowMovieStreamService(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // GOW_MPEG_DIAG: once per second, the movie struct words (0x304D10 + 0x80..0x140) that changed, the movie
+        // thread state and the poll's caller (what a stuck player waits for)
+        static const bool diag = std::getenv("GOW_MPEG_DIAG") != nullptr;
+        if (diag)
+        {
+            static auto last = std::chrono::steady_clock::time_point{};
+            static uint32_t previous[0x30] = {};
+            static uint64_t polls = 0;
+            ++polls;
+            if (std::chrono::steady_clock::now() - last > std::chrono::seconds(1))
+            {
+                last = std::chrono::steady_clock::now();
+                std::string changed;
+                for (uint32_t i = 0; i < 0x30u; ++i)
+                {
+                    const uint32_t value = readGuest32(rdram, 0x00304D90u + i * 4u);
+                    if (value != previous[i])
+                    {
+                        char text[32];
+                        std::snprintf(text, sizeof(text), " +%02x=%x", 0x80u + i * 4u, value);
+                        changed += text;
+                        previous[i] = value;
+                    }
+                }
+                std::fprintf(stderr, "[gow-fmv-poll] polls=%llu state=%u ra=%x%s\n", static_cast<unsigned long long>(polls),
+                             readGuest32(rdram, 0x0029C838u), GPR_U32(ctx, 31), changed.c_str());
+            }
+        }
+        runtime->eeScheduler().catchUpToHost(EeScheduler::kEeClockHz / 60u);
+        sub_00188B80_0x188b80(rdram, ctx, runtime);
+    }
+
     void gowSkipMovieReady(uint8_t *, R5900Context *ctx, PS2Runtime *) { padReturn(ctx, 1u); }
     void gowSkipMovieNoop(uint8_t *, R5900Context *ctx, PS2Runtime *) { padReturn(ctx, 0u); }
+    // The level script's movie start request (0x188E80): logged so skipped runs show when a movie would play.
+    void gowSkipMovieStart(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        std::fprintf(stderr, "[gow-fmv] start request skipped (ra=%x)\n", GPR_U32(ctx, 31));
+        padReturn(ctx, 0u);
+    }
 
     void gowDiagFlashReady(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -394,7 +1331,7 @@ namespace
         }
         sub_00100C50_0x100c50(rdram, ctx, runtime);
         static unsigned samples = 0;
-        if (readGuest32(rdram, 0x29E560u) == 4u && ctx->pc == ra && samples++ % 100 == 0)
+        if ((readGuest32(rdram, 0x29E560u) == 4u || readGuest32(rdram, 0x29E560u) == 11u) && ctx->pc == ra && samples++ % 100 == 0)
         {
             float delta = 0;
             std::memcpy(&delta, rdram + 0x29C64Cu, sizeof(delta));
@@ -826,7 +1763,9 @@ namespace
         const uint32_t cmd = GPR_U32(ctx, 4);
         const uint32_t size = GPR_U32(ctx, 5);
         const uint32_t data = GPR_U32(ctx, 6);
-        if (++g_sndCmdCount <= 300)
+        // GOW_SND_CALLLOG=1: every command after the first 300 too, except the stream status poll 0x40
+        static const bool callLog = std::getenv("GOW_SND_CALLLOG") != nullptr;
+        if (++g_sndCmdCount <= 300 || (callLog && cmd != 0x40u))
         {
             if (cmd == 0x68u)
             {
@@ -877,10 +1816,10 @@ namespace
         ctx->pc = GPR_U32(ctx, 31);
     }
 
-    // smpd (SMPD_IOP.IRX) lee GODOFWAR.TOC / PART*.PAK por numero de sector con sceCdRead. Sin imagen de
-    // disco, el IOP monta una ISO virtual con los archivos extraidos; con la ISO original los sectores son
-    // exactamente los del DVD. Orden: variable GOW_ISO, "../God of War.iso" respecto al ELF, o el primer
-    // .iso de la carpeta del ELF.
+    // GOW-Port: no-emulation step 6 (docs/disc.md). The game reads its data from the files extracted next to the ELF
+    // (tools/iso_extract.py --layout: .disc_layout + .disc_meta), each at its original LSN, so smpd's raw sector reads
+    // of GODOFWAR.TOC / PART*.PAK are host file reads (ps2xIOP DiscSource). GOW_ISO=<iso> still selects the original
+    // image explicitly (for comparisons); no .iso is looked for otherwise.
     void configureGowCdImage()
     {
         namespace fs = std::filesystem;
@@ -897,38 +1836,266 @@ namespace
         if (const char *env = std::getenv("GOW_ISO"); env != nullptr && env[0] != '\0')
             image = fs::u8path(env);
 #endif
-        else if (!paths.elfDirectory.empty())
+        if (image.empty())
         {
-            const fs::path sibling = paths.elfDirectory.parent_path() / "God of War.iso";
-            if (fs::is_regular_file(sibling, ec))
-                image = sibling;
-            else
-                for (const auto &entry : fs::directory_iterator(paths.elfDirectory, ec))
-                    if (entry.is_regular_file(ec) && entry.path().extension() == ".iso")
-                    {
-                        image = entry.path();
-                        break;
-                    }
+            const fs::path root = paths.cdRoot.empty() ? paths.elfDirectory : paths.cdRoot;
+            if (!fs::is_regular_file(root / ".disc_layout", ec))
+                std::fprintf(stderr, "[gow-cd] no .disc_layout in %s: extract the disc with tools/iso_extract.py --layout\n",
+                             reinterpret_cast<const char *>(root.u8string().c_str()));
+            return;
         }
-        if (image.empty() || !fs::is_regular_file(image, ec))
+        if (!fs::is_regular_file(image, ec))
         {
-            std::fprintf(stderr, "[gow-cd] sin imagen de disco: el IOP usara la ISO virtual de la carpeta extraida\n");
+            std::fprintf(stderr, "[gow-cd] GOW_ISO is not a file; using the extracted files\n");
             return;
         }
         paths.cdImage = image;
         PS2Runtime::setIoPaths(paths);
         const auto imageUtf8 = image.u8string();
-        std::fprintf(stderr, "[gow-cd] imagen de disco: %s\n", reinterpret_cast<const char *>(imageUtf8.c_str()));
+        std::fprintf(stderr, "[gow-cd] disc image (GOW_ISO): %s\n", reinterpret_cast<const char *>(imageUtf8.c_str()));
     }
+
+    // GOW-Port: no-emulation step 5, GS privileged registers (docs/native-port.md). The game's three functions that
+    // touched them as hardware are native: the display setup becomes a GSDisplayState handed to the presentation,
+    // the GS FINISH interrupt handshake uses the native GS status (runtime/gs/gs_display.h).
+    void gowStore32(uint8_t *rdram, uint32_t addr, uint32_t value) { std::memcpy(rdram + addr, &value, sizeof(value)); }
+    uint64_t gowLoad64(const uint8_t *rdram, uint32_t addr)
+    {
+        uint64_t value;
+        std::memcpy(&value, rdram + addr, sizeof(value));
+        return value;
+    }
+
+    // 0x183360 (vid display setup, called once per frame by 0x1837B8): computes the CRTC setup from the game's video
+    // globals. Same values as the original's register stores, minus the stack garbage it left in unused bits
+    // (and in circuit 1 when circuit 1 is off). GOW_GSREGS_CHECK=1 also runs the original and compares.
+    bool gowComputeDisplay(const uint8_t *rdram, GSDisplayState &s)
+    {
+        const uint32_t flags = readGuest32(rdram, 0x0032F1B4u);     // bit 1: interlaced
+        const uint32_t fieldMode = readGuest32(rdram, 0x00334F5Cu); // FFMD; non-zero = one circuit, no merge
+        const uint32_t fbp = readGuest32(rdram, 0x00331074u) & 0x1FFu;
+        const uint32_t psm = readGuest32(rdram, 0x00331070u) & 0x1Fu;
+        const uint32_t video = readGuest32(rdram, 0x00331078u);     // 0x50: PAL timing
+        const uint32_t width = readGuest32(rdram, 0x002FDD50u);
+        const uint32_t height = readGuest32(rdram, 0x002FDD54u);
+        if (width == 0u)
+            return false; // the original traps (divide by zero): let it run
+        s = {};
+        s.smode2 = ((flags >> 1) & 1u) | ((fieldMode & 1u) << 1);
+        // EN2 + MMOD; without field mode also EN1 with ALP 0x80: both circuits merged 50/50, circuit 1 one line
+        // lower (the menu "Soften" option).
+        s.pmode = 0x22u | (fieldMode == 0u ? 0x8001u : 0u);
+        s.dispfb2 = static_cast<uint64_t>(fbp | (((width >> 6) & 0x3Fu) << 9) | (psm << 15));
+        uint32_t dx, magh, dw, dh;
+        if (video == 0x50u)
+        {
+            magh = 0x60Eu / width;
+            dx = 0x138u;
+            dw = (width * magh - 3u) & 0xFFFu;
+            dh = (height - 1u) & 0x7FFu;
+        }
+        else
+        {
+            magh = (width + 0x9FFu) / width;
+            dx = 0x27Cu;
+            dw = (width * magh - 1u) & 0xFFFu;
+            dh = ((fieldMode != 0u ? height * 2u : height) - 1u) & 0x7FFu;
+        }
+        const uint64_t dy = 0x32u;
+        s.display2 = dx | (dy << 12) | (static_cast<uint64_t>((magh - 1u) & 0xFu) << 23) |
+                     (static_cast<uint64_t>(dw) << 32) | (static_cast<uint64_t>(dh) << 44);
+        if (s.pmode & 1u)
+        {
+            s.dispfb1 = s.dispfb2 | (1ull << 43); // DBY 1
+            s.display1 = (s.display2 & ~(0x7FFull << 44)) | (static_cast<uint64_t>((dh - 1u) & 0x7FFu) << 44);
+        }
+        s.bgcolor = 0u;
+        return true;
+    }
+
+    void gowDisplaySetup(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool check = [] { const char *v = std::getenv("GOW_GSREGS_CHECK"); return v && v[0] == '1'; }();
+        GSDisplayState state;
+        if (!gowComputeDisplay(rdram, state))
+        {
+            sub_00183360_0x183360(rdram, ctx, runtime);
+            return;
+        }
+        if (check)
+        {
+            const uint32_t ra = GPR_U32(ctx, 31);
+            sub_00183360_0x183360(rdram, ctx, runtime); // writes through the register path
+            const GSDisplayState hw = ps2_gs_display::display(runtime->memory());
+            static int reports = 0;
+            const uint64_t fb = 0x3FFFFF000FFFFFull, dm = 0x007FFFFF1FFFFFFFull; // DISPFB/DISPLAY defined fields
+            const bool c1 = (state.pmode & 1u) != 0u;
+            const bool same = (hw.pmode & 0xFFFFu) == state.pmode && (hw.smode2 & 3u) == state.smode2 &&
+                              (hw.dispfb2 & fb) == state.dispfb2 && (hw.display2 & dm) == state.display2 &&
+                              (hw.bgcolor & 0xFFFFFFu) == state.bgcolor &&
+                              (!c1 || ((hw.dispfb1 & fb) == state.dispfb1 && (hw.display1 & dm) == state.display1));
+            if (!same || reports < 3)
+            {
+                if (reports++ < 40)
+                    std::fprintf(stderr, "[gsregs-check] %s pmode %llx/%llx smode2 %llx/%llx fb1 %llx/%llx d1 %llx/%llx fb2 %llx/%llx d2 %llx/%llx\n",
+                                 same ? "same" : "DIFF", (unsigned long long)hw.pmode, (unsigned long long)state.pmode,
+                                 (unsigned long long)hw.smode2, (unsigned long long)state.smode2, (unsigned long long)hw.dispfb1,
+                                 (unsigned long long)state.dispfb1, (unsigned long long)hw.display1, (unsigned long long)state.display1,
+                                 (unsigned long long)hw.dispfb2, (unsigned long long)state.dispfb2, (unsigned long long)hw.display2,
+                                 (unsigned long long)state.display2);
+            }
+            SET_GPR_U32(ctx, 31, ra);
+        }
+        ps2_gs_display::setDisplay(runtime->memory(), state);
+        SET_GPR_U64(ctx, 2, 0u); // the original returned stack garbage; its only caller (0x1837B8 <- 0x17A128) ignores it
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    // 0x182DD8: GS interrupt (INTC 0) handler, installed by 0x182E88 with FINISH unmasked. On FINISH it sets the
+    // game's "GS done" flag (0x29C7D0 = 2, read by vid::WaitForDMAComplete), optionally samples timer 0 for the GPU
+    // time statistic, acknowledges FINISH and returns 0 with interrupts enabled.
+    void gowGsFinishHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        PS2Memory &memory = runtime->memory();
+        if (ps2_gs_display::finishPending(memory))
+        {
+            gowStore32(rdram, 0x0029C7D0u, 2u);
+            if (readGuest32(rdram, 0x0032F1B4u) & 4u)
+            {
+                const uint32_t now = runtime->memory().eeTimerLoad(0x10000000u); // native EE clock, timer 0
+                if (now < readGuest32(rdram, 0x002C7908u))
+                {
+                    const uint64_t wraps = gowLoad64(rdram, 0x00303628u) + 0x10000u;
+                    std::memcpy(rdram + 0x00303628u, &wraps, sizeof(wraps));
+                }
+                const uint32_t total = static_cast<uint32_t>(gowLoad64(rdram, 0x00303628u) + now);
+                gowStore32(rdram, 0x002C7908u, now);
+                gowStore32(rdram, 0x0029C66Cu, total - readGuest32(rdram, 0x00334F54u));
+            }
+            ps2_gs_display::ackFinish(memory);
+        }
+        ctx->cop0_status |= 0x10000u; // ei
+        SET_GPR_U64(ctx, 2, 0u);
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    // 0x182E88: installs that handler. Same kernel calls as the original (AddIntcHandler(0, 0x182DD8, 0),
+    // EnableIntc(0), GsPutIMR(GsGetIMR() & ~FINISHMSK)); the CSR store clearing a stale FINISH is the native ack.
+    void gowGsFinishInstall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        auto call = [&](uint32_t address)
+        {
+            SET_GPR_U32(ctx, 31, ra);
+            ctx->pc = address;
+            if (PS2Runtime::RecompiledFunction fn = runtime->lookupFunction(address))
+                fn(rdram, ctx, runtime);
+            if (ctx->pc != ra)
+                std::fprintf(stderr, "[gsregs] call %08x did not return (pc=%08x)\n", address, ctx->pc);
+        };
+        SET_GPR_U64(ctx, 4, 0u);
+        SET_GPR_U64(ctx, 5, 0x00182DD8u);
+        SET_GPR_U64(ctx, 6, 0u);
+        call(0x00293900u); // AddIntcHandler
+        gowStore32(rdram, 0x0029C7C0u, GPR_U32(ctx, 2));
+        ps2_gs_display::ackFinish(runtime->memory());
+        SET_GPR_U64(ctx, 4, 0u);
+        call(0x00294690u); // EnableIntc
+        call(0x00279E30u); // GsGetIMR
+        SET_GPR_U64(ctx, 4, GPR_U64(ctx, 2) & ~0x200ull);
+        call(0x00279DF0u); // GsPutIMR
+        SET_GPR_U32(ctx, 31, ra);
+        ctx->pc = ra;
+    }
+
+    // ---- GOW-Port: no-emulation, EE timer 2 (docs/native-port.md "EE timers") ----
+    // libkernel's timer system (InitTimer + StartTimerSystemTime from _InitSys, SetTimerAlarm and the timer-2
+    // interrupt handler cbTimerHandler) serves only DelayThread in this game. DelayThread is a native scheduler
+    // delay and the timer system starts without timer 2, so no game code programs or reads timer 2.
+
+    // 0x294A30 DelayThread(usec): the original waits on a semaphore signalled by a timer alarm. Same result
+    // (0, or KE_CAN_NOT_WAIT 0x80008008 with interrupts disabled), the thread sleeps usec of guest time.
+    void gowDelayThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = GPR_U32(ctx, 31);
+        if ((ctx->cop0_status & 0x10000u) == 0u)
+        {
+            SET_GPR_S32(ctx, 2, static_cast<int32_t>(0x80008008u));
+            return;
+        }
+        const uint64_t usec = GPR_U32(ctx, 4);
+        runtime->eeScheduler().delayCurrent(usec * EeScheduler::kEeClockHz / 1000000u); // resumes with v0 = 0
+    }
+
+    // 0x2998C0 InitTimer(prescale) and 0x299A20 StartTimerSystemTime(), called once each by _InitSys (0x2994A0):
+    // success without programming timer 2 or installing its interrupt handler.
+    void gowTimerSystemNoop(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        SET_GPR_U64(ctx, 2, 0u);
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+    // ---- end EE timer 2 ----
 
     void applyGowOverrides(PS2Runtime &runtime)
     {
+        // GOW-Port: GOW_THREAD_WATCH=<s> (debug): every <s> seconds a host thread prints the EE threads (status, wait,
+        // pc, ra) from the scheduler's snapshot, so a guest that blocks for good (no frames, no pad polls, where
+        // GOW_THREAD_DUMP never fires) still shows where each thread waits
+        if (const char *watch = std::getenv("GOW_THREAD_WATCH"))
+        {
+            const double period = std::max(1.0, std::atof(watch));
+            std::thread([&runtime, period] {
+                for (;;)
+                {
+                    std::this_thread::sleep_for(std::chrono::duration<double>(period));
+                    const EeKernelSnapshot snapshot = runtime.eeScheduler().snapshot();
+                    std::fprintf(stderr, "[gow-threads] watch running=%d cycle=%llu\n", snapshot.runningThreadId,
+                                 static_cast<unsigned long long>(snapshot.eeCycle));
+                    for (const EeThreadSnapshot &t : snapshot.threads)
+                        std::fprintf(stderr, "[gow-threads]   id=%d prio=%d status=%d wait=%d/%d pc=%08x ra=%08x\n", t.id,
+                                     t.currentPriority, int(t.status), int(t.waitReason), t.waitId, t.pc, t.ra);
+                    // the movie player struct (*0x304F20) words +0xE8..+0x15C, when a movie is loaded
+                    const uint8_t *ram = runtime.memory().getRDRAM();
+                    const auto word = [ram](uint32_t a) { uint32_t v; std::memcpy(&v, ram + (a & 0x01FFFFFFu), 4); return v; };
+                    if (const uint32_t movie = word(0x304F20u); movie != 0u)
+                    {
+                        std::string text;
+                        for (uint32_t off = 0xE8u; off < 0x160u; off += 4u)
+                        {
+                            char item[24];
+                            std::snprintf(item, sizeof(item), " +%x=%x", off, word(movie + off));
+                            text += item;
+                        }
+                        std::fprintf(stderr, "[gow-threads]   movie=%x%s\n", movie, text.c_str());
+                    }
+                }
+            }).detach();
+        }
         configureGowCdImage();
         gow_gs_replay::configure(runtime.memory(),runtime.gs());
         // El heap interno del runtime va bajo el ELF (memoria libre) para no pisar el heap propio del juego,
         // que este crea con SetupHeap al final del .bss (patches/ps2recomp-heap.patch).
         runtime.setPrivateGuestHeap(0x000A0000u, 0x000FF000u);
         runtime.replaceFunction(0x00279600u, gowIpuInit);
+        runtime.replaceFunction(0x0028C0C8u, gowRand);
+        runtime.replaceFunction(0x0014C278u, gowOperatorNew);         // object guard (heap_guard)
+        runtime.replaceFunction(0x0014C2F0u, gowOperatorDelete);
+        runtime.replaceFunction(0x00147520u, gowGuardTimelineChannels);
+        runtime.replaceFunction(0x0023B6A0u, gowGuardNodeDestructor);
+        runtime.replaceFunction(0x00149340u, gowGuardCloneList);
+        if (std::getenv("GOW_FLASHQ_WATCH"))
+        {
+            runtime.replaceFunction(0x00146158u, gowFlashQueueDrain);
+            runtime.replaceFunction(0x001460C0u, gowFlashQueueAppend);
+        }
+        if (std::getenv("GOW_CTRL_DIAG"))
+            runtime.replaceFunction(0x00116EF0u, gowDiagController);
+        if (std::getenv("GOW_BLEND_DIAG"))
+            runtime.replaceFunction(0x00110E40u, gowDiagBlend);
+        if (std::getenv("GOW_HEAP_ZERO"))
+            runtime.replaceFunction(0x0013DC78u, gowHeapZeroAlloc);
+        if (std::getenv("GOW_SKEL_DIAG") || std::getenv("GOW_SKEL_OBJECT") || std::getenv("GOW_SKEL_ANIM"))
+            runtime.replaceFunction(0x00157A60u, gowDiagCalcWorldMatrix);
         if (std::getenv("GOW_PATH_DIAG") || std::getenv("GOW_ANM_DIAG") || std::getenv("GOW_FAST_BOOT"))
         {
             runtime.replaceFunction(0x001B2390u, gowDiagFlashReady);
@@ -938,10 +2105,24 @@ namespace
         if (const char *skip = std::getenv("GOW_SKIP_FMV"); skip && std::strcmp(skip, "1") == 0)
         {
             runtime.replaceFunction(0x00188CA0u, gowSkipMovieLoad);
-            runtime.replaceFunction(0x00188E80u, gowSkipMovieNoop);
+            runtime.replaceFunction(0x00188E80u, gowSkipMovieStart);
             runtime.replaceFunction(0x00188ED8u, gowSkipMovieReady);
             runtime.replaceFunction(0x00188EF0u, gowSkipMovieReady);
             runtime.replaceFunction(0x00188F20u, gowSkipMovieNoop);
+        }
+        else
+        {
+            runtime.replaceFunction(0x00188B80u, gowMovieStreamService);
+            runtime.replaceFunction(0x0018A788u, gowMovieVideoRingWrite);
+            runtime.replaceFunction(0x0018AAA8u, gowMovieNodata);
+            if (std::getenv("GOW_MOVIE_OVERRIDE") || std::getenv("GOW_MPEG_DIAG"))
+                runtime.replaceFunction(0x00188CA0u, gowMovieOverrideLoad);
+            if (std::getenv("GOW_BONUS_MOVIE") || movieOverrideList().size() > 1)
+                runtime.replaceFunction(0x001BA4F8u, gowDiagBonusMovie);
+            if (std::getenv("GOW_SND_CALLLOG"))
+                runtime.replaceFunction(0x00175148u, gowDiagSoundGroups);
+            if (std::getenv("GOW_MPEG_DIAG"))
+                runtime.replaceFunction(0x0017AFE0u, gowDiagStreamRead);
         }
         if (std::getenv("GOW_RENDER_DIAG"))
             for (const uint32_t address : {0x001262C8u, 0x00126310u, 0x0012633Cu, 0x00126368u,
@@ -963,6 +2144,12 @@ namespace
         }
         runtime.replaceFunction(0x00180E50u, gowDiagPathSelect);
         runtime.replaceFunction(0x00180D08u, gowDiagAttachNode);
+        runtime.replaceFunction(0x00183360u, gowDisplaySetup);
+        runtime.replaceFunction(0x00182DD8u, gowGsFinishHandler);
+        runtime.replaceFunction(0x00182E88u, gowGsFinishInstall);
+        runtime.replaceFunction(0x00294A30u, gowDelayThread);     // EE timer 2: native DelayThread
+        runtime.replaceFunction(0x002998C0u, gowTimerSystemNoop); // InitTimer
+        runtime.replaceFunction(0x00299A20u, gowTimerSystemNoop); // StartTimerSystemTime
         runtime.replaceFunction(0x0027B7E8u, gowPad2Init);
         runtime.replaceFunction(0x0027B828u, gowPad2Init);
         runtime.replaceFunction(0x0027B890u, gowPad2CreateSocket);
@@ -971,6 +2158,7 @@ namespace
         runtime.replaceFunction(0x0027BAC8u, gowPad2GetButtonProfile);
         runtime.replaceFunction(0x0027BB98u, gowPad2GetState);
         runtime.replaceFunction(0x0027BF90u, gowVibGetProfile);
+        runtime.replaceFunction(0x0027C010u, gowVibSetActParam);
         // El recompilador descarta estas dos funciones porque empiezan en el delay slot
         // de un "jr ra" suelto de la funcion anterior.
         const bool a = ps2_game_overrides::bindAddressHandler(runtime, 0x00296C48u, "sceSifInitRpc");

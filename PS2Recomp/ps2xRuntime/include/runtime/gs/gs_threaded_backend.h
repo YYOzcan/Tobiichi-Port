@@ -6,6 +6,7 @@
 #include "runtime/gs/gs_backend_state.h"
 
 #include <condition_variable>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -22,7 +23,6 @@ public:
 
     static std::unique_ptr<GSRasterBackend> MakeDefault();
     static void SetEnabledByDefault(bool enabled);
-    static void SetGpuByDefault(bool enabled);
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
@@ -37,6 +37,7 @@ public:
     void TextureFlush() override;
     void Sync(GSSyncReason reason) override;
     PresentationFrame Present(const GSPresentationRequest &request) override;
+    bool UsesSharedPresentation() const override { return m_sharedPresentation.load(std::memory_order_acquire); }
 
     bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
     uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
@@ -76,6 +77,8 @@ private:
     void Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBatch &draw);
 
     std::unique_ptr<GSRasterBackend> m_inner;
+    // GOW-Port: publicado por el worker tras Initialize, sin consultar GL desde el host.
+    std::atomic<bool> m_sharedPresentation{false};
 
     mutable std::mutex m_producerMutex;
     std::vector<uint8_t> m_open;

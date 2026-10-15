@@ -34,9 +34,6 @@ namespace ps2x::iop::detail
         void raiseException(IopCpuState &cpu, uint32_t code, uint32_t faultPc, bool delaySlot, std::optional<uint32_t> badAddress = std::nullopt) const;
 
     private:
-        static void writeRegister(IopCpuState &cpu, uint32_t reg, uint32_t value, uint32_t &writtenReg);
-        static void scheduleLoad(uint32_t reg, uint32_t value, bool &scheduled, uint32_t &scheduledReg, uint32_t &scheduledValue);
-
         IopMemory &m_memory;
     };
 }

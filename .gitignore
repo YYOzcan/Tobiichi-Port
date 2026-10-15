@@ -61,3 +61,9 @@ build_generar_vu1
 
 # Oyun microcodigo generado (se regenera con tools/vu1/generar_vu1.cpp)
 PS2Recomp/ps2xRuntime/src/vu1_compiled/programa*.cpp
+
+# Enlaces locales a los datos del juego (árbol Ultimate)
+/IOP_MOD
+/capturas_vu1
+/Mcd001.ps2
+/disc/

@@ -27,6 +27,10 @@ namespace ps2x::iop
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
         void runEeCycles(uint64_t eeCycles) noexcept;
+        // runEeCycles split in two so the caller can time only the real IOP work: accrue returns true when a batch
+        // is due, then runPendingEeCycles runs it (same result as runEeCycles).
+        [[nodiscard]] bool accrueEeCycles(uint64_t eeCycles) noexcept;
+        void runPendingEeCycles() noexcept;
 
         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;

@@ -5,129 +5,15 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <cassert>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 
-void gowCountGuestFrame(uint32_t pc, const uint8_t *rdram); // GOW-Port: ps2_runtime.cpp (contador del panel F1)
-// GOW-Port: GOW_FRAME_DIAG=1: por cuadro del juego, ciclos del EE emulados, VBlanks, espera de ritmo (el EE va por
-// delante del reloj y espera al VBlank) y ciclos añadidos al ir por detrás (VBlank al reloj real).
-namespace
-{
-    std::atomic<uint64_t> g_frameDiagPacingNs{0};
-    std::atomic<uint64_t> g_frameDiagCatchUp{0};
-    bool frameDiag()
-    {
-        static const bool on = [] { const char *v = std::getenv("GOW_FRAME_DIAG"); return v && v[0] == '1'; }();
-        return on;
-    }
-}
-extern std::atomic<uint64_t> g_gowGuestFrames; // GOW-Port: ps2_runtime.cpp (contador de cuadros del juego)
-
-// GOW-Port: pantalla panorámica de God of War (SCUS-97399), a partir del parche "Widescreen 16:9" de PCSX2
-// (nemesis2000 y CRASHARKI). La proyección de la cámara (sub_00169238) y la lectura del indicador panorámico
-// del reproductor de vídeo (0x21E4F0) se cambian al recompilar (config/recomp.template.toml) y leen dos palabras
-// de la memoria del núcleo que el juego no usa y que escribe el runtime antes de arrancar y en cada VBlank:
-//   0x7F00 (float) F: la proyección multiplica el campo de visión horizontal por F * aspecto (0x32F1B0).
-//   0x7F04: indicador panorámico que recibe el reproductor de vídeo.
-// Sin TOBIICHI_PANORAMICO, F * aspecto = 1 exacto (0,75 * 4/3 o 0,5625 * 16/9) y el vídeo recibe el indicador
-// del juego (0x29CC90): mismo resultado que el código original. Con TOBIICHI_PANORAMICO=16:9 (16:10, 21:9, un
-// número...), en cada VBlank y como el parche: aspecto A en 0x32F1B0 y en los dos modos de pantalla
-// (0x2FD930/0x2FD968), indicador del juego 0x29CC90 = 1, 0x304D94 = 2 y vídeos sin modo panorámico; F = 0,75
-// (Hor+: se ve más a los lados) salvo con el fondo del menú (0x29CC50 = 1), donde F = 1/A (recorte vertical).
-void gowTrucosVBlank(uint8_t *rdram); // GOW-Port: gow_trucos.cpp
-
-float gowAspectoPanoramico()
-{
-    static const float aspect = []
-    {
-        const char *value = std::getenv("TOBIICHI_PANORAMICO");
-        if (!value || !*value)
-            return 0.0f;
-        float width = 0.0f, height = 0.0f;
-        float result = 0.0f;
-        if (std::sscanf(value, "%f:%f", &width, &height) == 2 && width > 0.0f && height > 0.0f)
-            result = width / height;
-        else
-            result = std::strtof(value, nullptr);
-        return result >= 1.0f && result <= 4.0f ? result : 0.0f;
-    }();
-    return aspect;
-}
+void gowIntegracionVBlank(uint8_t *rdram); // GOW-Port: gow_integracion.cpp
 
 namespace
 {
-    void gowPanoramicoVBlank(uint8_t *rdram)
-    {
-        if (!rdram)
-            return;
-        const auto read32 = [rdram](uint32_t address)
-        {
-            uint32_t value = 0u;
-            std::memcpy(&value, rdram + address, sizeof(value));
-            return value;
-        };
-        const auto write32 = [rdram](uint32_t address, uint32_t value) { std::memcpy(rdram + address, &value, sizeof(value)); };
-        const auto floatBits = [](float value)
-        {
-            uint32_t bits = 0u;
-            std::memcpy(&bits, &value, sizeof(bits));
-            return bits;
-        };
-        const float target = gowAspectoPanoramico();
-        float factor = 0.75f;
-        if (target > 0.0f)
-        {
-            const uint32_t bits = floatBits(target);
-            write32(0x32F1B0u, bits);
-            write32(0x2FD930u, bits);
-            write32(0x2FD968u, bits);
-            rdram[0x29CC90u] = 1u;
-            write32(0x304D94u, 2u);
-            write32(0x7F04u, 0u);
-            uint16_t menuBackground = 0u;
-            std::memcpy(&menuBackground, rdram + 0x29CC50u, sizeof(menuBackground));
-            if (menuBackground == 1u)
-                factor = 1.0f / target;
-        }
-        else
-        {
-            const uint32_t bits = read32(0x32F1B0u);
-            float aspect = 0.0f;
-            std::memcpy(&aspect, &bits, sizeof(aspect));
-            if (bits == 0x3FE38E39u) // 16/9: modo panorámico del propio juego
-                factor = 0.5625f;
-            else if (bits != 0x3FAAAAABu && aspect > 0.5f && aspect < 4.0f) // 4/3 o aún sin escribir: 0,75
-                factor = 1.0f / aspect;
-            write32(0x7F04u, read32(0x29CC90u));
-        }
-        write32(0x7F00u, floatBits(factor));
-    }
-}
-
-namespace
-{
-    // GOW-Port: GOW_VBLANK_REALTIME=1 ata el VBlank al reloj del host. Normalmente un VBlank espera a la vez a
-    // su ciclo del EE y a su hora del host, así que con el juego a 20 cuadros/s solo hay ~20 VBlank por segundo
-    // y todo (lógica, animaciones, sonido) va a cámara lenta. Con la variable, si llega la hora de un VBlank y
-    // el EE va por detrás, se adelantan los ciclos del EE (temporizadores e IOP incluidos) hasta él: el tiempo
-    // emulado sigue al real y el juego pierde cuadros en vez de ralentizarse.
-    bool vblankRealtime()
-    {
-        static const bool on = [] {
-            const char *value = std::getenv("GOW_VBLANK_REALTIME");
-            return value && value[0] == '1';
-        }();
-        return on;
-    }
-    // Hora del host (ns de steady_clock) del próximo VBlankStart; la consulta checkpointDue al acabar cada rodaja.
-    std::atomic<int64_t> g_realtimeVblankNs{std::numeric_limits<int64_t>::max()};
-    constexpr auto kRealtimeMaxLag = std::chrono::milliseconds(200); // más atrás: se descartan VBlank (cargas)
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -170,41 +56,7 @@ namespace
     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
-
-    inline std::chrono::microseconds getVBlankPeriod()
-    {
-        static const auto period = []() {
-            const char *fpsEnv = std::getenv("GOW_TARGET_FPS");
-            const char *unlocked = std::getenv("GOW_UNLOCKED_FPS");
-            int fps = 60;
-            if (fpsEnv && fpsEnv[0] != '\0')
-            {
-                fps = std::atoi(fpsEnv);
-            }
-            else if (unlocked && (unlocked[0] == '1' || unlocked[0] == 'u' || unlocked[0] == 'U'))
-            {
-                fps = 120;
-            }
-            fps = std::clamp(fps, 15, 360);
-            return std::chrono::microseconds(1000000 / fps);
-        }();
-        return period;
-    }
-
-    inline uint64_t getVBlankPeriodCycles()
-    {
-        static const uint64_t cycles = microsecondsToEeCycles(static_cast<uint64_t>(getVBlankPeriod().count()));
-        return cycles;
-    }
-
-    inline bool isUnlockedFps()
-    {
-        static const bool unlocked = []() {
-            const char *val = std::getenv("GOW_UNLOCKED_FPS");
-            return val && (val[0] == '1' || val[0] == 'u' || val[0] == 'U');
-        }();
-        return unlocked;
-    }
+    constexpr uint64_t kPaceSteps = 16u; // pacing points per field (see VBlankStart)
 
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
@@ -238,7 +90,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
 {
     m_executorThread = std::this_thread::get_id();
     m_rdram = rdram;
-    gowPanoramicoVBlank(rdram); // GOW-Port: F y el indicador de vídeo listos antes del primer cuadro
+    gowIntegracionVBlank(rdram); // GOW-Port: factor panorámico listo antes del primer cuadro
     m_readyQueues = {};
     m_threads.clear();
     m_semaphores.clear();
@@ -299,8 +151,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
-    scheduleEvent(m_eeCycle + getVBlankPeriodCycles(),
-                  std::chrono::steady_clock::now() + getVBlankPeriod(),
+    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
+                  std::chrono::steady_clock::now() + kVBlankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
 }
@@ -450,8 +302,7 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
-            ps2_perf::guestEntry(context.pc);
-            gowCountGuestFrame(context.pc, m_rdram);
+            ps2_perf::guestEntry(context.pc, m_rdram);
             loadSharedVu0Random(context);
             function(m_rdram, &context, &m_runtime);
             saveSharedVu0Random(context);
@@ -515,23 +366,6 @@ void EeScheduler::postEvent(EeEvent event)
 
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
-    // GOW-Port: GOW_EE_CICLOS=N (por ciento, 100 por defecto): escala los ciclos que cobra el código del juego
-    // (32 por vuelta de bucle y 8 por llamada: una estimación gruesa). Como el VBlank va al reloj real
-    // (GOW_VBLANK_REALTIME), cobrar menos no acelera el juego: el EE hace más trabajo por VBlank y, si va por
-    // detrás del reloj, el tiempo emulado se pone al día (EE, temporizadores e IOP). Es el "EE cycle rate" de
-    // PCSX2: con 100, partidas que caben en un VBlank del host se contaban como dos y el juego iba a 30 cuadros/s.
-    static const uint32_t percent = [] {
-        const char *value = std::getenv("GOW_EE_CICLOS");
-        const long parsed = value ? std::strtol(value, nullptr, 10) : 100;
-        return static_cast<uint32_t>(std::clamp<long>(parsed, 10, 400));
-    }();
-    if (percent != 100u)
-    {
-        static uint64_t remainder = 0; // solo el hilo ejecutor del EE cobra ciclos
-        const uint64_t scaled = static_cast<uint64_t>(cycles) * percent + remainder;
-        cycles = static_cast<uint32_t>(scaled / 100u);
-        remainder = scaled % 100u;
-    }
     accountCycles(cycles);
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
@@ -552,14 +386,6 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return false;
     }
 
-    if (vblankRealtime() &&
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() >=
-            g_realtimeVblankNs.load(std::memory_order_relaxed))
-    {
-        m_checkpointPending.store(true, std::memory_order_release); // processDueDeadlines adelanta el EE
-        return true;
-    }
-
     const GuestThread *running = currentThread();
     if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
     {
@@ -576,47 +402,38 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
     m_eeCycle += elapsed;
-    if (frameDiag()) [[unlikely]]
-    {
-        // GOW-Port: GOW_FRAME_DIAG. El cuadro lo marca gowCountGuestFrame (salto al PC del cuadro); aquí se mira
-        // si cambió el contador y se acumulan ciclos emulados y VBlanks por cuadro.
-        static uint64_t lastFrames = 0, lastCycle = 0, lastTick = 0, cyclesSum = 0, ticksSum = 0;
-        static unsigned frames = 0;
-        static auto window = std::chrono::steady_clock::now();
-        const uint64_t f = g_gowGuestFrames.load(std::memory_order_relaxed);
-        if (f != lastFrames)
-        {
-            const uint64_t tick = currentVSyncTick();
-            if (lastFrames != 0u)
-            {
-                cyclesSum += m_eeCycle - lastCycle;
-                ticksSum += tick - lastTick;
-                frames += static_cast<unsigned>(f - lastFrames);
-            }
-            lastFrames = f;
-            lastCycle = m_eeCycle;
-            lastTick = tick;
-            const auto now = std::chrono::steady_clock::now();
-            const double wall = std::chrono::duration<double>(now - window).count();
-            if (wall >= 1.0)
-            {
-                std::fprintf(stderr, "[gow-frame] cuadros=%u ciclos/cuadro=%.2fM vblank/cuadro=%.2f ritmo_ms/s=%.0f "
-                                     "alcance_Mciclos/s=%.2f (VBlank=%.2fM ciclos)\n",
-                             frames, frames ? cyclesSum / 1e6 / frames : 0.0, frames ? static_cast<double>(ticksSum) / frames : 0.0,
-                             g_frameDiagPacingNs.exchange(0) / 1e6 / wall, g_frameDiagCatchUp.exchange(0) / 1e6 / wall,
-                             getVBlankPeriodCycles() / 1e6);
-                frames = 0;
-                cyclesSum = ticksSum = 0;
-                window = now;
-            }
-        }
-    }
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
     if (m_pendingEeTimerInterrupts != 0u)
     {
         m_checkpointPending.store(true, std::memory_order_release);
     }
+}
+
+uint64_t EeScheduler::catchUpToHost(uint64_t maxCycles) noexcept
+{
+    uint64_t target = 0u;
+    {
+        std::lock_guard lock(m_eventMutex);
+        const auto now = std::chrono::steady_clock::now();
+        for (const ScheduledEvent &item : m_deadlines)
+        {
+            if (item.hostDeadline <= now && item.deadlineCycle > m_eeCycle && item.deadlineCycle > target)
+                target = item.deadlineCycle; // the latest event that is already due on the host clock
+        }
+    }
+    if (target <= m_eeCycle)
+        return 0u;
+    uint64_t missing = std::min(target - m_eeCycle, maxCycles);
+    const uint64_t added = missing;
+    while (missing != 0u)
+    {
+        const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(missing, 0x40000000u));
+        accountCycles(step);
+        missing -= step;
+    }
+    m_checkpointPending.store(true, std::memory_order_release);
+    return added;
 }
 
 bool EeScheduler::isExecutingGuest() const noexcept
@@ -1298,6 +1115,19 @@ int EeScheduler::setAlarm(uint16_t ticks,
                   std::chrono::steady_clock::now() + std::chrono::microseconds(tickCount * kAlarmTickMicroseconds),
                   EeEvent{EeEventType::Alarm, static_cast<uint32_t>(id), 0});
     return id;
+}
+
+void EeScheduler::delayCurrent(uint64_t cycles)
+{
+    assertExecutor();
+    // A wake-up event at the deadline, like the timer alarm the guest's DelayThread used. The token names this one
+    // wait (deadline + thread), so a stale event of an earlier, released delay cannot wake a later one.
+    constexpr uint32_t kDelayWaitType = 2u;
+    const uint64_t deadline = m_eeCycle + std::max<uint64_t>(1u, cycles);
+    const uint64_t token = (deadline << 8) | static_cast<uint64_t>(m_currentThreadId & 0xFF);
+    scheduleEvent(deadline, std::chrono::steady_clock::now() + eeCyclesToHostDuration(deadline - m_eeCycle),
+                  EeEvent{EeEventType::ExternalWake, kDelayWaitType, token});
+    waitExternal(EeWaitReason::External, kDelayWaitType, token);
 }
 
 int EeScheduler::cancelAlarm(int id)
@@ -2039,27 +1869,6 @@ void EeScheduler::processDueDeadlines()
                 }
             }
 
-            uint64_t catchUp = 0u;
-            if (vblankRealtime())
-            {
-                for (const ScheduledEvent &item : m_deadlines)
-                    if (item.event.type == EeEventType::VBlankStart && item.deadlineCycle > m_eeCycle && item.hostDeadline <= now)
-                        catchUp = std::max<uint64_t>(catchUp, item.deadlineCycle - m_eeCycle);
-            }
-            if (catchUp != 0u)
-            {
-                if (frameDiag())
-                    g_frameDiagCatchUp.fetch_add(catchUp, std::memory_order_relaxed);
-                lock.unlock();
-                while (catchUp != 0u)
-                {
-                    const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(catchUp, std::numeric_limits<uint32_t>::max()));
-                    accountCycles(step);
-                    catchUp -= step;
-                }
-                continue; // ahora el VBlank vence también por ciclos
-            }
-
             if (pacingDeadline == std::chrono::steady_clock::time_point{})
             {
                 updateNextDeadline();
@@ -2068,13 +1877,11 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
+                // GOW-Port: sleeping until the host VBlank/timer deadline is waiting, not EE work (ee_ms).
+                ps2_perf::Scope waitPerf(ps2_perf::Bucket::GuestWait);
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
-                if (frameDiag())
-                    g_frameDiagPacingNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                      std::chrono::steady_clock::now() - now).count()),
-                                                  std::memory_order_relaxed);
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
                 {
                     updateNextDeadline();
@@ -2119,14 +1926,39 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                // GOW-Port: GOW_VBLANK_DIAG=1 prints the guest VBlank rate and how far the host deadline lags
+                // behind the wall clock (a lag means VBlanks are cycle-paced and can run faster than 60 Hz).
+                static const bool vblankDiag = std::getenv("GOW_VBLANK_DIAG") != nullptr;
+                if (vblankDiag)
+                {
+                    static uint64_t count = 0;
+                    static auto windowStart = std::chrono::steady_clock::now();
+                    ++count;
+                    const auto wall = std::chrono::steady_clock::now();
+                    const double secs = std::chrono::duration<double>(wall - windowStart).count();
+                    if (secs >= 5.0)
+                    {
+                        std::fprintf(stderr, "[vblank-diag] rate=%.2f Hz host_lag_ms=%.1f\n", count / secs,
+                                     std::chrono::duration<double, std::milli>(wall - scheduled.hostDeadline).count());
+                        count = 0;
+                        windowStart = wall;
+                    }
+                }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                auto nextHost = scheduled.hostDeadline + getVBlankPeriod();
-                if (vblankRealtime() && nextHost + kRealtimeMaxLag < std::chrono::steady_clock::now())
-                    nextHost = std::chrono::steady_clock::now(); // muy atrás (carga): no recuperar cada VBlank perdido
-                scheduleEvent(scheduled.deadlineCycle + getVBlankPeriodCycles(), nextHost,
+                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+                              scheduled.hostDeadline + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
+                // GOW-Port: pacing points on the VBlank grid (cycle and host deadline in lockstep, no-op event). The
+                // guest clock may not run ahead of the wall clock by more than 1/16 field inside a frame: recompiled
+                // busy-waits (vid::WaitForDMAComplete polling the GS-done flag) otherwise burn guest cycles ~10x
+                // faster than real time, the FINISH and the game's frame-clock read land late in guest time and its
+                // frame step (>= 1 field) ran 3 % fast at 60 fps (docs/performance.md, game speed).
+                for (uint64_t k = 1; k < kPaceSteps; ++k)
+                    scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles * k / kPaceSteps,
+                                  scheduled.hostDeadline + kVBlankPeriod * k / kPaceSteps,
+                                  EeEvent{EeEventType::ExternalWake, 0xFFFFFFFFu, ~0ull});
             }
             processEvent(scheduled.event);
         }
@@ -2141,8 +1973,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
-        gowPanoramicoVBlank(m_rdram); // GOW-Port
-        gowTrucosVBlank(m_rdram); // GOW-Port: menú de trucos (gow_trucos.cpp)
+        gowIntegracionVBlank(m_rdram); // GOW-Port: panorámico Hor+ y menú de trucos (gow_integracion.cpp)
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
@@ -2313,12 +2144,6 @@ void EeScheduler::waitForEvent()
         }
     }
 
-    if (isUnlockedFps())
-    {
-        hostDeadline = std::min(hostDeadline, std::chrono::steady_clock::now());
-    }
-
-    m_runtime.advanceIopEeCycles(0u);
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
@@ -2346,9 +2171,6 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
         m_deadlines.push_back(ScheduledEvent{deadlineCycle, hostDeadline, event, ++m_eventSequence});
         updateNextDeadline();
     }
-    if (event.type == EeEventType::VBlankStart)
-        g_realtimeVblankNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(hostDeadline.time_since_epoch()).count(),
-                                 std::memory_order_relaxed);
     m_eventCv.notify_one();
 }
 

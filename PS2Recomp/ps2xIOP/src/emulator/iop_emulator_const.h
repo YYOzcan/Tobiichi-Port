@@ -10,6 +10,7 @@ constexpr uint64_t kIopClockHz = 36'864'000ull;
 constexpr uint64_t kVblankPeriodCycles = (kIopClockHz * 1001ull + 30'000ull) / 60'000ull;
 constexpr uint64_t kVblankEndPhaseCycles = kVblankPeriodCycles / 16ull;
 constexpr uint32_t kDefaultSlice = 256u;
+constexpr uint64_t kIopCycleBatch = 512u; // IOP cycles accumulated from EE accounting before the IOP runs
 // GOW-Port: era 2'000'000. La inicializacion del plugin smpd de God of War (llamada desde el servidor RPC
 // de 989snd) recorre todo GODOFWAR.TOC y necesita bastante mas; al agotarse, la llamada se cortaba en silencio.
 constexpr uint32_t kMaxCallInstructions = 400'000'000u;

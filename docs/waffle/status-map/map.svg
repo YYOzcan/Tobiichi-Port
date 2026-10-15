@@ -1,0 +1,826 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="424" viewBox="0 0 900 424" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" role="img">
+<title>Status: libraries* 100.0%, hardware 100.0%</title>
+<style>
+  .bg { fill: #ffffff; } .line { stroke: #d0d7de; } .t1 { fill: #1f2328; } .t2 { fill: #59636e; }
+  .ok { fill: #0ca30c; } .partial { fill: #fab219; } .pending { fill: #c4c8ce; } .gap { stroke: #ffffff; }
+  .hatch { stroke: #8a5a00; } .chip { fill: #1f2328; fill-opacity: .8; } .chip-t { fill: #ffffff; }
+  .on-ok, .on-partial { fill: #ffffff; } .on-pending { fill: #1f2328; }
+  .bk { fill: #59636e; } .bt { fill: #ffffff; }
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #0d1117; } .line { stroke: #30363d; } .t1 { fill: #e6edf3; } .t2 { fill: #9198a1; }
+    .pending { fill: #4b525c; } .gap { stroke: #0d1117; } .on-pending { fill: #e6edf3; } .bk { fill: #3d444d; }
+  }
+</style>
+<defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+<line class="hatch" x1="0" y1="0" x2="0" y2="6" stroke-width="1.5" stroke-opacity=".55"/></pattern></defs>
+<rect class="bg" width="900" height="424" rx="6"/>
+<text class="t1" x="16" y="34" font-size="24" font-weight="600">Status</text>
+<line class="line" x1="16" y1="44" x2="884" y2="44" stroke-width="1"/>
+<rect class="bk" x="16" y="56" width="92" height="22" rx="3"/>
+<text class="bt" x="62.0" y="71" font-size="12.5" text-anchor="middle">libraries*</text>
+<rect class="partial" x="108.0" y="56" width="60" height="22" rx="3"/>
+<text class="t1" x="138.2" y="71" font-size="12.5" text-anchor="middle">100.0%</text>
+<rect class="bk" x="178.4" y="56" width="78" height="22" rx="3"/>
+<text class="bt" x="217.4" y="71" font-size="12.5" text-anchor="middle">hardware</text>
+<rect class="partial" x="256.4" y="56" width="60" height="22" rx="3"/>
+<text class="t1" x="286.6" y="71" font-size="12.5" text-anchor="middle">100.0%</text>
+<text class="t1" x="16" y="103" font-size="14">Sony SDK libraries*: 100.0% (647/647)</text>
+<text class="t1" x="460" y="103" font-size="14">PS2 hardware → native: 100.0%</text>
+<g><title>libc: 150 functions, ok</title>
+<rect class="ok gap" x="16.0" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="112.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="124.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="137.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="150.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="163.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="175.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="188.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="201.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="214.0" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="226.7" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="239.5" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="252.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="252.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="252.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="252.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="252.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="252.2" width="12.8" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="252.2" width="12.8" height="12.7" stroke-width="1.0"/>
+</g>
+<g><title>libmpeg: 103 functions, ok - Movies play at real speed with sound (native libmpeg2 decoder, native sound engine); audio trails picture ~0.1 s, constant</title>
+<rect class="ok gap" x="16.0" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="265.0" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="278.1" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="291.2" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="304.4" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="317.5" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="330.6" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="169.0" y="343.7" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="16.0" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="28.8" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="41.5" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="54.3" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="67.0" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="79.8" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="92.5" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="105.3" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="118.0" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="130.8" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="143.5" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+<rect class="ok gap" x="156.3" y="356.9" width="12.8" height="13.1" stroke-width="1.0"/>
+</g>
+<g><title>libkernel: 101 functions, ok - Runs natively; DelayThread on the scheduler, no timer register access</title>
+<rect class="ok gap" x="181.8" y="112.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="112.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="112.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="112.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="112.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="112.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="112.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="112.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="112.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="112.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="124.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="124.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="124.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="124.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="124.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="124.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="124.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="124.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="124.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="124.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="136.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="136.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="136.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="136.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="136.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="136.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="136.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="136.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="136.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="136.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="149.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="149.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="149.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="149.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="149.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="149.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="149.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="149.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="149.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="149.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="161.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="161.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="161.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="161.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="161.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="161.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="161.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="161.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="161.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="161.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="174.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="174.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="174.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="174.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="174.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="174.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="174.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="174.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="174.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="174.0" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="186.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="186.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="186.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="186.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="186.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="186.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="186.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="186.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="186.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="186.4" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="198.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="198.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="198.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="198.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="198.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="198.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="198.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="198.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="198.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="198.8" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="211.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="211.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="211.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="211.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="211.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="211.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="211.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="211.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="211.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="211.2" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="223.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="223.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="223.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="223.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="223.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="223.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="223.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="223.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="223.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="223.6" width="12.5" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="236.0" width="12.5" height="12.4" stroke-width="1.0"/>
+</g>
+<g><title>libmc2: 90 functions, ok - Native memory-card service; load and save verified (savetest)</title>
+<rect class="ok gap" x="181.8" y="248.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="248.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="248.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="248.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="248.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="248.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="248.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="248.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="248.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="248.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="261.9" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="261.9" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="261.9" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="261.9" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="261.9" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="261.9" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="261.9" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="261.9" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="261.9" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="261.9" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="275.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="275.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="275.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="275.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="275.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="275.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="275.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="275.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="275.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="275.4" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="289.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="289.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="289.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="289.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="289.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="289.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="289.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="289.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="289.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="289.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="302.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="302.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="302.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="302.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="302.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="302.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="302.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="302.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="302.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="302.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="316.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="316.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="316.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="316.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="316.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="316.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="316.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="316.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="316.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="316.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="329.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="329.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="329.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="329.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="329.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="329.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="329.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="329.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="329.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="329.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="343.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="343.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="343.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="343.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="343.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="343.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="343.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="343.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="343.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="343.0" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="181.8" y="356.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="194.3" y="356.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="206.8" y="356.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="219.3" y="356.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="231.9" y="356.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="244.4" y="356.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="256.9" y="356.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="269.4" y="356.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="281.9" y="356.5" width="12.5" height="13.5" stroke-width="1.0"/>
+<rect class="ok gap" x="294.5" y="356.5" width="12.5" height="13.5" stroke-width="1.0"/>
+</g>
+<g><title>C++ EH: 34 functions, ok</title>
+<rect class="ok gap" x="307.0" y="112.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="320.7" y="112.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="334.4" y="112.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="348.1" y="112.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="361.8" y="112.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="124.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="320.7" y="124.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="334.4" y="124.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="348.1" y="124.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="361.8" y="124.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="136.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="320.7" y="136.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="334.4" y="136.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="348.1" y="136.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="361.8" y="136.0" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="147.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="320.7" y="147.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="334.4" y="147.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="348.1" y="147.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="361.8" y="147.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="159.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="320.7" y="159.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="334.4" y="159.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="348.1" y="159.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="361.8" y="159.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="171.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="320.7" y="171.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="334.4" y="171.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="348.1" y="171.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="361.8" y="171.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="183.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="320.7" y="183.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="334.4" y="183.9" width="13.7" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="348.1" y="183.9" width="13.7" height="12.0" stroke-width="1.0"/>
+</g>
+<g><title>libgcc: 32 functions, ok</title>
+<rect class="ok gap" x="375.5" y="112.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="388.4" y="112.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="401.3" y="112.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="414.2" y="112.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="427.1" y="112.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="375.5" y="124.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="388.4" y="124.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="401.3" y="124.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="414.2" y="124.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="427.1" y="124.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="375.5" y="136.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="388.4" y="136.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="401.3" y="136.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="414.2" y="136.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="427.1" y="136.0" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="375.5" y="147.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="388.4" y="147.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="401.3" y="147.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="414.2" y="147.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="427.1" y="147.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="375.5" y="159.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="388.4" y="159.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="401.3" y="159.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="414.2" y="159.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="427.1" y="159.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="375.5" y="171.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="388.4" y="171.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="401.3" y="171.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="414.2" y="171.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="427.1" y="171.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="375.5" y="183.9" width="12.9" height="12.0" stroke-width="1.0"/>
+<rect class="ok gap" x="388.4" y="183.9" width="12.9" height="12.0" stroke-width="1.0"/>
+</g>
+<g><title>sif: 24 functions, ok - RPC as direct native calls</title>
+<rect class="ok gap" x="307.0" y="195.9" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="320.6" y="195.9" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="334.3" y="195.9" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="347.9" y="195.9" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="361.5" y="195.9" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="375.2" y="195.9" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="208.3" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="320.6" y="208.3" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="334.3" y="208.3" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="347.9" y="208.3" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="361.5" y="208.3" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="375.2" y="208.3" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="220.7" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="320.6" y="220.7" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="334.3" y="220.7" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="347.9" y="220.7" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="361.5" y="220.7" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="375.2" y="220.7" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="233.1" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="320.6" y="233.1" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="334.3" y="233.1" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="347.9" y="233.1" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="361.5" y="233.1" width="13.6" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="375.2" y="233.1" width="13.6" height="12.4" stroke-width="1.0"/>
+</g>
+<g><title>fileio: 15 functions, ok</title>
+<rect class="ok gap" x="388.8" y="195.9" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="401.6" y="195.9" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="414.4" y="195.9" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="427.2" y="195.9" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="388.8" y="208.3" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="401.6" y="208.3" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="414.4" y="208.3" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="427.2" y="208.3" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="388.8" y="220.7" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="401.6" y="220.7" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="414.4" y="220.7" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="427.2" y="220.7" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="388.8" y="233.1" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="401.6" y="233.1" width="12.8" height="12.4" stroke-width="1.0"/>
+<rect class="ok gap" x="414.4" y="233.1" width="12.8" height="12.4" stroke-width="1.0"/>
+</g>
+<g><title>libscf: 14 functions, ok</title>
+<rect class="ok gap" x="307.0" y="245.4" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="245.4" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="335.5" y="245.4" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="349.7" y="245.4" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="255.8" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="255.8" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="335.5" y="255.8" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="349.7" y="255.8" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="266.2" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="266.2" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="335.5" y="266.2" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="349.7" y="266.2" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="276.6" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="276.6" width="14.3" height="10.4" stroke-width="1.0"/>
+</g>
+<g><title>libm: 14 functions, ok</title>
+<rect class="ok gap" x="307.0" y="287.0" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="287.0" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="335.5" y="287.0" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="349.7" y="287.0" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="297.3" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="297.3" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="335.5" y="297.3" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="349.7" y="297.3" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="307.7" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="307.7" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="335.5" y="307.7" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="349.7" y="307.7" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="318.1" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="318.1" width="14.3" height="10.4" stroke-width="1.0"/>
+</g>
+<g><title>loadfile: 14 functions, ok</title>
+<rect class="ok gap" x="307.0" y="328.5" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="328.5" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="335.5" y="328.5" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="349.7" y="328.5" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="338.9" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="338.9" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="335.5" y="338.9" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="349.7" y="338.9" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="349.2" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="349.2" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="335.5" y="349.2" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="349.7" y="349.2" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="307.0" y="359.6" width="14.3" height="10.4" stroke-width="1.0"/>
+<rect class="ok gap" x="321.2" y="359.6" width="14.3" height="10.4" stroke-width="1.0"/>
+</g>
+<g><title>libpad2: 13 functions, ok - Native pad read on the EE (keyboard / gamepad)</title>
+<rect class="ok gap" x="364.0" y="245.4" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="377.7" y="245.4" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="391.4" y="245.4" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="364.0" y="256.1" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="377.7" y="256.1" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="391.4" y="256.1" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="364.0" y="266.8" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="377.7" y="266.8" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="391.4" y="266.8" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="364.0" y="277.5" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="377.7" y="277.5" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="391.4" y="277.5" width="13.7" height="10.7" stroke-width="1.0"/>
+<rect class="ok gap" x="364.0" y="288.2" width="13.7" height="10.7" stroke-width="1.0"/>
+</g>
+<g><title>libdbc: 11 functions, ok - dbcman RPC answered by native pad services</title>
+<rect class="ok gap" x="405.2" y="245.4" width="11.6" height="13.3" stroke-width="1.0"/>
+<rect class="ok gap" x="416.8" y="245.4" width="11.6" height="13.3" stroke-width="1.0"/>
+<rect class="ok gap" x="428.4" y="245.4" width="11.6" height="13.3" stroke-width="1.0"/>
+<rect class="ok gap" x="405.2" y="258.8" width="11.6" height="13.3" stroke-width="1.0"/>
+<rect class="ok gap" x="416.8" y="258.8" width="11.6" height="13.3" stroke-width="1.0"/>
+<rect class="ok gap" x="428.4" y="258.8" width="11.6" height="13.3" stroke-width="1.0"/>
+<rect class="ok gap" x="405.2" y="272.1" width="11.6" height="13.3" stroke-width="1.0"/>
+<rect class="ok gap" x="416.8" y="272.1" width="11.6" height="13.3" stroke-width="1.0"/>
+<rect class="ok gap" x="428.4" y="272.1" width="11.6" height="13.3" stroke-width="1.0"/>
+<rect class="ok gap" x="405.2" y="285.5" width="11.6" height="13.3" stroke-width="1.0"/>
+<rect class="ok gap" x="416.8" y="285.5" width="11.6" height="13.3" stroke-width="1.0"/>
+</g>
+<g><title>libcdvd: 10 functions, ok - CD reads served from the extracted game files (disc-usa/); the ISO only with GOW_ISO</title>
+<rect class="ok gap" x="364.0" y="298.8" width="14.3" height="9.9" stroke-width="1.0"/>
+<rect class="ok gap" x="378.2" y="298.8" width="14.3" height="9.9" stroke-width="1.0"/>
+<rect class="ok gap" x="392.5" y="298.8" width="14.3" height="9.9" stroke-width="1.0"/>
+<rect class="ok gap" x="364.0" y="308.7" width="14.3" height="9.9" stroke-width="1.0"/>
+<rect class="ok gap" x="378.2" y="308.7" width="14.3" height="9.9" stroke-width="1.0"/>
+<rect class="ok gap" x="392.5" y="308.7" width="14.3" height="9.9" stroke-width="1.0"/>
+<rect class="ok gap" x="364.0" y="318.6" width="14.3" height="9.9" stroke-width="1.0"/>
+<rect class="ok gap" x="378.2" y="318.6" width="14.3" height="9.9" stroke-width="1.0"/>
+<rect class="ok gap" x="392.5" y="318.6" width="14.3" height="9.9" stroke-width="1.0"/>
+<rect class="ok gap" x="364.0" y="328.5" width="14.3" height="9.9" stroke-width="1.0"/>
+</g>
+<g><title>libdma: 8 functions, ok - sceDmaSend feeds VIF/GIF directly; no DMA controller model</title>
+<rect class="ok gap" x="364.0" y="338.4" width="14.3" height="10.5" stroke-width="1.0"/>
+<rect class="ok gap" x="378.2" y="338.4" width="14.3" height="10.5" stroke-width="1.0"/>
+<rect class="ok gap" x="392.5" y="338.4" width="14.3" height="10.5" stroke-width="1.0"/>
+<rect class="ok gap" x="364.0" y="348.9" width="14.3" height="10.5" stroke-width="1.0"/>
+<rect class="ok gap" x="378.2" y="348.9" width="14.3" height="10.5" stroke-width="1.0"/>
+<rect class="ok gap" x="392.5" y="348.9" width="14.3" height="10.5" stroke-width="1.0"/>
+<rect class="ok gap" x="364.0" y="359.5" width="14.3" height="10.5" stroke-width="1.0"/>
+<rect class="ok gap" x="378.2" y="359.5" width="14.3" height="10.5" stroke-width="1.0"/>
+</g>
+<g><title>libgraph: 7 functions, ok - Display setup is a native override (GS display state, no GS register access)</title>
+<rect class="ok gap" x="406.7" y="298.8" width="11.1" height="11.9" stroke-width="1.0"/>
+<rect class="ok gap" x="417.8" y="298.8" width="11.1" height="11.9" stroke-width="1.0"/>
+<rect class="ok gap" x="428.9" y="298.8" width="11.1" height="11.9" stroke-width="1.0"/>
+<rect class="ok gap" x="406.7" y="310.7" width="11.1" height="11.9" stroke-width="1.0"/>
+<rect class="ok gap" x="417.8" y="310.7" width="11.1" height="11.9" stroke-width="1.0"/>
+<rect class="ok gap" x="428.9" y="310.7" width="11.1" height="11.9" stroke-width="1.0"/>
+<rect class="ok gap" x="406.7" y="322.6" width="11.1" height="11.9" stroke-width="1.0"/>
+</g>
+<g><title>libipu: 5 functions, ok - Served by the native decoder</title>
+<rect class="ok gap" x="406.7" y="334.4" width="11.1" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="417.8" y="334.4" width="11.1" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="428.9" y="334.4" width="11.1" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="406.7" y="347.1" width="11.1" height="12.7" stroke-width="1.0"/>
+<rect class="ok gap" x="417.8" y="347.1" width="11.1" height="12.7" stroke-width="1.0"/>
+</g>
+<g><title>libvib: 2 functions, ok - DualShock 2 actuators -&gt; host gamepad rumble (Windows: XInput pads, DualShock 4 / DualSense over USB through HID, Bluetooth opt-in; raylib elsewhere); verified by the user on a real DualShock 4 over USB (2026-10-13)</title>
+<rect class="ok gap" x="406.7" y="359.8" width="11.1" height="10.2" stroke-width="1.0"/>
+<rect class="ok gap" x="417.8" y="359.8" width="11.1" height="10.2" stroke-width="1.0"/>
+</g>
+<rect class="chip" x="19.0" y="115.0" width="36.4" height="16" rx="3"/>
+<text class="chip-t" x="24.0" y="127.0" font-size="11.5">libc</text>
+<rect class="chip" x="19.0" y="268.0" width="56.2" height="16" rx="3"/>
+<text class="chip-t" x="24.0" y="280.0" font-size="11.5">libmpeg</text>
+<rect class="chip" x="184.8" y="115.0" width="69.4" height="16" rx="3"/>
+<text class="chip-t" x="189.8" y="127.0" font-size="11.5">libkernel</text>
+<rect class="chip" x="184.8" y="251.4" width="49.6" height="16" rx="3"/>
+<text class="chip-t" x="189.8" y="263.4" font-size="11.5">libmc2</text>
+<rect class="chip" x="310.0" y="115.0" width="49.6" height="16" rx="3"/>
+<text class="chip-t" x="315.0" y="127.0" font-size="11.5">C++ EH</text>
+<rect class="chip" x="378.5" y="115.0" width="49.6" height="16" rx="3"/>
+<text class="chip-t" x="383.5" y="127.0" font-size="11.5">libgcc</text>
+<rect class="chip" x="310.0" y="198.9" width="29.8" height="16" rx="3"/>
+<text class="chip-t" x="315.0" y="210.9" font-size="11.5">sif</text>
+<rect class="chip" x="391.8" y="198.9" width="49.6" height="16" rx="3"/>
+<text class="chip-t" x="396.8" y="210.9" font-size="11.5">fileio</text>
+<rect class="chip" x="310.0" y="248.4" width="49.6" height="16" rx="3"/>
+<text class="chip-t" x="315.0" y="260.4" font-size="11.5">libscf</text>
+<rect class="chip" x="310.0" y="290.0" width="36.4" height="16" rx="3"/>
+<text class="chip-t" x="315.0" y="302.0" font-size="11.5">libm</text>
+<rect class="chip" x="310.0" y="331.5" width="62.8" height="16" rx="3"/>
+<text class="chip-t" x="315.0" y="343.5" font-size="11.5">loadfile</text>
+<rect class="chip" x="367.0" y="248.4" width="56.2" height="16" rx="3"/>
+<text class="chip-t" x="372.0" y="260.4" font-size="11.5">libpad2</text>
+<rect class="chip" x="367.0" y="301.8" width="56.2" height="16" rx="3"/>
+<text class="chip-t" x="372.0" y="313.8" font-size="11.5">libcdvd</text>
+<rect class="chip" x="367.0" y="341.4" width="49.6" height="16" rx="3"/>
+<text class="chip-t" x="372.0" y="353.4" font-size="11.5">libdma</text>
+<g><title>R3000A CPU: no interpreter on the hot path (ok)</title>
+<rect class="ok gap" x="462.0" y="114.0" width="76.9" height="95.2" stroke-width="1.5"/>
+<text class="on-ok" x="500.4" y="165.6" font-size="12" text-anchor="middle">R3000A</text>
+</g>
+<g><title>SPU2: native sound engine driven by LIBSD's exports (ok)</title>
+<rect class="ok gap" x="538.9" y="114.0" width="76.9" height="95.2" stroke-width="1.5"/>
+<text class="on-ok" x="577.3" y="165.6" font-size="12" text-anchor="middle">SPU2</text>
+</g>
+<g><title>The game's 8 IRX modules compiled ahead of time to C++ (ok)</title>
+<rect class="ok gap" x="462.0" y="209.2" width="76.9" height="63.5" stroke-width="1.5"/>
+<text class="on-ok" x="500.4" y="245.0" font-size="12" text-anchor="middle">IRX</text>
+</g>
+<g><title>SIF: RPC and DMA as direct native calls (ok)</title>
+<rect class="ok gap" x="538.9" y="209.2" width="76.9" height="63.5" stroke-width="1.5"/>
+<text class="on-ok" x="577.3" y="245.0" font-size="12" text-anchor="middle">SIF</text>
+</g>
+<g><title>CDVD: the game's reads served from the extracted files (no drive model) (ok)</title>
+<rect class="ok gap" x="462.0" y="272.8" width="51.3" height="95.2" stroke-width="1.5"/>
+<text class="on-ok" x="487.6" y="324.4" font-size="12" text-anchor="middle">CDVD</text>
+</g>
+<g><title>Pad: native service (SIO2 chip model deleted) (ok)</title>
+<rect class="ok gap" x="513.3" y="272.8" width="51.3" height="95.2" stroke-width="1.5"/>
+<text class="on-ok" x="538.9" y="324.4" font-size="12" text-anchor="middle">Pad</text>
+</g>
+<g><title>Memory card: native service, load/save verified (ok)</title>
+<rect class="ok gap" x="564.5" y="272.8" width="51.3" height="95.2" stroke-width="1.5"/>
+<text class="on-ok" x="590.1" y="324.4" font-size="12" text-anchor="middle">MC</text>
+</g>
+<rect class="chip" x="463.0" y="115.0" width="29.8" height="16" rx="3"/>
+<text class="chip-t" x="468.0" y="127.0" font-size="11.5">IOP</text>
+<g><title>R5900 CPU: game code statically recompiled to C++ (6.4k functions) (ok)</title>
+<rect class="ok gap" x="619.8" y="114.0" width="143.9" height="84.7" stroke-width="1.5"/>
+<text class="on-ok" x="691.7" y="160.3" font-size="12" text-anchor="middle">R5900</text>
+</g>
+<g><title>Kernel: threads, semaphores, alarms, syscalls (native HLE) (ok)</title>
+<rect class="ok gap" x="619.8" y="198.7" width="86.3" height="84.7" stroke-width="1.5"/>
+<text class="on-ok" x="662.9" y="245.0" font-size="12" text-anchor="middle">Kernel</text>
+</g>
+<g><title>FPU (COP1) and MMI instructions (ok)</title>
+<rect class="ok gap" x="706.1" y="198.7" width="57.6" height="84.7" stroke-width="1.5"/>
+<text class="on-ok" x="734.9" y="245.0" font-size="12" text-anchor="middle">FPU/MMI</text>
+</g>
+<g><title>INTC: not accessed by game code in gameplay (ok)</title>
+<rect class="ok gap" x="619.8" y="283.3" width="57.6" height="84.7" stroke-width="1.5"/>
+<text class="on-ok" x="648.5" y="329.7" font-size="12" text-anchor="middle">INTC</text>
+</g>
+<g><title>DMA controller: no model, packets go straight to VIF/GIF (ok)</title>
+<rect class="ok gap" x="677.3" y="283.3" width="57.6" height="84.7" stroke-width="1.5"/>
+<text class="on-ok" x="706.1" y="329.7" font-size="12" text-anchor="middle">DMAC</text>
+</g>
+<g><title>Timers: native EE clock (game code calls it, counts computed from guest cycles); T2 users (DelayThread) on the scheduler (ok)</title>
+<rect class="ok gap" x="734.9" y="283.3" width="28.8" height="84.7" stroke-width="1.5"/>
+<text class="on-ok" x="749.3" y="325.7" font-size="12" text-anchor="middle" dominant-baseline="central" transform="rotate(-90 749.3 325.7)">Timers</text>
+</g>
+<rect class="chip" x="620.8" y="115.0" width="23.2" height="16" rx="3"/>
+<text class="chip-t" x="625.8" y="127.0" font-size="11.5">EE</text>
+<g><title>GS: native OpenGL render-target renderer, 2x internal, 16:9; display registers native (ok)</title>
+<rect class="ok gap" x="767.7" y="114.0" width="114.3" height="63.5" stroke-width="1.5"/>
+<text class="on-ok" x="824.8" y="149.8" font-size="12" text-anchor="middle">GS</text>
+</g>
+<g><title>VIF1 decoded directly; VU1 microprograms compiled ahead of time to C++ (ok)</title>
+<rect class="ok gap" x="767.7" y="177.5" width="114.3" height="63.5" stroke-width="1.5"/>
+<text class="on-ok" x="824.8" y="213.2" font-size="12" text-anchor="middle">VIF1/VU1</text>
+</g>
+<g><title>Textures and CLUT: native texture store; palettes from render targets read on the GPU (ok)</title>
+<rect class="ok gap" x="767.7" y="241.0" width="57.2" height="84.7" stroke-width="1.5"/>
+<text class="on-ok" x="796.3" y="283.3" font-size="12" text-anchor="middle" dominant-baseline="central" transform="rotate(-90 796.3 283.3)">Tex/CLUT</text>
+</g>
+<g><title>GIF (PATH1-3): the game's GIF tags fed to the renderer (ok)</title>
+<rect class="ok gap" x="824.8" y="241.0" width="57.2" height="84.7" stroke-width="1.5"/>
+<text class="on-ok" x="853.4" y="287.3" font-size="12" text-anchor="middle">GIF</text>
+</g>
+<g><title>IPU: replaced by the native MPEG-2 decoder (libmpeg2); movies play at real speed with sound (ok)</title>
+<rect class="ok gap" x="767.7" y="325.7" width="114.3" height="42.3" stroke-width="1.5"/>
+<text class="on-ok" x="824.8" y="350.8" font-size="12" text-anchor="middle">IPU</text>
+</g>
+<rect class="chip" x="768.7" y="115.0" width="56.2" height="16" rx="3"/>
+<text class="chip-t" x="773.7" y="127.0" font-size="11.5">GS / VU</text>
+<rect class="ok" x="16.0" y="383.0" width="12.0" height="12.0" rx="2"/>
+<text class="t2" x="33" y="394" font-size="12.5">Native / working</text>
+<rect class="partial" x="171.0" y="383.0" width="12.0" height="12.0" rx="2"/>
+<rect fill="url(#hatch)" x="171" y="383" width="12" height="12" rx="2"/>
+<text class="t2" x="188" y="394" font-size="12.5">Partial</text>
+<rect class="pending" x="263.0" y="383.0" width="12.0" height="12.0" rx="2"/>
+<text class="t2" x="280" y="394" font-size="12.5">Pending</text>
+<text class="t2" x="16" y="414" font-size="11">* Functions of the static Sony libraries linked into SCUS_973.99 (recompiled output). Hardware: weighted per component.</text>
+</svg>

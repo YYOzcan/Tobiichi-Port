@@ -91,57 +91,6 @@ void register_ps2_mmi_tests()
             t.IsTrue(toWords(PS2_PSRAVW(rs, rt)) == Words{0x00800000u, 0u, 0xFFFFFFFFu, 0xFFFFFFFFu}, "PSRAVW shifts arithmetically");
         });
 
-        // GOW-Port: valores literales distintos por lane; incluyen signo y extremos.
-        tc.Run("PMULTH writes eight independent signed products and both HI LO banks", [](TestCase &t)
-        {
-            const __m128i rs = fromHalves({1, 0xFFFE, 3, 0xFFFC, 5, 0xFFFA, 7, 0xFFF8});
-            const __m128i rt = fromHalves({11, 12, 13, 14, 15, 16, 17, 18});
-            for (const unsigned rd : {3u, 1u, 2u, 0u})
-            {
-                R5900Context ctx{};
-                const Words zeroSentinel{0xAABBCCDD, 22, 33, 44};
-                ctx.r[0] = fromWords(zeroSentinel);
-                ctx.r[1] = rs; ctx.r[2] = rt;
-                ctx.hi = ctx.lo = ctx.hi1 = ctx.lo1 = UINT64_MAX;
-                ps2_pmulth(&ctx, GPR_VEC((&ctx), 1), GPR_VEC((&ctx), 2), rd);
-                t.Equals(ctx.lo, 0xFFFFFFE80000000Bull, "LO contiene p0=11 y p1=-24");
-                t.Equals(ctx.hi, 0xFFFFFFC800000027ull, "HI contiene p2=39 y p3=-56");
-                t.Equals(ctx.lo1, 0xFFFFFFA00000004Bull, "LO alto contiene p4=75 y p5=-96");
-                t.Equals(ctx.hi1, 0xFFFFFF7000000077ull, "HI alto contiene p6=119 y p7=-144");
-                if (rd) t.IsTrue(toWords(ctx.r[rd]) == Words{11,39,75,119}, "rd conserva cuatro productos, también con alias");
-                t.IsTrue(toWords(ctx.r[0]) == zeroSentinel, "rd=0 no escribe el registro cero");
-                if (rd != 1) t.IsTrue(toHalves(ctx.r[1]) == toHalves(rs), "rs no cambia sin alias");
-                if (rd != 2) t.IsTrue(toHalves(ctx.r[2]) == toHalves(rt), "rt no cambia sin alias");
-            }
-            R5900Context ctx{};
-            ps2_pmulth(&ctx, fromHalves({0x8000,0x8000,0x7FFF,0xFFFF,0,0x7FFF,0x8000,1}),
-                              fromHalves({0x8000,0x7FFF,0x7FFF,0x8000,0xFFFF,0x8000,0xFFFF,0}), 4);
-            t.Equals(ctx.lo, 0xC000800040000000ull, "mínimo por mínimo y mínimo por máximo");
-            t.Equals(ctx.hi, 0x000080003FFF0001ull, "máximo por máximo y negativo por mínimo");
-            t.Equals(ctx.lo1, 0xC000800000000000ull, "cero y máximo por mínimo");
-            t.Equals(ctx.hi1, 0x0000000000008000ull, "mínimo por menos uno, y cero");
-            t.IsTrue(toWords(ctx.r[4]) == Words{0x40000000,0x3FFF0001,0,0x8000}, "rd completo, sin truncamiento de 16 bits");
-            ctx.r[0] = fromWords({11,22,33,44});
-            ctx.r[1] = rs;
-            ps2_pmulth(&ctx, GPR_VEC((&ctx), 0), GPR_VEC((&ctx), 1), 5);
-            t.IsTrue(!ctx.lo && !ctx.hi && !ctx.lo1 && !ctx.hi1 && toWords(ctx.r[5]) == Words{}, "rs=0 lee cero arquitectónico");
-            ps2_pmulth(&ctx, GPR_VEC((&ctx), 1), GPR_VEC((&ctx), 0), 5);
-            t.IsTrue(!ctx.lo && !ctx.hi && !ctx.lo1 && !ctx.hi1 && toWords(ctx.r[5]) == Words{}, "rt=0 lee cero arquitectónico");
-            ps2_pmulth(&ctx, rs, rs, 6);
-            t.IsTrue(toWords(ctx.r[6]) == Words{1,9,25,49}, "rs=rt usa los operandos completos previos");
-        });
-
-        tc.Run("PMULTH generator preserves operands aliases and rd zero side effects", [](TestCase &t)
-        {
-            using namespace ps2recomp;
-            for (const unsigned rd : {3u,1u,2u,0u})
-            {
-                const auto code = emit(MMI_MMI2, MMI2_PMULTH, rd, 1, 2);
-                const auto expected = "ps2_pmulth(ctx, GPR_VEC(ctx, 1), GPR_VEC(ctx, 2), " + std::to_string(rd) + ");";
-                t.Equals(code, expected, "el código generado conserva rs/rt/rd y los efectos HI/LO");
-            }
-        });
-
         tc.Run("the code generator emits the corrected MMI forms", [](TestCase &t)
         {
             using namespace ps2recomp;

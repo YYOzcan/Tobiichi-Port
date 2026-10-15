@@ -6,14 +6,15 @@ option(PS2X_IOP_BUILD_TESTS "Build ps2xIOP emulator smoke tests" OFF)
 
 add_library(ps2_iop STATIC
     src/ps2_path.cpp
+    src/disc_source.cpp
     src/iop_module_manager.cpp
     src/iop_subsystem.cpp
     src/emulator/iop_emulator.cpp
     src/emulator/core/iop_cpu.cpp
     src/emulator/core/iop_kernel.cpp
     src/emulator/core/iop_memory.cpp
-    src/emulator/core/spu2.cpp
-    src/emulator/core/sio2.cpp
+    src/emulator/core/sound_engine.cpp
+    src/emulator/core/memory_card.cpp
     src/emulator/services/iop_module_loader.cpp
     src/emulator/services/iop_rpc.cpp
     src/emulator/imports/iop_cdvd.cpp
@@ -32,6 +33,17 @@ add_library(ps2_iop STATIC
     src/modules/mcserv.cpp
     src/modules/gow_stub_services.cpp
 )
+
+# GOW-Port: IRX modules compiled ahead of time (tools/iop/iopn_gen.py)
+# (generated from the game's modules, not in git; without them the empty registry is used and the IRX code is interpreted)
+file(GLOB PS2X_IOP_NATIVE_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/native/iopn_*.cpp)
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/native/iopn_registry.cpp)
+    list(APPEND PS2X_IOP_NATIVE_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/native/iop_native_none.cpp)
+endif()
+target_sources(ps2_iop PRIVATE ${PS2X_IOP_NATIVE_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/src/native/iop_native_overrides.cpp)
+if(MSVC)
+    set_source_files_properties(${PS2X_IOP_NATIVE_SOURCES} PROPERTIES COMPILE_OPTIONS "/bigobj")
+endif()
 
 target_compile_features(ps2_iop PUBLIC cxx_std_20)
 

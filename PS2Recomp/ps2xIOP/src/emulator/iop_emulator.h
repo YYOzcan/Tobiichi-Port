@@ -25,6 +25,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
         void runEeCycles(uint64_t eeCycles) noexcept;
+        [[nodiscard]] bool accrueEeCycles(uint64_t eeCycles) noexcept;
+        void runPendingEeCycles() noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
         void onSifTransfer(const SifTransfer &transfer);
@@ -36,7 +38,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool zeroMemory(uint32_t address, size_t size);
         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
 
-        // GOW-Port: muestras estereo de 48 kHz que ha producido el SPU2 (ver Spu2::drainOutput).
+        // GOW-Port: 48 kHz stereo samples produced by the native sound engine (SoundEngine::drainOutput).
         size_t drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames);
         [[nodiscard]] uint64_t cycles() const noexcept;
         [[nodiscard]] uint64_t instructions() const noexcept;

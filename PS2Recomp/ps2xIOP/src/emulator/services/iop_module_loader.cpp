@@ -522,6 +522,8 @@ namespace ps2x::iop::detail
                 result.gp = gp != 0u
                                 ? static_cast<uint32_t>(static_cast<int64_t>(gp) + delta)
                                 : 0u;
+                if (program.filesz >= 16u)
+                    std::memcpy(&result.textSize, image.data() + program.offset + 12u, sizeof(result.textSize));
                 break;
             }
         }

@@ -3,17 +3,18 @@
 #include "../core/iop_cpu.h"
 #include "../core/iop_kernel.h"
 #include "../core/iop_memory.h"
+#include "ps2x/iop/disc_source.h"
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/ps2_path.h"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -203,7 +204,8 @@ namespace ps2x::iop::detail
             completionCallback.reset();
             nodes.clear();
             metadataSectors.clear();
-            imageHandle = 0u;
+            disc.reset();
+            discOpened = false;
         }
 
         bool dispatchImport(uint16_t ordinal, IopCpuState &cpu)
@@ -230,7 +232,13 @@ namespace ps2x::iop::detail
                 return true;
 
             case 6: // sceCdRead
-                if (readSectors(a0, a1, a2))
+            {
+                const bool ok = readSectors(a0, a1, a2);
+                // GOW_CD_TRACE=1 (debug): every sceCdRead (lsn, sectors, IOP destination, result)
+                static const bool trace = std::getenv("GOW_CD_TRACE") != nullptr;
+                if (trace)
+                    std::fprintf(stderr, "[cd-read] lsn=%u sectors=%u dst=%x ok=%d\n", a0, a1, a2, ok ? 1 : 0);
+                if (ok)
                 {
                     signalCommandComplete();
                     if (callback.address != 0u)
@@ -246,6 +254,7 @@ namespace ps2x::iop::detail
                 else
                     cpu.gpr[2] = 0u;
                 return true;
+            }
 
             case 7: // sceCdSeek
                 currentLsn = a0;
@@ -398,11 +407,29 @@ namespace ps2x::iop::detail
                 (void)kernel.setInternalEventFlag(interruptEventFlagId, kCdvdInterruptReadyBits);
         }
 
+        // GOW-Port: the disc the game reads (docs/disc.md). The configured image if any, otherwise the files extracted
+        // by tools/iso_extract.py --layout in the CD root: .disc_layout puts every file at its original LSN, so the
+        // game's raw sector reads (smpd reads GODOFWAR.TOC / PART*.PAK by LSN) become plain host file reads.
+        // nullptr: a loose folder without a layout, served by the virtual ISO below.
+        DiscSource *discSource()
+        {
+            if (discOpened)
+                return disc.get();
+            discOpened = true;
+            const std::string imagePath = host.hostPath(HostPathKind::CdImage);
+            const std::string rootPath = host.hostPath(HostPathKind::CdRoot);
+            if (!imagePath.empty())
+                disc = DiscSource::openImage(std::filesystem::u8path(imagePath));
+            else if (!rootPath.empty())
+                disc = DiscSource::openExtracted(std::filesystem::u8path(rootPath));
+            host.log(LogLevel::Info, disc ? (!imagePath.empty() ? "[cdvd] disc: image " + imagePath
+                                                                   : "[cdvd] disc: extracted files in " + rootPath)
+                                          : std::string("[cdvd] disc: virtual ISO of the CD root folder"));
+            return disc.get();
+        }
+
         void closeFiles()
         {
-            if (imageHandle != 0u)
-                host.closeHostFile(imageHandle);
-            imageHandle = 0u;
             for (IsoNode &node : nodes)
             {
                 if (node.handle != 0u)
@@ -626,17 +653,28 @@ namespace ps2x::iop::detail
                 return false;
 
             const std::string guestPath = memory.readString(nameAddress, 1024u);
-            IsoNode *node = findVirtualIsoNode(guestPath);
-            if (!node)
-                return false;
+            DiscSource::File file;
+            if (DiscSource *source = discSource())
+            {
+                const std::optional<DiscSource::File> found = source->findFile(guestPath);
+                if (!found)
+                    return false;
+                file = *found;
+            }
+            else
+            {
+                IsoNode *node = findVirtualIsoNode(guestPath);
+                if (!node)
+                    return false;
+                file = {normalizedIsoComponent(node->identifier), node->lsn, node->size, node->directory};
+            }
 
             // sceCdlFILE: lsn, size, name[16], date/flags[8].
             std::array<uint8_t, 32u> result{};
-            writeLe32(result.data(), node->lsn);
-            writeLe32(result.data() + 4u, node->size);
-            const std::string leaf = normalizedIsoComponent(node->identifier);
-            std::memcpy(result.data() + 8u, leaf.data(), std::min<size_t>(16u, leaf.size()));
-            result[24u] = node->directory ? 2u : 0u;
+            writeLe32(result.data(), file.lsn);
+            writeLe32(result.data() + 4u, file.size);
+            std::memcpy(result.data() + 8u, file.name.data(), std::min<size_t>(16u, file.name.size()));
+            result[24u] = file.directory ? 2u : 0u;
             return memory.writeRam(resultAddress, result.data(), result.size());
         }
 
@@ -679,7 +717,6 @@ namespace ps2x::iop::detail
 
         bool readSectors(uint32_t lsn, uint32_t sectors, uint32_t destination)
         {
-
             if (sectors == 0u)
             {
                 lastError = kCdvdErrorNone;
@@ -695,24 +732,9 @@ namespace ps2x::iop::detail
             std::vector<uint8_t> bytes(byteCount, 0u);
 
             bool read = false;
-            const std::string imagePath = host.hostPath(HostPathKind::CdImage);
-            if (!imagePath.empty())
-            {
-                if (imageHandle == 0u)
-                    imageHandle = host.openHostFile(imagePath);
-                if (imageHandle != 0u)
-                {
-                    size_t bytesRead = 0u;
-                    read = host.readHostFile(imageHandle,
-                                             static_cast<uint64_t>(lsn) * kSectorSize,
-                                             bytes.data(),
-                                             byteCount,
-                                             bytesRead) &&
-                           bytesRead == byteCount;
-                }
-            }
-
-            if (!read && buildVirtualIso())
+            if (DiscSource *source = discSource())
+                read = source->readSectors(lsn, sectors, bytes.data());
+            else if (buildVirtualIso())
             {
                 read = true;
                 for (uint32_t sector = 0u; sector < sectors; ++sector)
@@ -746,7 +768,8 @@ namespace ps2x::iop::detail
         uint32_t streamFlag = 0u;
         uint32_t lastReadTimeout = 0u;
         int interruptEventFlagId = 0;
-        uint64_t imageHandle = 0u;
+        std::unique_ptr<DiscSource> disc;
+        bool discOpened = false;
         bool virtualIsoBuilt = false;
         bool virtualIsoValid = false;
         uint32_t volumeSectors = 0u;

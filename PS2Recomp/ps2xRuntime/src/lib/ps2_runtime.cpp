@@ -1,4 +1,8 @@
 #include "ps2_runtime.h"
+#include "runtime/gs/gs_stage.h"
+#include "vu_pcsx2/pcsx2_vu1_bridge.h"
+static bool gowUsePcsx2Vu1(); // GOW_VU1_PCSX2=1, defined before PS2Runtime::initialize
+#include "runtime/gs/gs_host_present.h" // GOW-Port: consumidor privado del host.
 #include "ps2_log.h"
 #include "runtime/ps2_perf.h"
 #include "ps2_stubs.h"
@@ -6,9 +10,6 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
-#include "runtime/gs/gs_cpu_backend.h"
-#include "runtime/gs/gs_shared_present.h"
-#include "runtime/gs/gs_threaded_backend.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -17,13 +18,17 @@
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
-#include "spu2_time_stretch.h"
 
+#include <xmmintrin.h>
 #include <iostream>
 #include <stdexcept>
 #include <fstream>
 #include <algorithm>
 #include <array>
+#include <map>
+#include <mutex>
+#include <string>
+#include <tuple>
 #include <cstring>
 #include <limits>
 #include <chrono>
@@ -31,13 +36,22 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
-#include <cstdlib>
-#include <cmath>
 #include <cstdio>
-#include <clocale>
-#include "rlgl.h" // GOW-Port: rlGetShaderIdDefault (sombreadores de presentación)
+#include <cstdlib>
+
+// GOW-Port: audio device position for the movie A/V check (GOW_MPEG_DIAG, Kernel/Stubs/MPEG.cpp): frames the device
+// has played (including silence fill) and frames the sound engine produced (= GOW_AUDIO_PCM file position).
+std::atomic<uint64_t> g_gowAudioFramesPlayed{0};
+std::atomic<uint64_t> g_gowAudioFramesProduced{0};
+// GOW-Port: funciones de Tobiichi Port (gow_integracion.cpp).
+void gowVentanaAbrir(const char *title);
+int gowVentanaFps();
+void gowIntegracionInstalar(PS2Runtime &runtime, const std::string &elfPath);
+void gowCuadroEntrada();
 
 #if !defined(PLATFORM_VITA)
+bool ps2AudioOpenNamedDevice(void (*fill)(void *, unsigned int), unsigned int sampleRate); // ps2_audio_device.cpp
+void ps2AudioCloseNamedDevice();
 namespace
 {
     // GOW-Port: salida del SPU2 emulado por el IOP. raylib pide las muestras desde su hilo de audio; el IOP las
@@ -45,87 +59,56 @@ namespace
     std::atomic<ps2x::iop::IopSubsystem *> g_spu2AudioSource{nullptr};
     AudioStream g_spu2Stream{};
     bool g_spu2StreamActive = false;
+    bool g_spu2NamedDevice = false; // playing on a chosen device (ps2_audio_device.cpp), not the raylib stream
     constexpr size_t kSpu2MaxLatencyFrames = 4800u; // 100 ms a 48 kHz
-    // GOW-Port: estirado temporal (spu2_time_stretch.h): si la emulación va más lenta que el tiempo real, el
-    // sonido se alarga sin cambiar el tono en vez de cortarse. GOW_AUDIO_STRETCH=0 vuelve a la salida directa.
-    ps2_audio::TimeStretch g_spu2Stretch;
-    std::atomic<uint64_t> g_spu2DiagArrived{0}; // GOW-Port: GOW_AUDIO_DIAG
-    const bool g_spu2StretchEnabled = [] {
-        const char *setting = std::getenv("GOW_AUDIO_STRETCH");
-        return !(setting && setting[0] == '0');
-    }();
 
     void spu2AudioCallback(void *buffer, unsigned int frames)
     {
         int16_t *out = static_cast<int16_t *>(buffer);
-        ps2x::iop::IopSubsystem *source = g_spu2AudioSource.load(std::memory_order_acquire);
-        if (g_spu2StretchEnabled)
-        {
-            if (source)
-            {
-                int16_t chunk[2048u * 2u];
-                size_t drained = 0u;
-                // GOW-Port: GOW_AUDIO_VOLCADO=<archivo>: PCM 48 kHz estéreo s16 tal como sale del SPU2 (diagnóstico).
-                static std::FILE *volcado = [] { const char *v = std::getenv("GOW_AUDIO_VOLCADO"); return v ? std::fopen(v, "wb") : nullptr; }();
-                while ((drained = source->drainAudio(chunk, 2048u)) != 0u)
-                {
-                    if (volcado)
-                        std::fwrite(chunk, sizeof(int16_t) * 2u, drained, volcado);
-                    g_spu2Stretch.push(chunk, drained);
-                    g_spu2DiagArrived.fetch_add(drained, std::memory_order_relaxed);
-                }
-            }
-            g_spu2Stretch.pull(out, frames);
-            // GOW-Port: GOW_AUDIO_DIAG=1: cada segundo, tramas llegadas/sacadas, tempo, colchón y vaciados.
-            static const bool diag = [] { const char *v = std::getenv("GOW_AUDIO_DIAG"); return v && v[0] == '1'; }();
-            if (diag)
-            {
-                static uint64_t pulled = 0;
-                static double tempoMin = 10.0, tempoMax = 0.0, tempoSum = 0.0;
-                static unsigned calls = 0, lastStarves = 0;
-                static auto window = std::chrono::steady_clock::now();
-                pulled += frames;
-                const double t = g_spu2Stretch.tempo();
-                tempoMin = std::min(tempoMin, t);
-                tempoMax = std::max(tempoMax, t);
-                tempoSum += t;
-                ++calls;
-                const auto now = std::chrono::steady_clock::now();
-                const double wall = std::chrono::duration<double>(now - window).count();
-                if (wall >= 1.0)
-                {
-                    std::fprintf(stderr, "[gow-audio] salida=%.0f/s llegada=%.0f/s tempo=%.2f..%.2f (media %.2f) colchon=%zu objetivo=%zu vaciados=%u\n",
-                                 pulled / wall, g_spu2DiagArrived.exchange(0) / wall, tempoMin, tempoMax, tempoSum / calls,
-                                 g_spu2Stretch.inputFrames(), g_spu2Stretch.target(), g_spu2Stretch.starves() - lastStarves);
-                    lastStarves = g_spu2Stretch.starves();
-                    pulled = 0;
-                    tempoMin = 10.0;
-                    tempoMax = tempoSum = 0.0;
-                    calls = 0;
-                    window = now;
-                }
-            }
-            return;
-        }
         size_t produced = 0u;
-        if (source)
+        if (ps2x::iop::IopSubsystem *source = g_spu2AudioSource.load(std::memory_order_acquire))
             produced = source->drainAudio(out, frames, kSpu2MaxLatencyFrames);
+        g_gowAudioFramesPlayed.fetch_add(frames, std::memory_order_relaxed);
+        g_gowAudioFramesProduced.fetch_add(produced, std::memory_order_relaxed);
+        // GOW-Port: GOW_AUDIO_PCM=<archivo> guarda las muestras emuladas (s16le, estéreo, 48 kHz) sin los
+        // silencios de relleno, para comprobar el audio aunque la emulación vaya más lenta que el tiempo real.
+        static std::FILE *pcm = []() -> std::FILE *
+        {
+            const char *path = std::getenv("GOW_AUDIO_PCM");
+            return path ? std::fopen(path, "wb") : nullptr;
+        }();
+        if (pcm && produced != 0u)
+        {
+            std::fwrite(out, sizeof(int16_t) * 2u, produced, pcm);
+            std::fflush(pcm);
+        }
         std::fill(out + produced * 2u, out + static_cast<size_t>(frames) * 2u, int16_t{0}); // sin datos: silencio
     }
 
     void startSpu2Audio(ps2x::iop::IopSubsystem *source)
     {
+        // GOW_AUDIO=0 mutes: no stream, except with GOW_AUDIO_PCM, where the stream runs at volume 0 so the recording is
+        // paced and drained exactly as when it is heard (tools/movies.py)
         const char *setting = std::getenv("GOW_AUDIO");
-        if (g_spu2StreamActive || source == nullptr || !IsAudioDeviceReady() || (setting && setting[0] == '0'))
+        const bool muted = setting && setting[0] == '0';
+        const bool recording = std::getenv("GOW_AUDIO_PCM") != nullptr;
+        if (g_spu2StreamActive || source == nullptr || !IsAudioDeviceReady() || (muted && !recording))
             return;
+        g_spu2AudioSource.store(source, std::memory_order_release);
+        if (!muted && ps2AudioOpenNamedDevice(spu2AudioCallback, 48000u)) // a muted recording stays on the silent stream
+        {
+            g_spu2NamedDevice = g_spu2StreamActive = true;
+            return;
+        }
         SetAudioStreamBufferSizeDefault(1024);
         g_spu2Stream = LoadAudioStream(48000u, 16u, 2u);
         SetAudioStreamBufferSizeDefault(0); // el resto de flujos conserva el tamano por defecto
         if (!IsAudioStreamValid(g_spu2Stream))
             return;
-        g_spu2Stretch.reset(); // el callback aún no corre
         g_spu2AudioSource.store(source, std::memory_order_release);
         SetAudioStreamCallback(g_spu2Stream, spu2AudioCallback);
+        if (muted)
+            SetAudioStreamVolume(g_spu2Stream, 0.0f);
         PlayAudioStream(g_spu2Stream);
         g_spu2StreamActive = true;
         std::cerr << "[SPU2] salida de audio a 48 kHz activa (GOW_AUDIO=0 la desactiva)" << std::endl;
@@ -135,8 +118,14 @@ namespace
     {
         if (!g_spu2StreamActive)
             return;
-        StopAudioStream(g_spu2Stream);
-        UnloadAudioStream(g_spu2Stream); // raylib espera a que termine el callback en curso
+        if (g_spu2NamedDevice)
+            ps2AudioCloseNamedDevice();
+        else
+        {
+            StopAudioStream(g_spu2Stream);
+            UnloadAudioStream(g_spu2Stream); // raylib espera a que termine el callback en curso
+        }
+        g_spu2NamedDevice = false;
         g_spu2AudioSource.store(nullptr, std::memory_order_release);
         g_spu2StreamActive = false;
     }
@@ -146,52 +135,6 @@ namespace
 namespace ps2_stubs
 {
     void resetSifState();
-}
-
-// GOW-Port: cuadros del juego (entradas a GOW_PERF_FRAME_PC, vid::Flip en God of War) para el contador
-// del panel de depuración (F1). A diferencia de ps2_perf::guestFlips, no depende de GOW_PERF_DIAG.
-std::atomic<uint64_t> g_gowGuestFrames{0};
-// GOW-Port: velocidad del juego = tiempo de juego / tiempo real (1 = tiempo real; < 1 = cámara lenta). Suma el
-// paso de tiempo del juego (float en 0x29C64C de SCUS-97399) en cada cuadro. Con GOW_DELTA_DIAG=1 se imprime
-// cada segundo; el panel F1 lo muestra siempre (g_gowGameSpeed).
-std::atomic<float> g_gowGameSpeed{0.0f};
-void gowCountGuestFrame(uint32_t pc, const uint8_t *rdram)
-{
-    static const uint32_t framePc = [] {
-        const char *value = std::getenv("GOW_PERF_FRAME_PC");
-        return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
-    }();
-    if (framePc == 0u || pc != framePc)
-        return;
-    g_gowGuestFrames.fetch_add(1, std::memory_order_relaxed);
-    if (!rdram)
-        return;
-    static const bool diag = [] { const char *v = std::getenv("GOW_DELTA_DIAG"); return v && v[0] == '1'; }();
-    static auto windowStart = std::chrono::steady_clock::now();
-    static double gameSeconds = 0.0;
-    static unsigned frames = 0;
-    float delta = 0.0f;
-    std::memcpy(&delta, rdram + 0x29C64Cu, sizeof(delta));
-    if (delta > 0.0f && delta < 1.0f)
-        gameSeconds += delta;
-    ++frames;
-    const auto now = std::chrono::steady_clock::now();
-    const double wall = std::chrono::duration<double>(now - windowStart).count();
-    if (wall >= 1.0)
-    {
-        g_gowGameSpeed.store(static_cast<float>(gameSeconds / wall), std::memory_order_relaxed);
-        if (diag)
-            std::fprintf(stderr, "[gow-delta] frames=%u wall=%.2f game=%.3f speed=%.2f last_delta=%.4f\n",
-                         frames, wall, gameSeconds, gameSeconds / wall, delta);
-        windowStart = now;
-        gameSeconds = 0.0;
-        frames = 0;
-    }
-}
-bool gowGuestFrameCounterEnabled()
-{
-    const char *value = std::getenv("GOW_PERF_FRAME_PC");
-    return value && std::strtoul(value, nullptr, 0) != 0u;
 }
 
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
@@ -211,648 +154,6 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
 static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
 #endif
-
-float gowAspectoPanoramico(); // GOW-Port: Kernel/EeScheduler.cpp (0 = sin TOBIICHI_PANORAMICO)
-bool tobiichiSticksTeclado(uint8_t (&sticks)[4]); // GOW-Port: ps2_pad.cpp (teclado configurable)
-// GOW-Port: menú de trucos de God of War (gow_trucos.cpp).
-void gowTrucosInstalar(PS2Runtime &runtime, const std::string &elfPath);
-void gowPeliculasInstalar(PS2Runtime &runtime, const std::string &elfPath); // GOW-Port: gow_peliculas.cpp
-void gowVideoInstalar(PS2Runtime &runtime, const std::string &elfPath);     // GOW-Port: gow_video.cpp
-void gowFijarInstalar(PS2Runtime &runtime, const std::string &elfPath);     // GOW-Port: gow_fijar.cpp
-void gowCancelarInstalar(PS2Runtime &runtime, const std::string &elfPath);  // GOW-Port: gow_cancelar.cpp
-void gowCapturaGsInstalar(PS2Runtime &runtime);                             // GOW-Port: gow_captura_gs.cpp
-void gowSondeoInstalar(PS2Runtime &runtime);                                // GOW-Port: gow_sondeo.cpp
-void gowIconosInstalar(PS2Runtime &runtime, const std::string &elfPath);    // GOW-Port: gow_iconos.cpp
-void ps2MuestreoIniciar();                                                 // GOW-Port: ps2_muestreo.cpp (GOW_MUESTREO)
-void gowEsperaInstalar(PS2Runtime &runtime, const std::string &elfPath);    // GOW-Port: gow_espera.cpp
-void gowFijarEntrada();                                                    // GOW-Port: gow_fijar.cpp (Alt y ratón)
-void gowFijarDibujar(float x, float y, float w, float h);                    // GOW-Port: marca del objetivo fijado
-void gowIconosDibujar(float x, float y, float w, float h);                   // GOW-Port: iconos de botones (gow_iconos.cpp)
-bool gowPeliculaEnPantalla(const uint8_t *rdram); // GOW-Port: gow_peliculas.cpp
-bool ps2MpegCuadroPantalla(std::vector<uint8_t> &rgba, int &width, int &height, uint64_t &serial); // Kernel/Stubs/MPEG.cpp
-uint64_t ps2MpegSerieCuadroPantalla(); // Kernel/Stubs/MPEG.cpp
-bool gowTrucosEntradaBloqueada();
-void gowTrucosMenuEntrada(bool escCierraJuego);
-void gowTrucosMenuDibujar();
-// GOW-Port: GLFW va enlazado dentro de raylib; solo hace falta esta función (sin sus cabeceras).
-#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
-extern "C" void glfwSetWindowAttrib(void *window, int attrib, int value);
-#endif
-
-namespace
-{
-    // GOW-Port: con TOBIICHI_TECLAS (lanzador), los sticks del teclado salen del mapa configurable. La lectura del
-    // mando de God of War (scePad2Read, 0x27B9F0, gowPad2Read en los overrides) escribe sus propios sticks fijos
-    // (WASD / Ctrl + WASD); este envoltorio la llama y luego pone los del mapa en el paquete (RX, RY, LX, LY).
-    // Con el menú de trucos abierto el paquete queda en reposo (botones sueltos, sticks centrados, sin presión).
-    constexpr uint32_t kGowPad2Read = 0x0027B9F0u;
-    PS2Runtime::RecompiledFunction g_gowPad2Read = nullptr;
-
-    void tobiichiPad2Read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        const uint32_t buffer = GPR_U32(ctx, 5) & 0x01FFFFFFu;
-        g_gowPad2Read(rdram, ctx, runtime);
-        if (GPR_U32(ctx, 2) != 18u || buffer + 18u > PS2_RAM_SIZE)
-            return;
-        if (gowTrucosEntradaBloqueada())
-        {
-            uint8_t *paquete = rdram + buffer;
-            paquete[0] = paquete[1] = 0xFFu;
-            std::memset(paquete + 2u, 0x80, 4u);
-            std::memset(paquete + 6u, 0, 12u);
-            return;
-        }
-        uint8_t sticks[4];
-        if (tobiichiSticksTeclado(sticks))
-            std::memcpy(rdram + buffer + 2u, sticks, sizeof(sticks));
-    }
-}
-
-// GOW-Port: ventana y presentación configurables (God of War: Tobiichi Launcher). Sin estas variables todo
-// queda como antes.
-//   TOBIICHI_ANCHO / TOBIICHI_ALTO: tamaño inicial de la ventana. TOBIICHI_PANTALLA=completa: pantalla completa
-//     sin bordes (F11 alterna). TOBIICHI_VSYNC=1: sincronía vertical. TOBIICHI_TITULO, TOBIICHI_ICONO (PNG).
-//     TOBIICHI_ESC_SALIR=0: Escape no cierra la ventana (es el círculo del mando con el teclado clásico).
-//   TOBIICHI_ASPECTO: "auto" (4:3; el aspecto de TOBIICHI_PANORAMICO; 16:9 con el modo panorámico del propio
-//     juego), "4:3", "16:9"... o "estirar". Sin la variable, la proporción de píxeles del GS (640x448).
-//   TOBIICHI_FILTRO: "fsr" (AMD FidelityFX Super Resolution 1.0: EASU + RCAS), "bilineal" o "pixel" (vecino más
-//     cercano, el de antes). TOBIICHI_NITIDEZ: RCAS en pasos (0 = máxima, 2 = suave; 0,25 por defecto).
-//   TOBIICHI_FXAA=1: suavizado de bordes a la resolución del juego antes de escalar.
-//   TOBIICHI_FPS_GOSTER=1: cuadros por segundo del juego (GOW_PERF_FRAME_PC) y de la ventana en una esquina.
-namespace
-{
-namespace presentacion
-{
-    bool envFlag(const char *name, bool fallback)
-    {
-        const char *value = std::getenv(name);
-        if (!value || !*value)
-            return fallback;
-        return value[0] == '1';
-    }
-
-    long envLong(const char *name, long fallback, long low, long high)
-    {
-        const char *value = std::getenv(name);
-        if (!value || !*value)
-            return fallback;
-        return std::clamp(std::strtol(value, nullptr, 10), low, high);
-    }
-
-    struct Ventana
-    {
-        int width = HOST_WINDOW_WIDTH;
-        int height = HOST_WINDOW_HEIGHT;
-        bool fullscreen = false;
-        bool vsync = false;
-        bool escExits = true;
-    };
-
-    Ventana ventana()
-    {
-        Ventana v;
-        v.width = static_cast<int>(envLong("TOBIICHI_ANCHO", v.width, 320, 7680));
-        v.height = static_cast<int>(envLong("TOBIICHI_ALTO", v.height, 224, 4320));
-        const char *mode = std::getenv("TOBIICHI_PANTALLA");
-        v.fullscreen = mode && std::strcmp(mode, "completa") == 0;
-        v.vsync = envFlag("TOBIICHI_VSYNC", false);
-        v.escExits = envFlag("TOBIICHI_ESC_SALIR", true);
-        return v;
-    }
-
-    enum class Filtro { Pixel, Bilineal, Fsr };
-
-    struct Config
-    {
-        Filtro filtro = Filtro::Pixel;
-        bool fxaa = false;
-        bool fps = false;
-        float sharpness = 1.0f; // exp2(-pasos), como FsrRcasCon
-        bool legacyAspect = true;
-        bool stretch = false;
-        float fixedAspect = 0.0f; // 0 = auto
-    };
-
-    float parseAspect(const char *value)
-    {
-        float width = 0.0f, height = 0.0f;
-        if (std::sscanf(value, "%f:%f", &width, &height) == 2 && width > 0.0f && height > 0.0f)
-            return width / height;
-        const float aspect = std::strtof(value, nullptr);
-        return aspect >= 0.5f && aspect <= 4.0f ? aspect : 0.0f;
-    }
-
-    const Config &config()
-    {
-        static const Config c = []
-        {
-            Config out;
-            if (const char *filter = std::getenv("TOBIICHI_FILTRO"))
-            {
-                if (std::strcmp(filter, "fsr") == 0)
-                    out.filtro = Filtro::Fsr;
-                else if (std::strcmp(filter, "bilineal") == 0)
-                    out.filtro = Filtro::Bilineal;
-            }
-            out.fxaa = envFlag("TOBIICHI_FXAA", false);
-            out.fps = envFlag("TOBIICHI_FPS_GOSTER", false);
-            if (const char *stops = std::getenv("TOBIICHI_NITIDEZ"); stops && *stops)
-                out.sharpness = std::exp2(-std::clamp(std::strtof(stops, nullptr), 0.0f, 2.0f));
-            else
-                out.sharpness = std::exp2(-0.25f);
-            if (const char *aspect = std::getenv("TOBIICHI_ASPECTO"); aspect && *aspect)
-            {
-                out.legacyAspect = false;
-                if (std::strcmp(aspect, "estirar") == 0)
-                    out.stretch = true;
-                else if (std::strcmp(aspect, "auto") != 0)
-                    out.fixedAspect = parseAspect(aspect);
-            }
-            return out;
-        }();
-        return c;
-    }
-
-#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
-    // Cabecera común: sombreador de vértices por defecto de raylib (fragTexCoord). "fuente" = zona válida de la
-    // textura de entrada en texeles (la del cuadro mide 640x512 y el GS suele llenar 640x448).
-    constexpr const char *kHeader = R"(#version 330
-in vec2 fragTexCoord;
-in vec4 fragColor;
-uniform sampler2D texture0;
-uniform vec2 fuente;
-out vec4 finalColor;
-vec3 tap(ivec2 p) { return texelFetch(texture0, clamp(p, ivec2(0), ivec2(fuente) - 1), 0).rgb; }
-vec3 muestra(vec2 uv)
-{
-    vec2 tam = vec2(textureSize(texture0, 0));
-    return texture(texture0, clamp(uv, 0.5 / tam, (fuente - 0.5) / tam)).rgb;
-}
-)";
-
-    constexpr const char *kCopia = R"(
-void main() { finalColor = vec4(muestra(fragTexCoord), 1.0); }
-)";
-
-    // GOW-Port: reducción por área (resolución interna mayor que la ventana): cada píxel de salida promedia los texeles
-    // que cubre, ponderados por la superficie. Es la resolución correcta del supermuestreo; EASU solo sirve para ampliar.
-    constexpr const char *kReducir = R"(
-void main()
-{
-    vec2 tam = vec2(textureSize(texture0, 0));
-    vec2 paso = max(abs(vec2(dFdx(fragTexCoord.x), dFdy(fragTexCoord.y))) * tam, vec2(1.0));
-    vec2 centro = fragTexCoord * tam;
-    vec2 a = centro - 0.5 * paso, b = centro + 0.5 * paso;
-    ivec2 i0 = ivec2(floor(a)), i1 = min(ivec2(ceil(b)) - 1, i0 + 9);
-    vec3 suma = vec3(0.0);
-    float peso = 0.0;
-    for (int y = i0.y; y <= i1.y; ++y)
-        for (int x = i0.x; x <= i1.x; ++x)
-        {
-            vec2 lo = max(a, vec2(x, y)), hi = min(b, vec2(x + 1, y + 1));
-            float w = max(hi.x - lo.x, 0.0) * max(hi.y - lo.y, 0.0);
-            suma += tap(ivec2(x, y)) * w;
-            peso += w;
-        }
-    finalColor = vec4(suma / max(peso, 1e-6), 1.0);
-}
-)";
-
-    // FXAA (Timothy Lottes, versión compacta "FXAA PC simple"), a la resolución del juego.
-    constexpr const char *kFxaa = R"(
-void main()
-{
-    vec2 inv = 1.0 / vec2(textureSize(texture0, 0));
-    vec2 uv = fragTexCoord;
-    vec3 rgbNW = muestra(uv + vec2(-1.0, -1.0) * inv);
-    vec3 rgbNE = muestra(uv + vec2(1.0, -1.0) * inv);
-    vec3 rgbSW = muestra(uv + vec2(-1.0, 1.0) * inv);
-    vec3 rgbSE = muestra(uv + vec2(1.0, 1.0) * inv);
-    vec3 rgbM = muestra(uv);
-    const vec3 luma = vec3(0.299, 0.587, 0.114);
-    float lumaNW = dot(rgbNW, luma), lumaNE = dot(rgbNE, luma), lumaSW = dot(rgbSW, luma), lumaSE = dot(rgbSE, luma);
-    float lumaM = dot(rgbM, luma);
-    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
-    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
-    vec2 dir = vec2(-((lumaNW + lumaNE) - (lumaSW + lumaSE)), (lumaNW + lumaSW) - (lumaNE + lumaSE));
-    float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 / 8.0), 1.0 / 128.0);
-    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
-    dir = clamp(dir * rcpDirMin, vec2(-8.0), vec2(8.0)) * inv;
-    vec3 rgbA = 0.5 * (muestra(uv + dir * (1.0 / 3.0 - 0.5)) + muestra(uv + dir * (2.0 / 3.0 - 0.5)));
-    vec3 rgbB = rgbA * 0.5 + 0.25 * (muestra(uv - dir * 0.5) + muestra(uv + dir * 0.5));
-    float lumaB = dot(rgbB, luma);
-    finalColor = vec4((lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB, 1.0);
-}
-)";
-
-    // AMD FidelityFX Super Resolution 1.0, EASU (ffx_fsr1.h, licencia MIT), con texelFetch en lugar de gather.
-    // Doce texeles alrededor de la posición en la entrada:
-    //    b c
-    //  e f g h
-    //  i j k l
-    //    n o
-    constexpr const char *kEasu = R"(
-float luma(vec3 c) { return c.b * 0.5 + (c.r * 0.5 + c.g); }
-void easuSet(inout vec2 dir, inout float len, float w, float lA, float lB, float lC, float lD, float lE)
-{
-    float dc = lD - lC, cb = lC - lB;
-    float lenX = 1.0 / max(max(abs(dc), abs(cb)), 1.0 / 65536.0);
-    float dirX = lD - lB;
-    dir.x += dirX * w;
-    lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
-    lenX *= lenX;
-    len += lenX * w;
-    float ec = lE - lC, ca = lC - lA;
-    float lenY = 1.0 / max(max(abs(ec), abs(ca)), 1.0 / 65536.0);
-    float dirY = lE - lA;
-    dir.y += dirY * w;
-    lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
-    lenY *= lenY;
-    len += lenY * w;
-}
-void easuTap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c)
-{
-    vec2 v = vec2(off.x * dir.x + off.y * dir.y, off.x * (-dir.y) + off.y * dir.x) * len;
-    float d2 = min(v.x * v.x + v.y * v.y, clp);
-    float wB = 2.0 / 5.0 * d2 - 1.0;
-    float wA = lob * d2 - 1.0;
-    wB *= wB;
-    wA *= wA;
-    wB = 25.0 / 16.0 * wB - (25.0 / 16.0 - 1.0);
-    float w = wB * wA;
-    aC += c * w;
-    aW += w;
-}
-void main()
-{
-    vec2 pp = fragTexCoord * vec2(textureSize(texture0, 0)) - 0.5;
-    vec2 fp = floor(pp);
-    pp -= fp;
-    ivec2 p = ivec2(fp);
-    vec3 b = tap(p + ivec2(0, -1)), c = tap(p + ivec2(1, -1));
-    vec3 e = tap(p + ivec2(-1, 0)), f = tap(p), g = tap(p + ivec2(1, 0)), h = tap(p + ivec2(2, 0));
-    vec3 i = tap(p + ivec2(-1, 1)), j = tap(p + ivec2(0, 1)), k = tap(p + ivec2(1, 1)), l = tap(p + ivec2(2, 1));
-    vec3 n = tap(p + ivec2(0, 2)), o = tap(p + ivec2(1, 2));
-    float bL = luma(b), cL = luma(c), eL = luma(e), fL = luma(f), gL = luma(g), hL = luma(h);
-    float iL = luma(i), jL = luma(j), kL = luma(k), lL = luma(l), nL = luma(n), oL = luma(o);
-    vec2 dir = vec2(0.0);
-    float len = 0.0;
-    easuSet(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);
-    easuSet(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);
-    easuSet(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL);
-    easuSet(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);
-    vec2 dir2 = dir * dir;
-    float dirR = dir2.x + dir2.y;
-    bool zro = dirR < 1.0 / 32768.0;
-    dirR = zro ? 1.0 : inversesqrt(dirR);
-    dir.x = zro ? 1.0 : dir.x;
-    dir *= dirR;
-    len = len * 0.5;
-    len *= len;
-    float stretch = (dir.x * dir.x + dir.y * dir.y) / max(abs(dir.x), abs(dir.y));
-    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
-    float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
-    float clp = 1.0 / lob;
-    vec3 min4 = min(min(f, g), min(j, k));
-    vec3 max4 = max(max(f, g), max(j, k));
-    vec3 aC = vec3(0.0);
-    float aW = 0.0;
-    easuTap(aC, aW, vec2(0.0, -1.0) - pp, dir, len2, lob, clp, b);
-    easuTap(aC, aW, vec2(1.0, -1.0) - pp, dir, len2, lob, clp, c);
-    easuTap(aC, aW, vec2(-1.0, 1.0) - pp, dir, len2, lob, clp, i);
-    easuTap(aC, aW, vec2(0.0, 1.0) - pp, dir, len2, lob, clp, j);
-    easuTap(aC, aW, vec2(0.0, 0.0) - pp, dir, len2, lob, clp, f);
-    easuTap(aC, aW, vec2(-1.0, 0.0) - pp, dir, len2, lob, clp, e);
-    easuTap(aC, aW, vec2(1.0, 1.0) - pp, dir, len2, lob, clp, k);
-    easuTap(aC, aW, vec2(2.0, 1.0) - pp, dir, len2, lob, clp, l);
-    easuTap(aC, aW, vec2(2.0, 0.0) - pp, dir, len2, lob, clp, h);
-    easuTap(aC, aW, vec2(1.0, 0.0) - pp, dir, len2, lob, clp, g);
-    easuTap(aC, aW, vec2(1.0, 2.0) - pp, dir, len2, lob, clp, o);
-    easuTap(aC, aW, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, n);
-    finalColor = vec4(min(max4, max(min4, aC / aW)), 1.0);
-}
-)";
-
-    // FSR 1.0, RCAS (afilado adaptativo al contraste), 1:1 sobre la salida de EASU.
-    constexpr const char *kRcas = R"(
-uniform float nitidez;
-void main()
-{
-    ivec2 p = ivec2(fragTexCoord * vec2(textureSize(texture0, 0)));
-    vec3 b = tap(p + ivec2(0, -1)), d = tap(p + ivec2(-1, 0)), e = tap(p), f = tap(p + ivec2(1, 0)), h = tap(p + ivec2(0, 1));
-    vec3 mn4 = min(min(b, d), min(f, h));
-    vec3 mx4 = max(max(b, d), max(f, h));
-    vec3 hitMin = mn4 / max(4.0 * mx4, vec3(1.0 / 65536.0));
-    vec3 hitMax = (1.0 - mx4) / min(4.0 * mn4 - 4.0, vec3(-1.0 / 65536.0));
-    vec3 lobeRGB = max(-hitMin, hitMax);
-    float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * nitidez;
-    finalColor = vec4((lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0), 1.0);
-}
-)";
-
-    class Presentador
-    {
-    public:
-        void init()
-        {
-            const Config &c = config();
-            if (c.filtro == Filtro::Pixel && !c.fxaa)
-                return;
-            const auto load = [](const char *body)
-            {
-                const std::string source = std::string(kHeader) + body;
-                Shader shader = LoadShaderFromMemory(nullptr, source.c_str());
-                if (!IsShaderValid(shader) || shader.id == rlGetShaderIdDefault())
-                    shader = Shader{};
-                return shader;
-            };
-            m_copy = load(kCopia);
-            m_reducir = load(kReducir);
-            if (c.fxaa)
-                m_fxaa = load(kFxaa);
-            if (c.filtro == Filtro::Fsr)
-            {
-                m_easu = load(kEasu);
-                m_rcas = load(kRcas);
-            }
-            m_ready = m_copy.id != 0u && m_reducir.id != 0u && (!c.fxaa || m_fxaa.id != 0u) &&
-                      (c.filtro != Filtro::Fsr || (m_easu.id != 0u && m_rcas.id != 0u));
-            if (!m_ready)
-                std::cerr << "[presentacion] sombreadores no disponibles: se usa el escalado de antes" << std::endl;
-        }
-
-        // Pasos fuera de la pantalla (FXAA y EASU), antes de BeginDrawing.
-        void prepare(Texture2D &frame, uint32_t srcWidth, uint32_t srcHeight, bool newFrame, const Rectangle &dst)
-        {
-            m_active = m_ready && !IsWindowMinimized() && GetRenderWidth() > 0 && GetRenderHeight() > 0 &&
-                       dst.width >= 1.0f && dst.height >= 1.0f && srcWidth != 0u && srcHeight != 0u;
-            if (!m_active)
-                return;
-            const Config &c = config();
-            const int width = static_cast<int>(dst.width), height = static_cast<int>(dst.height);
-            const bool sizeChanged = width != m_dstWidth || height != m_dstHeight ||
-                                     srcWidth != m_srcWidth || srcHeight != m_srcHeight;
-            if (!newFrame && !sizeChanged && m_prepared)
-                return;
-            m_srcWidth = srcWidth;
-            m_srcHeight = srcHeight;
-            m_dstWidth = width;
-            m_dstHeight = height;
-            if (m_frameFilter != 1)
-            {
-                SetTextureFilter(frame, TEXTURE_FILTER_BILINEAR);
-                m_frameFilter = 1;
-            }
-            m_input = frame;
-            m_inputSrc = Rectangle{0.0f, 0.0f, static_cast<float>(srcWidth), static_cast<float>(srcHeight)};
-            m_inputValid = Vector2{static_cast<float>(srcWidth), static_cast<float>(srcHeight)};
-            // GOW-Port: imagen mayor que el destino (resolución interna): se reduce por área a la salida, sin FXAA (el
-            // supermuestreo ya suaviza los bordes) ni EASU; RCAS afila después como siempre.
-            m_reducido = c.filtro != Filtro::Pixel && (srcWidth > static_cast<uint32_t>(width) || srcHeight > static_cast<uint32_t>(height));
-            if (m_reducido)
-            {
-                ensureTarget(m_easuTarget, width, height);
-                runPass(m_easuTarget, m_reducir, m_input, m_inputSrc, m_inputValid);
-                m_prepared = true;
-                return;
-            }
-            if (c.fxaa)
-            {
-                ensureTarget(m_fxaaTarget, static_cast<int>(srcWidth), static_cast<int>(srcHeight));
-                runPass(m_fxaaTarget, m_fxaa, m_input, m_inputSrc, m_inputValid);
-                m_input = m_fxaaTarget.texture;
-                SetTextureFilter(m_input, c.filtro == Filtro::Pixel ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
-                m_inputSrc = Rectangle{0.0f, 0.0f, static_cast<float>(srcWidth), -static_cast<float>(srcHeight)};
-            }
-            if (c.filtro == Filtro::Fsr && width > 0 && height > 0)
-            {
-                ensureTarget(m_easuTarget, width, height);
-                runPass(m_easuTarget, m_easu, m_input, m_inputSrc, m_inputValid);
-            }
-            m_prepared = true;
-        }
-
-        // Último paso, ya dentro de BeginDrawing. Devuelve false si hay que usar el dibujo de antes.
-        bool draw(const Rectangle &dst)
-        {
-            if (!m_active)
-                return false;
-            const Config &c = config();
-            if (c.filtro == Filtro::Fsr)
-            {
-                const Vector2 size{static_cast<float>(m_easuTarget.texture.width), static_cast<float>(m_easuTarget.texture.height)};
-                BeginShaderMode(m_rcas);
-                setVec2(m_rcas, "fuente", size);
-                const int loc = GetShaderLocation(m_rcas, "nitidez");
-                SetShaderValue(m_rcas, loc, &c.sharpness, SHADER_UNIFORM_FLOAT);
-                DrawTexturePro(m_easuTarget.texture, Rectangle{0.0f, 0.0f, size.x, -size.y}, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-                EndShaderMode();
-                return true;
-            }
-            if (m_reducido)
-            {
-                const Vector2 size{static_cast<float>(m_easuTarget.texture.width), static_cast<float>(m_easuTarget.texture.height)};
-                BeginShaderMode(m_copy);
-                setVec2(m_copy, "fuente", size);
-                DrawTexturePro(m_easuTarget.texture, Rectangle{0.0f, 0.0f, size.x, -size.y}, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-                EndShaderMode();
-                return true;
-            }
-            if (c.filtro == Filtro::Pixel)
-            {
-                // Solo con FXAA: la entrada ya es el resultado del suavizado, sin filtrar al ampliar.
-                DrawTexturePro(m_input, m_inputSrc, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-                return true;
-            }
-            BeginShaderMode(m_copy);
-            setVec2(m_copy, "fuente", m_inputValid);
-            DrawTexturePro(m_input, m_inputSrc, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-            EndShaderMode();
-            return true;
-        }
-
-        void unload()
-        {
-            for (Shader *shader : {&m_copy, &m_reducir, &m_fxaa, &m_easu, &m_rcas})
-                if (shader->id != 0u)
-                    UnloadShader(*shader);
-            for (RenderTexture2D *target : {&m_fxaaTarget, &m_easuTarget})
-                if (target->id != 0u)
-                    UnloadRenderTexture(*target);
-        }
-
-    private:
-        static void setVec2(Shader &shader, const char *name, const Vector2 &value)
-        {
-            SetShaderValue(shader, GetShaderLocation(shader, name), &value, SHADER_UNIFORM_VEC2);
-        }
-
-        static void ensureTarget(RenderTexture2D &target, int width, int height)
-        {
-            if (target.id != 0u && target.texture.width == width && target.texture.height == height)
-                return;
-            if (target.id != 0u)
-                UnloadRenderTexture(target);
-            target = LoadRenderTexture(std::max(width, 1), std::max(height, 1));
-        }
-
-        static void runPass(RenderTexture2D &target, Shader &shader, Texture2D &input, const Rectangle &src, const Vector2 &valid)
-        {
-            BeginTextureMode(target);
-            ClearBackground(BLACK);
-            BeginShaderMode(shader);
-            setVec2(shader, "fuente", valid);
-            DrawTexturePro(input, src,
-                           Rectangle{0.0f, 0.0f, static_cast<float>(target.texture.width), static_cast<float>(target.texture.height)},
-                           Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-            EndShaderMode();
-            EndTextureMode();
-        }
-
-        Shader m_copy{}, m_reducir{}, m_fxaa{}, m_easu{}, m_rcas{};
-        RenderTexture2D m_fxaaTarget{}, m_easuTarget{};
-        Texture2D m_input{};
-        Rectangle m_inputSrc{};
-        Vector2 m_inputValid{};
-        uint32_t m_srcWidth = 0u, m_srcHeight = 0u;
-        int m_dstWidth = 0, m_dstHeight = 0;
-        int m_frameFilter = 0;
-        bool m_ready = false, m_active = false, m_prepared = false, m_reducido = false;
-    };
-#endif
-
-    // Rectángulo de destino en la ventana (píxeles enteros para que RCAS quede 1:1).
-    Rectangle destino(float srcWidth, float srcHeight, const uint8_t *rdram)
-    {
-        const Config &c = config();
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
-        if (c.stretch)
-            return Rectangle{0.0f, 0.0f, screenWidth, screenHeight};
-        float aspect = srcWidth / srcHeight;
-        if (!c.legacyAspect)
-        {
-            aspect = c.fixedAspect;
-            if (aspect <= 0.0f)
-            {
-                const float panoramico = gowAspectoPanoramico();
-                if (panoramico > 0.0f)
-                    aspect = panoramico;
-                else
-                    aspect = rdram && (rdram[0x29CC90u] & 1u) != 0u ? 16.0f / 9.0f : 4.0f / 3.0f;
-            }
-        }
-        float width = screenWidth, height = screenWidth / aspect;
-        if (height > screenHeight)
-        {
-            height = screenHeight;
-            width = screenHeight * aspect;
-        }
-        width = std::max(1.0f, std::round(width));
-        height = std::max(1.0f, std::round(height));
-        return Rectangle{std::floor((screenWidth - width) * 0.5f), std::floor((screenHeight - height) * 0.5f), width, height};
-    }
-
-    // Contador en la esquina superior izquierda de la imagen.
-    void drawFps(const Rectangle &dst)
-    {
-        static double lastTime = 0.0;
-        static uint64_t lastFrames = 0;
-        static int gameFps = 0;
-        const double now = GetTime();
-        const uint64_t frames = g_gowGuestFrames.load(std::memory_order_relaxed);
-        if (lastTime == 0.0)
-        {
-            lastTime = now;
-            lastFrames = frames;
-        }
-        else if (now - lastTime >= 0.5)
-        {
-            gameFps = static_cast<int>(std::lround(static_cast<double>(frames - lastFrames) / (now - lastTime)));
-            lastTime = now;
-            lastFrames = frames;
-        }
-        const int fontSize = std::max(16, static_cast<int>(dst.height / 40.0f));
-        const char *text = TextFormat("%d FPS  |  %d Hz", gameFps, GetFPS());
-        const int textWidth = MeasureText(text, fontSize);
-        const int x = static_cast<int>(dst.x) + fontSize / 2, y = static_cast<int>(dst.y) + fontSize / 2;
-        DrawRectangle(x - fontSize / 3, y - fontSize / 4, textWidth + fontSize * 2 / 3, fontSize + fontSize / 2, Color{0, 0, 0, 150});
-        DrawText(text, x, y, fontSize, gameFps >= 55 ? Color{120, 230, 120, 255} : gameFps >= 28 ? Color{240, 210, 90, 255} : Color{240, 100, 90, 255});
-    }
-
-    // Pruebas: TOBIICHI_CAPTURAS=40,70 guarda la ventana (ventana_40.png...) en la carpeta de trabajo a esos
-    // segundos desde que se abre. Con TOBIICHI_CAPTURAS_JUEGO=1 guarda también la imagen del juego a su tamaño
-    // (juego_40.png...), sin el escalado de la ventana.
-    void capturas(const Texture2D *juego = nullptr, uint32_t juegoAncho = 0u, uint32_t juegoAlto = 0u)
-    {
-        static std::vector<int> pendientes = []
-        {
-            std::vector<int> out;
-            if (const char *value = std::getenv("TOBIICHI_CAPTURAS"))
-            {
-                std::stringstream lista(value);
-                std::string item;
-                while (std::getline(lista, item, ','))
-                    if (!item.empty())
-                        out.push_back(std::atoi(item.c_str()));
-            }
-            std::sort(out.begin(), out.end());
-            return out;
-        }();
-        if (pendientes.empty() || GetTime() < pendientes.front())
-            return;
-        const int seconds = pendientes.front();
-        pendientes.erase(pendientes.begin());
-        rlDrawRenderBatchActive();
-        TakeScreenshot(TextFormat("ventana_%d.png", seconds));
-        static const bool conJuego = [] { const char *v = std::getenv("TOBIICHI_CAPTURAS_JUEGO"); return v && v[0] == '1'; }();
-        if (conJuego && juego && juego->id != 0u && juegoAncho != 0u && juegoAlto != 0u)
-        {
-            Image imagen = LoadImageFromTexture(*juego);
-            ImageCrop(&imagen, Rectangle{0.0f, 0.0f, static_cast<float>(juegoAncho), static_cast<float>(juegoAlto)});
-            ExportImage(imagen, TextFormat("juego_%d.png", seconds));
-            UnloadImage(imagen);
-        }
-    }
-
-    void applyCursor()
-    {
-        if (IsWindowFullscreen())
-            HideCursor();
-        else
-            ShowCursor();
-    }
-
-    // Pantalla completa con el modo de vídeo actual del monitor (no cambia la resolución). En X11/XWayland el
-    // gestor de ventanas la trata como pantalla completa de verdad; ToggleBorderlessWindowed solo quita el marco
-    // y KWin dejaba la ventana en 922x1074 en una pantalla de 1920x1200.
-    void alternarPantallaCompleta()
-    {
-        static int previousWidth = 0, previousHeight = 0;
-        if (!IsWindowFullscreen())
-        {
-            previousWidth = GetScreenWidth();
-            previousHeight = GetScreenHeight();
-            const int monitor = GetCurrentMonitor();
-            SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
-#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
-            // Sin minimizar al perder el foco (GLFW_AUTO_ICONIFY): con la ventana minimizada el framebuffer mide 0 y
-            // el controlador de NVIDIA llegó a fallar dibujando en ella (SIGSEGV en rlDrawRenderBatch).
-            glfwSetWindowAttrib(GetWindowHandle(), 0x00020006 /* GLFW_AUTO_ICONIFY */, 0 /* GLFW_FALSE */);
-#endif
-            ToggleFullscreen();
-        }
-        else
-        {
-            ToggleFullscreen();
-            if (previousWidth > 0 && previousHeight > 0)
-                SetWindowSize(previousWidth, previousHeight);
-        }
-        applyCursor();
-    }
-}
-}
-
 struct ElfHeader
 {
     uint32_t magic;
@@ -1180,187 +481,8 @@ namespace
     }
 }
 
-bool gowGsPresentMailboxActive();       // GOW-Port: gs_threaded_backend.cpp
-uint64_t gowGsPresentMailboxDelivered(); // GOW-Port: gs_threaded_backend.cpp
-
-// GOW-Port: presentación compartida (PS2X_GS_DIRECT_PRESENT=1): la textura del cuadro es del contexto del GS. La
-// textura propia de la ventana se guarda para liberarla al cerrar.
-static bool s_texturaCompartida = false;
-static Texture2D s_texturaPropia{};
-
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight, bool &outNewFrame)
-{
-    outNewFrame = false; // GOW-Port: la presentación (FXAA/FSR) solo se rehace con un cuadro nuevo
-    if (GSSharedPresent::Active())
-    {
-        // El GS compone y publica el cuadro en la GPU; aquí solo se pide y se toma el último terminado.
-        static uint64_t s_tick = std::numeric_limits<uint64_t>::max();
-        static uint64_t s_secuencia = 0u;
-        const uint64_t tick = rt->eeScheduler().currentVSyncTick();
-        if (tick != s_tick)
-        {
-            rt->gs().latchHostPresentationFrame();
-            s_tick = tick;
-        }
-        GSSharedPresent::Frame f;
-        if (GSSharedPresent::Acquire(f) && f.texture && f.width && f.height)
-        {
-            if (!s_texturaCompartida)
-            {
-                s_texturaPropia = tex;
-                s_texturaCompartida = true;
-            }
-            tex = Texture2D{f.texture, static_cast<int>(f.width), static_cast<int>(f.height), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
-            outNewFrame = f.sequence != s_secuencia;
-            s_secuencia = f.sequence;
-        }
-        outWidth = static_cast<uint32_t>(tex.width);
-        outHeight = static_cast<uint32_t>(tex.height);
-        return;
-    }
-    static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-    static bool s_hasLatchedInitialFrame = false;
-    static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
-    static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
-    static bool s_lastPreferred = false;
-    static uint32_t s_lastWidth = 0u;
-    static uint32_t s_lastHeight = 0u;
-    static bool s_hasUploadedFrame = false;
-    static std::vector<uint8_t> s_scratch;
-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
-
-    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
-    if (needsLatch)
-    {
-        rt->gs().latchHostPresentationFrame();
-        s_lastPresentationTick = currentTick;
-        s_hasLatchedInitialFrame = true;
-        // GOW-Port: con el buzón, si el GS no entregó un cuadro nuevo la textura ya lo tiene: no se copia ni se sube.
-        static uint64_t s_uploadedSequence = 0u;
-        const uint64_t sequence = gowGsPresentMailboxActive() ? gowGsPresentMailboxDelivered() : 0u;
-        if (sequence != 0u && sequence == s_uploadedSequence && s_hasUploadedFrame)
-        {
-            outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-            outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
-            return;
-        }
-        s_uploadedSequence = sequence;
-    }
-    else if (s_hasUploadedFrame)
-    {
-        outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
-        return;
-    }
-
-    s_scratch.clear();
-    uint32_t width = 0u;
-    uint32_t height = 0u;
-    uint32_t displayFbp = 0u;
-    uint32_t sourceFbp = 0u;
-    bool usedPreferredDisplaySource = false;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
-                                                   width,
-                                                   height,
-                                                   &displayFbp,
-                                                   &sourceFbp,
-                                                   &usedPreferredDisplaySource))
-    {
-        Image blank = GenImageColor(tex.width, tex.height, MAGENTA); // GOW-Port: del tamaño actual de la textura
-        UpdateTexture(tex, blank.data);
-        UnloadImage(blank);
-        outNewFrame = true;
-        outWidth = FB_WIDTH;
-        outHeight = DEFAULT_DISPLAY_HEIGHT;
-        s_lastWidth = outWidth;
-        s_lastHeight = outHeight;
-        s_hasUploadedFrame = true;
-        return;
-    }
-
-    PS2_IF_AGRESSIVE_LOGS({
-        static uint32_t s_uploadDebugCount = 0u;
-        if (s_uploadDebugCount < 128u ||
-            displayFbp != s_lastDisplayFbp ||
-            sourceFbp != s_lastSourceFbp ||
-            usedPreferredDisplaySource != s_lastPreferred ||
-            width != s_lastWidth ||
-            height != s_lastHeight)
-        {
-            std::cout << "[frame:upload] idx=" << s_uploadDebugCount
-                      << " tick=" << currentTick
-                      << " displayFbp=" << displayFbp
-                      << " sourceFbp=" << sourceFbp
-                      << " size=" << width << "x" << height
-                      << " preferred=" << static_cast<uint32_t>(usedPreferredDisplaySource ? 1u : 0u)
-                      << std::endl;
-        }
-        ++s_uploadDebugCount;
-    });
-    s_lastDisplayFbp = displayFbp;
-    s_lastSourceFbp = sourceFbp;
-    s_lastPreferred = usedPreferredDisplaySource;
-    s_lastWidth = width;
-    s_lastHeight = height;
-
-    // GOW-Port: la textura toma el tamaño del cuadro (resolución interna, también dinámica). Con una textura mayor
-    // que el cuadro había que borrarla y subirla entera en cada cuadro (2048x1792 tras bajar de 4x a 1x).
-    if (width != 0u && height != 0u && s_scratch.size() == static_cast<size_t>(width) * height * 4u &&
-        (width != static_cast<uint32_t>(tex.width) || height != static_cast<uint32_t>(tex.height)))
-    {
-        const int w = static_cast<int>(width);
-        const int h = static_cast<int>(height);
-        Image blank = GenImageColor(w, h, BLANK);
-        UnloadTexture(tex);
-        tex = LoadTextureFromImage(blank);
-        UnloadImage(blank);
-        SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
-        std::fprintf(stderr, "[presentacion] imagen del juego %ux%u\n", width, height);
-    }
-    const size_t texBytes = static_cast<size_t>(tex.width) * static_cast<size_t>(tex.height) * 4u;
-    if (width == static_cast<uint32_t>(tex.width) && height == static_cast<uint32_t>(tex.height) && s_scratch.size() == texBytes)
-    {
-        // El cuadro ocupa toda la textura: se sube sin copia intermedia.
-        UpdateTexture(tex, s_scratch.data());
-        outNewFrame = true;
-        outWidth = width;
-        outHeight = height;
-        s_hasUploadedFrame = true;
-        return;
-    }
-    if (s_uploadBuffer.size() != texBytes)
-        s_uploadBuffer.assign(texBytes, 0u);
-    else
-        std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
-    if (!s_scratch.empty() && width != 0u && height != 0u)
-    {
-        const uint32_t copyWidth = std::min<uint32_t>(width, static_cast<uint32_t>(tex.width));
-        const uint32_t copyHeight = std::min<uint32_t>(height, static_cast<uint32_t>(tex.height));
-        const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(tex.width) * 4u;
-        const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
-        for (uint32_t y = 0; y < copyHeight; ++y)
-        {
-            const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
-            const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
-            if (srcOffset + copyRowBytes > s_scratch.size() ||
-                dstOffset + copyRowBytes > s_uploadBuffer.size())
-            {
-                break;
-            }
-            std::memcpy(s_uploadBuffer.data() + dstOffset, s_scratch.data() + srcOffset, copyRowBytes);
-        }
-    }
-
-    UpdateTexture(tex, s_uploadBuffer.data());
-    outNewFrame = true;
-    outWidth = width;
-    outHeight = height;
-    s_hasUploadedFrame = true;
-}
-
 PS2Runtime::PS2Runtime()
+    : m_hostPresentation(std::make_unique<GSHostPresentation>())
 {
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
@@ -1368,7 +490,6 @@ PS2Runtime::PS2Runtime()
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
 
     // GOW-Port: VU1 sin colas de escritura (un tercio más rápido); GOW_VU1_COLAS=1 vuelve al modelo con colas.
-    // Sin escrituras directas compiledProgramFor() no devuelve nunca el despachador compilado.
     {
         const char *queues = std::getenv("GOW_VU1_COLAS");
         m_vu1.setDirectRegisterWrites(!(queues && std::strcmp(queues, "1") == 0));
@@ -1424,7 +545,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
-        m_memory.syncVu1Worker(); // GOW-Port: el hilo de VU1 usa el GS, que se destruye antes que la memoria
+        m_memory.stopGsWorker(); // GOW-Port: the worker uses m_gs/m_vu1, destroyed before m_memory
 #if !defined(PLATFORM_VITA)
         stopSpu2Audio(); // GOW-Port: antes de destruir el IOP que produce las muestras
 #endif
@@ -1446,10 +567,7 @@ PS2Runtime::~PS2Runtime()
             m_debugUiInitialized = false;
         }
 
-        if (IsWindowReady())
-        {
-            CloseWindow();
-        }
+        shutdownHostGraphics(); // GOW-Port: el host vive hasta destruir el backend GS.
 
         m_loadedModules.clear();
     }
@@ -1508,25 +626,12 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
-    // GOW-Port: GOW_IOP_BATCH=N (ciclos del EE) agrupa los avances del IOP. accountCycles llama aquí en cada
-    // punto de control con pocos ciclos, y cada runCycles atiende SPU2, DMA, temporizadores y el planificador
-    // aunque avance 1 ciclo del IOP. Con N=1024 el IOP va como mucho ~3,4 µs por detrás del EE.
-    // advanceIopEeCycles(0) (espera del planificador) vacía lo acumulado. Sin la variable: sin agrupar.
-    static const uint64_t batch = [] {
-        const char *value = std::getenv("GOW_IOP_BATCH");
-        return value ? static_cast<uint64_t>(std::strtoull(value, nullptr, 0)) : 0ull;
-    }();
-    if (batch != 0u)
-    {
-        static uint64_t pending = 0; // solo el hilo ejecutor del EE (EeScheduler) llama aquí
-        pending += eeCycles;
-        if (eeCycles != 0u && pending < batch)
-            return;
-        eeCycles = pending;
-        pending = 0;
-    }
+    // Called at every EE checkpoint (millions/s): only the batched IOP run is timed, the accrual is a few adds
+    // (the perf scope reads the host clock twice, which was ~40 % of the EE thread with GOW_PERF_DIAG=1).
+    if (!m_iopSubsystem->accrueEeCycles(eeCycles))
+        return;
     ps2_perf::Scope perf(ps2_perf::Bucket::Iop);
-    m_iopSubsystem->runEeCycles(eeCycles);
+    m_iopSubsystem->runPendingEeCycles();
 }
 
 void PS2Runtime::resetIop()
@@ -1569,6 +674,23 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
     return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
 }
 
+// GOW-Port: diagnóstico de PR #12 (927c7b93), adaptado a StepContext de PR #18.
+// GOW_VU1_BUDGET_DIAG=1 observa cortes por presupuesto; no aumenta el límite.
+static void gowReportVu1Budget(const VU1Interpreter &vu1, const char *kind, uint32_t startPC)
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("GOW_VU1_BUDGET_DIAG");
+        return value && *value && *value != '0';
+    }();
+    if (!enabled || !vu1.lastRunHitBudget()) return;
+    static std::atomic<uint64_t> hits{0u};
+    const uint64_t count = hits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (count <= 32u || (count % 1024u) == 0u)
+        std::fprintf(stderr, "[gow-vu1-budget] %s start=0x%04X pc=0x%04X cycles=%llu hits=%llu\n",
+                     kind, startPC, vu1.state().pc, static_cast<unsigned long long>(vu1.state().cycles),
+                     static_cast<unsigned long long>(count));
+}
+
 bool PS2Runtime::syncCoreSubsystems()
 {
     uint8_t *const rdram = m_memory.getRDRAM();
@@ -1586,63 +708,102 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     // GOW-Port: cada flujo conserva su cursor GIF, incluso cuando otro PATH lo interrumpe.
     m_gifArbiter.reset();
+    // GOW-Port: with the GS worker, the GS frontend runs on its own stage thread behind VU1 (gs_stage.h).
+    static const bool gsPipeline = []
+    {
+        const char *worker = std::getenv("PS2X_GS_WORKER");
+        const char *pipeline = std::getenv("PS2X_GS_PIPELINE");
+        return worker && worker[0] == '1' && !(pipeline && pipeline[0] == '0');
+    }();
+    if (gsPipeline)
+        ps2_gs_stage::start([this](GifPathId path, const uint8_t *data, uint32_t size)
+                            { m_gs.processGIFPacket(data, size, path); },
+                            [this]
+                            {
+                                if (m_eeScheduler && (m_memory.gs().csr.load(std::memory_order_acquire) & 0x3u) != 0u)
+                                    m_eeScheduler->postEvent(EeEvent{EeEventType::ExternalWake, 0xFFFFFFFFu, ~0ull});
+                            });
     m_gifArbiter.setProcessPathPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
                                     {
-                                        // GOW-Port: desde el hilo de VU1, a su hilo del GS si está activado.
-                                        if (!m_memory.enqueueGsFront(path, data, size))
+                                        if (gsPipeline && m_memory.onGsWorkerThread())
+                                            ps2_gs_stage::push(path, data, size);
+                                        else
                                             m_gs.processGIFPacket(data, size, path);
                                     });
-    m_memory.setGsFrontProcess([this](GifPathId path, const uint8_t *data, uint32_t size)
-                               { m_gs.processGIFPacket(data, size, path); });
     m_memory.setGifArbiter(&m_gifArbiter);
-    // GOW-Port: con VIF1/VU1 en su hilo, despertar al EE cuando termina cada envío (Dmac no hace nada más).
-    m_memory.setVu1WorkerNotify([this]
-                                  {
-                                      if (m_eeScheduler)
-                                          m_eeScheduler->postEvent(EeEvent{EeEventType::Dmac});
-                                  });
-    m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+    // GOW-Port: on the GS worker (PS2X_GS_WORKER=1) the EE context belongs to another thread: the D/T-bit
+    // enables come from the FBRST captured when the job was queued, and VPU_STAT is not written back
+    // (this game has no CFC2/CTC2).
+    auto eeContextForVu1 = [this]() -> R5900Context *
+    {
+        if (m_memory.onGsWorkerThread())
+            return nullptr;
+        R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+        return cpuContext ? cpuContext : &m_cpuContext;
+    };
+    auto setVu1StopEnables = [this](const R5900Context *cpuContext)
+    {
+        const uint32_t fbrst = cpuContext ? cpuContext->vu0_fbrst : m_memory.gsWorkerJobFbrst();
+        m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+        m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
+    };
+    auto publishVu1Stop = [this](R5900Context *cpuContext)
+    {
+        if (!cpuContext)
+            return;
+        cpuContext->vu0_vpu_stat =
+            (cpuContext->vu0_vpu_stat & ~0x0600u) |
+            (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+            (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+    };
+    m_memory.setFbrstProvider([eeContextForVu1]() { return eeContextForVu1()->vu0_fbrst; });
+    // ExternalWake with a type no thread waits on: only runs the event pass (which polls the GS interrupt).
+    m_memory.setGsWorkerWake([this]()
+                             {
+                                 if (m_eeScheduler)
+                                     m_eeScheduler->postEvent(EeEvent{EeEventType::ExternalWake, 0xFFFFFFFFu, ~0ull});
+                             });
+    m_memory.setVu1MscalCallback([this, eeContextForVu1, setVu1StopEnables, publishVu1Stop](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     // GOW-Port: desde el hilo de VU1 no se consulta el planificador del EE.
-                                     R5900Context *cpuContext = m_eeScheduler && !m_memory.onVu1WorkerThread()
-                                                                    ? m_eeScheduler->currentContext()
-                                                                    : nullptr;
-                                     if (!cpuContext)
+                                     R5900Context *cpuContext = eeContextForVu1();
+                                     setVu1StopEnables(cpuContext);
+                                     // GOW-Port: GOW_VU1_PCSX2=1 runs VU1 on PCSX2's interpreter (vu_pcsx2, A/B test).
+                                     if (gowUsePcsx2Vu1())
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         const auto result = pcsx2vu1::run(
+                                             m_memory.getVU1Code(), m_memory.getVU1Data(), startPC, top, itop,
+                                             m_vu1.state().dBitEnabled, m_vu1.state().tBitEnabled, 65536,
+                                             [this](const uint8_t *packet, uint32_t size)
+                                             { m_memory.submitGifPacket(GifPathId::Path1, packet, size); });
+                                         m_vu1.state().stoppedByD = result.stoppedByD;
+                                         m_vu1.state().stoppedByT = result.stoppedByT;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     else
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
-    m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
+                                     gowReportVu1Budget(m_vu1, "MSCAL", startPC);
+                                     publishVu1Stop(cpuContext); });
+    m_memory.setVu1MscntCallback([this, eeContextForVu1, setVu1StopEnables, publishVu1Stop](uint32_t top, uint32_t itop)
                                  {
-                                     // GOW-Port: desde el hilo de VU1 no se consulta el planificador del EE.
-                                     R5900Context *cpuContext = m_eeScheduler && !m_memory.onVu1WorkerThread()
-                                                                    ? m_eeScheduler->currentContext()
-                                                                    : nullptr;
-                                     if (!cpuContext)
+                                     R5900Context *cpuContext = eeContextForVu1();
+                                     setVu1StopEnables(cpuContext);
+                                     if (gowUsePcsx2Vu1())
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         const auto result = pcsx2vu1::run(
+                                             m_memory.getVU1Code(), m_memory.getVU1Data(), -1, top, itop,
+                                             m_vu1.state().dBitEnabled, m_vu1.state().tBitEnabled, 65536,
+                                             [this](const uint8_t *packet, uint32_t size)
+                                             { m_memory.submitGifPacket(GifPathId::Path1, packet, size); });
+                                         m_vu1.state().stoppedByD = result.stoppedByD;
+                                         m_vu1.state().stoppedByT = result.stoppedByT;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     else
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     gowReportVu1Budget(m_vu1, "MSCNT", 0xFFFFu);
+                                     publishVu1Stop(cpuContext); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -1652,11 +813,14 @@ bool PS2Runtime::syncCoreSubsystems()
     return true;
 }
 
-void ps2AfinidadReservar(); // GOW-Port: ps2_afinidad.cpp
+static bool gowUsePcsx2Vu1()
+{
+    static const bool enabled = [] { const char *v = std::getenv("GOW_VU1_PCSX2"); return v && v[0] == '1'; }();
+    return enabled;
+}
 
 bool PS2Runtime::initialize(const char *title)
 {
-    ps2AfinidadReservar(); // GOW-Port: un núcleo físico para el hilo de VU1
     try
     {
         if (!m_memory.initialize())
@@ -1665,56 +829,33 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
 
-        if (!syncCoreSubsystems())
-        {
-            std::cerr << "Failed to bind runtime core subsystems" << std::endl;
-            return false;
-        }
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        // GOW-Port: tamaño, pantalla completa, sincronía vertical, título e icono (lanzador).
-        const presentacion::Ventana ventana = presentacion::ventana();
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE | (ventana.vsync ? FLAG_VSYNC_HINT : 0u));
-        const char *customTitle = std::getenv("TOBIICHI_TITULO");
-        InitWindow(ventana.width, ventana.height, customTitle && *customTitle ? customTitle : title);
-        // GOW-Port: GLFW pone LC_CTYPE del sistema. Con tr_TR, tolower('I') es 'I' y toupper('i') es 'i': fallaban las
-        // comparaciones ASCII de nombres (módulos IRX, archivos del disco). El juego no usa entrada de texto.
-        std::setlocale(LC_CTYPE, "C");
-        // GOW-Port: presentación compartida (PS2X_GS_DIRECT_PRESENT=1). El GS crea su contexto al construirse, antes que
-        // la ventana: tras capturar el de la ventana se vuelve a crear el backend, ahora con un contexto compartido.
-        GSSharedPresent::CaptureHostContext();
-        if (const char *directo = std::getenv("PS2X_GS_DIRECT_PRESENT"); directo && directo[0] == '1')
+        // GOW-Port: ventana del lanzador (gow_integracion.cpp): tamaño, pantalla completa, vsync, título, icono.
+        gowVentanaAbrir(title);
+#endif
+        m_hostWindowOwned = IsWindowReady();
+        if (!m_hostWindowOwned)
         {
-            m_gs.setRasterBackend(GSThreadedBackend::MakeDefault());
-            GSSharedPresent::RestoreHostContext(); // en Windows la captura suelta el contexto de la ventana
+            std::cerr << "Failed to create the runtime host window" << std::endl;
+            return false;
         }
-        SetWindowMinSize(320, 224);
-        if (const char *icon = std::getenv("TOBIICHI_ICONO"); icon && *icon)
+        // GOW-Port: el backend GPU solo puede compartir si el host ya existe.
+        m_hostPresentation->captureHostContext();
+        if (!syncCoreSubsystems())
         {
-            Image image = LoadImage(icon);
-            if (image.data)
-            {
-                SetWindowIcon(image);
-                UnloadImage(image);
-            }
+            std::cerr << "Failed to bind runtime core subsystems" << std::endl;
+            shutdownHostGraphics();
+            return false;
         }
-        if (ventana.fullscreen)
-            presentacion::alternarPantallaCompleta();
-        if (!ventana.escExits)
-            SetExitKey(KEY_NULL);
+        m_hostPresentation->restoreHostContext();
+#if !defined(PLATFORM_VITA)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         startSpu2Audio(m_iopSubsystem.get()); // GOW-Port
 #endif
-        // GOW-Port: límite de la ventana (TOBIICHI_VENTANA_FPS, 120 por defecto; antes 60; 0 = sin límite). El juego
-        // sigue limitado por sus VBlanks; la ventana muestra el último cuadro listo (buzón) con menos espera en
-        // pantallas de 120/144 Hz.
-        {
-            const char *value = std::getenv("TOBIICHI_VENTANA_FPS");
-            const long fps = value ? std::strtol(value, nullptr, 10) : 120;
-            SetTargetFPS(fps == 0 ? 0 : static_cast<int>(std::clamp<long>(fps, 30, 360)));
-        }
+        SetTargetFPS(gowVentanaFps()); // GOW-Port: TOBIICHI_VENTANA_FPS (60 por defecto)
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -1732,7 +873,19 @@ bool PS2Runtime::initialize(const char *title)
         std::cerr << "Failed to initialize PS2 runtime: unknown exception" << std::endl;
     }
 
+    shutdownHostGraphics(); // GOW-Port: cubrir también errores después de capturar WGL.
     return false;
+}
+
+void PS2Runtime::shutdownHostGraphics()
+{
+    if (!m_hostWindowOwned)
+        return;
+    m_memory.stopGsWorker(); // GOW-Port: no GS work after the host context goes away
+    m_hostPresentation->shutdown(m_gs);
+    if (IsWindowReady())
+        CloseWindow();
+    m_hostWindowOwned = false;
 }
 
 bool PS2Runtime::loadELF(const std::string &elfPath)
@@ -1986,29 +1139,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
                                       m_cpuContext.pc,
                                       elfCrc32,
                                       elfCrc32Valid);
-
-    // GOW-Port: teclado configurable y bloqueo del mando con el menú de trucos (ver tobiichiPad2Read). Solo God of War.
-    if (std::filesystem::path(elfPath).filename() == "SCUS_973.99" && hasFunction(kGowPad2Read))
-    {
-        const RecompiledFunction actual = lookupFunction(kGowPad2Read);
-        if (actual != &tobiichiPad2Read)
-        {
-            g_gowPad2Read = actual;
-            replaceFunction(kGowPad2Read, &tobiichiPad2Read);
-            if (std::getenv("TOBIICHI_TECLAS"))
-                std::cerr << "[teclado] mapa configurable activo (TOBIICHI_TECLAS); sticks del teclado desde el mapa" << std::endl;
-        }
-    }
-    gowTrucosInstalar(*this, elfPath); // GOW-Port
-    gowPeliculasInstalar(*this, elfPath); // GOW-Port
-    gowVideoInstalar(*this, elfPath);     // GOW-Port: escaneo progresivo siempre activado
-    gowFijarInstalar(*this, elfPath);     // GOW-Port: fijar objetivo (envuelve la lectura del mando)
-    gowCancelarInstalar(*this, elfPath);  // GOW-Port: cancelar ataques (después de fijar: encadena su envoltorio)
-    gowCapturaGsInstalar(*this);          // GOW-Port: GOW_GS_REPLAY_TRACE (diagnóstico)
-    gowSondeoInstalar(*this);             // GOW-Port: GOW_SONDEO (diagnóstico)
-    gowIconosInstalar(*this, elfPath);    // GOW-Port: iconos de botones según el dispositivo
-    ps2MuestreoIniciar();                 // GOW-Port: perfil por muestreo opcional
-    gowEsperaInstalar(*this, elfPath);    // GOW-Port: el EE duerme mientras espera el cuadro
+    gowIntegracionInstalar(*this, elfPath); // GOW-Port: funciones de Tobiichi Port (gow_integracion.cpp)
 
     RUNTIME_LOG("ELF file loaded successfully. Entry point: 0x" << std::hex << m_cpuContext.pc << std::dec);
     return true;
@@ -2133,6 +1264,25 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
     default:
         return "Unknown";
     }
+}
+
+// GOW-Port: exact PMULTH (PCSX2 MMI.cpp). The recompiler template summed the eight halfword products into one scalar;
+// the instruction stores them separately: LO={p0,p1,p4,p5}, HI={p2,p3,p6,p7}, Rd={LO0,HI0,LO2,HI2}.
+void ps2PmulthExec(R5900Context *ctx, int rs, int rt, int rd)
+{
+    const __m128i a = rs ? ctx->r[rs] : _mm_setzero_si128();
+    const __m128i b = rt ? ctx->r[rt] : _mm_setzero_si128();
+    const __m128i lo16 = _mm_mullo_epi16(a, b);
+    const __m128i hi16 = _mm_mulhi_epi16(a, b);
+    uint32_t p[8];
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(p), _mm_unpacklo_epi16(lo16, hi16));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(p + 4), _mm_unpackhi_epi16(lo16, hi16));
+    ctx->lo = static_cast<uint64_t>(p[0]) | (static_cast<uint64_t>(p[1]) << 32);
+    ctx->hi = static_cast<uint64_t>(p[2]) | (static_cast<uint64_t>(p[3]) << 32);
+    ctx->lo1 = static_cast<uint64_t>(p[4]) | (static_cast<uint64_t>(p[5]) << 32);
+    ctx->hi1 = static_cast<uint64_t>(p[6]) | (static_cast<uint64_t>(p[7]) << 32);
+    if (rd)
+        ctx->r[rd] = _mm_set_epi32(static_cast<int>(p[6]), static_cast<int>(p[4]), static_cast<int>(p[2]), static_cast<int>(p[0]));
 }
 
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
@@ -2339,7 +1489,6 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
 
     if (policy == MissingFunctionPolicy::Stop)
     {
-        std::fprintf(stderr, "[cierre] función inexistente 0x%x con la política Stop\n", targetPc); // GOW-Port
         requestStop();
     }
 }
@@ -2365,7 +1514,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
-    { uint32_t k = g_gowRingPos.fetch_add(1) & 255u; g_gowRing[k] = {sourcePc, targetPc, ctx ? (uint32_t)_mm_cvtsi128_si32(ctx->r[31]) : 0u, (uint32_t)kind}; }
+    // Guest code runs on the EE executor thread only: a relaxed load/store pair instead of a locked fetch_add.
+    { const uint32_t pos = g_gowRingPos.load(std::memory_order_relaxed); g_gowRingPos.store(pos + 1u, std::memory_order_relaxed);
+      g_gowRing[pos & 255u] = {sourcePc, targetPc, ctx ? (uint32_t)_mm_cvtsi128_si32(ctx->r[31]) : 0u, (uint32_t)kind}; }
 
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
@@ -2416,9 +1567,25 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t entryPc = ctx->pc;
     const uint64_t checkpointSerial = m_eeCheckpointSerial;
     const uint64_t jumpSerial = g_guestJumpSerial;
-    ps2_perf::guestEntry(targetPc); // GOW-Port: también cuenta llamadas que no vuelven al dispatcher.
-    gowCountGuestFrame(targetPc, rdram);
+    ps2_perf::guestEntry(targetPc, rdram); // GOW-Port: también cuenta llamadas que no vuelven al dispatcher.
+    // GOW-Port: PS2X_GS_WORKER_TRACE=<s>: for 2 s after <s> s of uptime, host µs of vid::Flip (0x1837B8),
+    // vid::WaitForDMAComplete (0x183878) and 0x13F730 entry/return, to see the per-frame dependency chain.
+    static const double traceFrom = [] { const char *v = std::getenv("PS2X_GS_WORKER_TRACE"); return v ? std::atof(v) : -1.0; }();
+    const bool traced = traceFrom >= 0.0 && (targetPc == 0x1837B8u || targetPc == 0x183878u || targetPc == 0x13F730u);
+    static const auto traceStart = std::chrono::steady_clock::now();
+    auto traceEvent = [&](const char *what)
+    {
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - traceStart).count();
+        if (s >= traceFrom && s < traceFrom + 2.0)
+            std::fprintf(stderr, "[gsw-trace] %.0f %s 0x%X\n",
+                         std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+                         what, targetPc);
+    };
+    if (traced)
+        traceEvent("enter");
     targetFn(rdram, ctx, this);
+    if (traced)
+        traceEvent("leave");
 
     if (isStopRequested() || ctx->pc == 0u)
     {
@@ -3068,8 +2235,36 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
     return top - 0x10u;
 }
 
+// GOW-Port: GOW_IO_HIST=<s>: hardware register accesses by (op, address, pc, ra) for <s> seconds after the first
+// access, then printed once. Shows which game code still talks to hardware (docs/native-port.md).
+static void ioHist(const char *op, uint32_t vaddr, const R5900Context *ctx)
+{
+    static const double window = [] { const char *v = std::getenv("GOW_IO_HIST"); return v ? std::atof(v) : 0.0; }();
+    if (window <= 0.0)
+        return;
+    static std::mutex mutex;
+    static std::map<std::tuple<std::string, uint32_t, uint32_t, uint32_t>, uint64_t> counts;
+    static std::chrono::steady_clock::time_point start;
+    static bool done = false;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (done)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (counts.empty())
+        start = now;
+    ++counts[{op, vaddr, ctx ? ctx->pc : 0u, ctx ? static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])) : 0u}];
+    if (std::chrono::duration<double>(now - start).count() < window)
+        return;
+    done = true;
+    for (const auto &[key, count] : counts)
+        std::fprintf(stderr, "[io-hist] %s %08x pc=%08x ra=%08x n=%llu\n", std::get<0>(key).c_str(), std::get<1>(key),
+                     std::get<2>(key), std::get<3>(key), static_cast<unsigned long long>(count));
+    std::fflush(stderr);
+}
+
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    ioHist("R8", vaddr, ctx);
     try
     {
         return m_memory.read8(vaddr);
@@ -3083,6 +2278,7 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    ioHist("R16", vaddr, ctx);
     try
     {
         return m_memory.read16(vaddr);
@@ -3096,6 +2292,7 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    ioHist("R32", vaddr, ctx);
     try
     {
         return m_memory.read32(vaddr);
@@ -3109,6 +2306,7 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    ioHist("R64", vaddr, ctx);
     try
     {
         return m_memory.read64(vaddr);
@@ -3122,6 +2320,7 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    ioHist("R128", vaddr, ctx);
     try
     {
         return m_memory.read128(vaddr);
@@ -3135,6 +2334,7 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
 {
+    ioHist("W8", vaddr, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
     try
     {
@@ -3148,6 +2348,7 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
 
 void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value)
 {
+    ioHist("W16", vaddr, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 2u, value, 0u, "WRITE16", ctx);
     try
     {
@@ -3161,6 +2362,7 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
+    ioHist("W32", vaddr, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
     try
     {
@@ -3175,6 +2377,7 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value)
 {
+    ioHist("W64", vaddr, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
     try
     {
@@ -3188,6 +2391,7 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m128i value)
 {
+    ioHist("W128", vaddr, ctx);
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
     ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
@@ -3201,38 +2405,17 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
     }
 }
 
+// The recompiler turns the store sequence D_PCR, D_STAT, GIF TADR, GIF CHCR (a GIF chain kick) into this call: the chain
+// goes to the GIF path natively and its DMA-end handlers run (D_PCR / D_STAT values are not kept: there is no DMAC).
 void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
-                                         R5900Context *ctx,
-                                         uint32_t dPcrValue,
-                                         uint32_t dStatValue,
+                                         R5900Context *,
+                                         uint32_t,
+                                         uint32_t,
                                          uint32_t tadr,
-                                         uint32_t chcr)
+                                         uint32_t)
 {
-    constexpr uint32_t D_PCR = 0x1000E020u;
-    constexpr uint32_t D_STAT = 0x1000E010u;
-    constexpr uint32_t GIF_TADR = 0x1000A030u;
-    constexpr uint32_t GIF_CHCR = 0x1000A000u;
-
-    ps2TraceGuestWrite(rdram, D_PCR, 4u, dPcrValue, 0u, "WRITE32", ctx);
-    m_memory.writeIORegister(D_PCR, dPcrValue);
-    ps2TraceGuestWrite(rdram, D_STAT, 4u, dStatValue, 0u, "WRITE32", ctx);
-    m_memory.writeIORegister(D_STAT, dStatValue);
-    ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
-    m_memory.writeIORegister(GIF_TADR, tadr);
-    ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
-    if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
-    {
-        drainCompletedDmacHandlers(rdram);
-        return;
-    }
-    if (m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
-    {
-        drainCompletedDmacHandlers(rdram);
-        return;
-    }
-    m_memory.writeIORegister(GIF_CHCR, chcr);
-    m_memory.processPendingTransfers();
-    drainCompletedDmacHandlers(rdram);
+    m_memory.sendDmaChain(PS2Memory::DmaPath::Gif, tadr);
+    ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, 2u);
 }
 
 void PS2Runtime::requestStop()
@@ -3414,28 +2597,21 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
-
     std::atomic<bool> gameThreadFinished{false};
-#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
-    presentacion::Presentador presentador; // GOW-Port
-    presentador.init();
-#endif
 
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        // GOW-Port: EE FPU like PCSX2's default (Pcsx2Config.cpp DEFAULT_FPU_FP_CONTROL_REGISTER): round toward
+        // zero, flush-to-zero and denormals-are-zero for all EE float math on this thread (division keeps its own
+        // round-to-nearest, see ps2FpuDivideNearest, = PCSX2's FPUDivFPCR). GOW_EE_FPU_NEAREST=1 = old behavior.
+        if (const char *nearest = std::getenv("GOW_EE_FPU_NEAREST"); !(nearest && nearest[0] == '1'))
+            _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
             m_eeScheduler->run();
             uint32_t pc = m_debugPc.load(std::memory_order_relaxed);
-            // GOW-Port: el motivo de cada cierre queda en el registro (también en Release).
-            std::fprintf(stderr, "[cierre] el hilo del juego terminó (pc=0x%x, parada pedida=%d)\n", pc,
-                         isStopRequested() ? 1 : 0);
             RUNTIME_LOG("Game thread returned. PC=0x" << std::hex << pc
                       << " RA=0x" << static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)) << std::dec << std::endl);
         }
@@ -3502,144 +2678,18 @@ void PS2Runtime::run()
                 }
             }
         });
-        uint32_t presentWidth = FB_WIDTH;
-        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        bool newFrame = false;
+        gowCuadroEntrada(); // GOW-Port: F11, menú de trucos (F2), fijar objetivo (gow_integracion.cpp)
+        // GOW-Port: el helper real termina el batch antes del próximo Acquire.
+        m_hostPresentation->renderFrame(m_gs, m_eeScheduler->currentVSyncTick(), [this]
         {
-            ps2_perf::Scope perf(ps2_perf::Bucket::Upload);
-            UploadFrame(frameTex, this, presentWidth, presentHeight, newFrame);
-        }
-
-        // GOW-Port: F11 alterna la pantalla completa.
-        if (IsKeyPressed(KEY_F11))
-            presentacion::alternarPantallaCompleta();
-        static const bool escCierraJuego = presentacion::ventana().escExits;
-        gowTrucosMenuEntrada(escCierraJuego); // GOW-Port: F2, menú de trucos
-        gowFijarEntrada();                    // GOW-Port: Alt fija el objetivo, el ratón lo cambia
-        if (IsWindowResized())
-            std::cerr << "[presentacion] ventana " << GetScreenWidth() << "x" << GetScreenHeight()
-                      << (IsWindowFullscreen() ? " (pantalla completa)" : "") << std::endl;
-        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
-        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        // GOW-Port: proporción (TOBIICHI_ASPECTO / panorámico) y escalado (TOBIICHI_FILTRO, TOBIICHI_FXAA).
-        const Rectangle dstRect = presentacion::destino(srcWidth, srcHeight, m_memory.getRDRAM());
-        // GOW-Port: vídeos (FMV). God of War los muestra con un truco de la memoria del GS (relee la imagen RGB32 como
-        // PSMZ16 y la redibuja en franjas) que nuestro GS no reproduce. Mientras el juego reproduce un vídeo, la
-        // ventana muestra el cuadro que decodifica FFmpeg (el mismo que recibe el juego), con su proporción.
-        static Texture2D fmvTex{};
-        static uint64_t fmvSerie = 0u, fmvSerieInicio = 0u;
-        static bool fmvAntes = false;
-        static std::vector<uint8_t> fmvPixeles;
-        const bool fmvActivo = gowPeliculaEnPantalla(m_memory.getRDRAM());
-        if (fmvActivo && !fmvAntes)
-            fmvSerieInicio = ps2MpegSerieCuadroPantalla(); // no mostrar el último cuadro de un vídeo anterior
-        fmvAntes = fmvActivo;
-        bool fmvListo = false;
-        if (fmvActivo)
-        {
-            int w = 0, h = 0;
-            if (ps2MpegCuadroPantalla(fmvPixeles, w, h, fmvSerie) && w > 0 && h > 0)
-            {
-                if (fmvTex.id == 0 || fmvTex.width != w || fmvTex.height != h)
-                {
-                    if (fmvTex.id != 0)
-                        UnloadTexture(fmvTex);
-                    Image img{fmvPixeles.data(), w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
-                    fmvTex = LoadTextureFromImage(img);
-                    SetTextureFilter(fmvTex, TEXTURE_FILTER_BILINEAR);
-                }
-                else
-                    UpdateTexture(fmvTex, fmvPixeles.data());
-            }
-            fmvListo = fmvTex.id != 0 && fmvSerie > fmvSerieInicio;
-        }
-        {
-            // GOW-Port: GOW_FMV_DIAG=1: cada ~2 s, estado del vídeo en la ventana (cuadro y brillo medio).
-            static const bool fmvDiag = [] { const char *v = std::getenv("GOW_FMV_DIAG"); return v && v[0] == '1'; }();
-            static unsigned fmvDiagTick = 0;
-            if (fmvDiag && (fmvActivo || fmvAntes) && ++fmvDiagTick % 240u == 0u)
-            {
-                uint64_t brillo = 0u;
-                for (size_t i = 0; i + 3u < fmvPixeles.size(); i += 4u * 97u)
-                    brillo += fmvPixeles[i] + fmvPixeles[i + 1u] + fmvPixeles[i + 2u];
-                const size_t muestras = fmvPixeles.size() / (4u * 97u);
-                std::fprintf(stderr, "[fmv-ventana] activo=%d listo=%d serie=%llu inicio=%llu brillo=%.1f\n", fmvActivo ? 1 : 0,
-                             fmvListo ? 1 : 0, static_cast<unsigned long long>(fmvSerie),
-                             static_cast<unsigned long long>(fmvSerieInicio), muestras ? brillo / (3.0 * muestras) : 0.0);
-            }
-        }
-
-        // GOW-Port: el vídeo, a su proporción y con el mismo escalado que el juego (FSR/FXAA si están activos).
-        Rectangle fmvDst{};
-        if (fmvListo)
-        {
-            const float sw = static_cast<float>(GetScreenWidth()), sh = static_cast<float>(GetScreenHeight());
-            const float escala = std::min(sw / static_cast<float>(fmvTex.width), sh / static_cast<float>(fmvTex.height));
-            const float dw = std::max(1.0f, std::floor(fmvTex.width * escala)), dh = std::max(1.0f, std::floor(fmvTex.height * escala));
-            fmvDst = Rectangle{std::floor((sw - dw) * 0.5f), std::floor((sh - dh) * 0.5f), dw, dh};
-        }
-#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
-        {
-            static bool fuenteFmv = false; // la fuente cambió: hay que volver a preparar aunque no haya cuadro nuevo
-            static uint64_t fmvSeriePreparada = 0u;
-            if (fmvListo)
-            {
-                const bool nuevo = !fuenteFmv || fmvSerie != fmvSeriePreparada;
-                presentador.prepare(fmvTex, static_cast<uint32_t>(fmvTex.width), static_cast<uint32_t>(fmvTex.height), nuevo, fmvDst);
-                fmvSeriePreparada = fmvSerie;
-            }
-            else
-                presentador.prepare(frameTex, presentWidth, presentHeight, newFrame || fuenteFmv, dstRect);
-            fuenteFmv = fmvListo;
-        }
-#endif
-
-        BeginDrawing();
-        ClearBackground(BLACK);
-        // GOW-Port: minimizada (framebuffer de 0) no se dibuja; solo se atienden la entrada y el ritmo.
-        const bool dibujar = !IsWindowMinimized() && GetRenderWidth() > 0 && GetRenderHeight() > 0;
-        if (dibujar && fmvListo)
-        {
-#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
-            if (!presentador.draw(fmvDst))
-#endif
-                DrawTexturePro(fmvTex, Rectangle{0.0f, 0.0f, static_cast<float>(fmvTex.width), static_cast<float>(fmvTex.height)},
-                               fmvDst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        }
-        else
-#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
-        if (dibujar && !presentador.draw(dstRect))
-#else
-        if (dibujar)
-#endif
-            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        if (dibujar && !fmvListo)
-        {
-            gowFijarDibujar(dstRect.x, dstRect.y, dstRect.width, dstRect.height); // GOW-Port
-            gowIconosDibujar(dstRect.x, dstRect.y, dstRect.width, dstRect.height); // GOW-Port
-        }
-        if (dibujar && presentacion::config().fps)
-            presentacion::drawFps(dstRect);
-        if (dibujar)
-            gowTrucosMenuDibujar(); // GOW-Port
-        if (m_debugUiInitialized && m_debugUiDrawCallback)
-        {
-            m_debugUiDrawCallback(*this, m_debugUiUserData);
-        }
-        presentacion::capturas(&frameTex, presentWidth, presentHeight); // GOW-Port
-        {
-            ps2_perf::Scope perf(ps2_perf::Bucket::HostWait);
-            EndDrawing();
-        }
+            if (m_debugUiInitialized && m_debugUiDrawCallback)
+                m_debugUiDrawCallback(*this, m_debugUiUserData);
+        });
         if (ps2_perf::countFrames()) ps2_perf::hostFrames.fetch_add(1, std::memory_order_relaxed);
         ps2_perf::report();
 
-        // GOW-Port: pruebas: TOBIICHI_CERRAR_TRAS=N cierra como el botón de la ventana a los N segundos.
-        static const double cerrarTras = [] { const char *v = std::getenv("TOBIICHI_CERRAR_TRAS"); return v ? std::atof(v) : 0.0; }();
-        if (WindowShouldClose() || (cerrarTras > 0.0 && GetTime() >= cerrarTras))
+        if (WindowShouldClose())
         {
-            std::fprintf(stderr, "[cierre] la ventana pidió cerrarse (botón de cerrar o tecla de salida)\n"); // GOW-Port
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
             requestStop();
             break;
@@ -3657,15 +2707,7 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    // GOW-Port: el contexto GL del GS cuelga de GLFW y CloseWindow (glfwTerminate) lo destruye. Antes se vacía la cola
-    // del GS y su backend OpenGL se destruye en su propio hilo, cambiando a un backend CPU (la VRAM pasa por copia).
-    // Sin esto el hilo del GS podía seguir dibujando con el contexto ya destruido (SIGSEGV al cerrar).
-    m_gs.setRasterBackend(std::make_unique<GSCpuBackend>());
-#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
-    presentador.unload();
-#endif
-    UnloadTexture(s_texturaCompartida ? s_texturaPropia : frameTex); // GOW-Port: la compartida es del GS
-    CloseWindow();
+    shutdownHostGraphics();
 
     RUNTIME_LOG("[run] exiting loop");
 }

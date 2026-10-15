@@ -26,8 +26,6 @@ namespace ps2_stubs
 
     void exit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::fprintf(stderr, "[cierre] el juego llamó a exit(%d) (ra=0x%x)\n", static_cast<int32_t>(getRegU32(ctx, 4)),
-                     getRegU32(ctx, 31)); // GOW-Port
         if (runtime)
         {
             runtime->requestStop();

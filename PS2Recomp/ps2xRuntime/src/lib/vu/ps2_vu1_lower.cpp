@@ -4,30 +4,21 @@
 #include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
 
-#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
-void vu1RapidoResolverMac(uint32_t &mac, uint64_t ciclo); // GOW-Port: ps2_vu1_core.cpp (modo rápido de VU1)
-#endif
-
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <immintrin.h>
+
+// GOW-Port: la aritmética de VU no depende de /fp:fast. El runtime se compila con /fp:fast, que deja al
+// compilador fusionar a*b+c en FMA según dónde esté el código: el intérprete y el microcódigo compilado
+// (o dos versiones del intérprete) podían dar resultados distintos. Aquí cada operación se redondea por
+// separado, como en las FMAC de la PS2 (y en PCSX2).
+#if defined(_MSC_VER)
+#pragma float_control(precise, on, push)
+#pragma fp_contract(off)
+#endif
 
 namespace
 {
-    inline void fastStoreDest(float *dst, const float *src, uint8_t dest)
-    {
-        if (__builtin_expect(dest == 0xFu, 1))
-        {
-            _mm_storeu_ps(dst, _mm_loadu_ps(src));
-            return;
-        }
-        if (dest & 0x8u) dst[0] = src[0];
-        if (dest & 0x4u) dst[1] = src[1];
-        if (dest & 0x2u) dst[2] = src[2];
-        if (dest & 0x1u) dst[3] = src[3];
-    }
-
     float vuEatan(float value)
     {
         constexpr float coefficients[] = {
@@ -88,8 +79,10 @@ namespace
 // ============================================================================
 // Lower instructions
 // ============================================================================
+unsigned long long g_vuLowerHist[128]; // GOW-Port: GOW_VU1_STATS op histogram of the generic path
 void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
 {
+    ++g_vuLowerHist[(instr >> 25) & 0x7Fu];
     (void)upperInstr;
     if (instr == 0x00000000 || instr == 0x8000033C) // NOP
         return;
@@ -110,7 +103,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         addr &= (dataSize - 1);
         if (addr + 16 <= dataSize)
         {
-            fastStoreDest(m_state.vf[it], reinterpret_cast<const float *>(vuData + addr), dest);
+            float tmp[4];
+            std::memcpy(tmp, vuData + addr, 16);
+            applyDest(m_state.vf[it], tmp, dest);
         }
         return;
     }
@@ -124,7 +119,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         addr &= (dataSize - 1);
         if (addr + 16 <= dataSize)
         {
-            queueStore(addr, reinterpret_cast<const uint32_t *>(m_state.vf[is]), dest);
+            uint32_t words[4]{};
+            std::memcpy(words, m_state.vf[is], sizeof(words));
+            queueStore(addr, words, dest);
         }
         return;
     }
@@ -253,10 +250,6 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     case 0x18: // FMEQ
     {
         commitReadyFlags(); // GOW-Port: flags listos en este ciclo
-#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
-        if (m_unit == Unit::VU1)
-            vu1RapidoResolverMac(m_state.mac, m_cycle); // MAC perezoso del modo rápido (ps2_vu1_step.inl)
-#endif
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
@@ -266,23 +259,25 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     case 0x1A: // FMAND
     {
         commitReadyFlags(); // GOW-Port: flags listos en este ciclo
-#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
-        if (m_unit == Unit::VU1)
-            vu1RapidoResolverMac(m_state.mac, m_cycle); // MAC perezoso del modo rápido (ps2_vu1_step.inl)
-#endif
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
             m_state.vi[it] = (int32_t)(m_state.mac & (uint32_t)(uint16_t)m_state.vi[is]);
+        // GOW_VU1_FMANDPC=<hex pc>: debug, print the MAC flag FMAND reads at that pc (A/B with PCSX2's interpreter)
+        static const long fmandPc = std::getenv("GOW_VU1_FMANDPC") ? std::strtol(std::getenv("GOW_VU1_FMANDPC"), nullptr, 16) : -1;
+        static int fmandShown = 0;
+        if ((fmandPc == 0xFFFF || (fmandPc >= 0 && (static_cast<long>(m_state.pc) == fmandPc || static_cast<long>(m_state.pc) == fmandPc + 8))) && fmandShown < 40)
+        {
+            ++fmandShown;
+            std::fprintf(stderr, "[vu1-fmand] pc=%x mac=%04x mask=%04x -> %04x cycle=%llu\n", m_state.pc, m_state.mac & 0xFFFFu,
+                         static_cast<unsigned>(static_cast<uint16_t>(m_state.vi[is])), static_cast<unsigned>(static_cast<uint16_t>(m_state.vi[it])),
+                         static_cast<unsigned long long>(m_cycle));
+        }
         return;
     }
     case 0x1B: // FMOR
     {
         commitReadyFlags(); // GOW-Port: flags listos en este ciclo
-#if defined(PS2X_VU1_RAPIDO) && PS2X_VU1_RAPIDO
-        if (m_unit == Unit::VU1)
-            vu1RapidoResolverMac(m_state.mac, m_cycle); // MAC perezoso del modo rápido (ps2_vu1_step.inl)
-#endif
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
@@ -469,15 +464,16 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             switch (funct2)
             {
             case 0x30: // MOVE
-                fastStoreDest(m_state.vf[vfT], m_state.vf[vfS], dest);
+            {
+                float tmp[4];
+                std::memcpy(tmp, m_state.vf[vfS], 16);
+                applyDest(m_state.vf[vfT], tmp, dest);
                 return;
+            }
             case 0x31: // MR32 (rotate right by 32 bits = shift xyzw -> yzwx)
             {
-                __m128 v = _mm_loadu_ps(m_state.vf[vfS]);
-                __m128 rot = _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 3, 2, 1));
-                alignas(16) float tmp[4];
-                _mm_store_ps(tmp, rot);
-                fastStoreDest(m_state.vf[vfT], tmp, dest);
+                float tmp[4] = {m_state.vf[vfS][1], m_state.vf[vfS][2], m_state.vf[vfS][3], m_state.vf[vfS][0]};
+                applyDest(m_state.vf[vfT], tmp, dest);
                 return;
             }
             case 0x34: // LQI (Load Quadword, post-increment)
@@ -485,7 +481,11 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
                 addr &= (dataSize - 1);
                 if (addr + 16 <= dataSize)
-                    fastStoreDest(m_state.vf[vfT], reinterpret_cast<const float *>(vuData + addr), dest);
+                {
+                    float tmp[4];
+                    std::memcpy(tmp, vuData + addr, 16);
+                    applyDest(m_state.vf[vfT], tmp, dest);
+                }
                 if (viS != 0)
                     m_state.vi[viS] = (int16_t)(m_state.vi[viS] + 1);
                 return;
@@ -495,7 +495,11 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viT]) * 16u;
                 addr &= (dataSize - 1);
                 if (addr + 16 <= dataSize)
-                    queueStore(addr, reinterpret_cast<const uint32_t *>(m_state.vf[vfS]), dest);
+                {
+                    uint32_t words[4]{};
+                    std::memcpy(words, m_state.vf[vfS], sizeof(words));
+                    queueStore(addr, words, dest);
+                }
                 if (viT != 0)
                     m_state.vi[viT] = (int16_t)(m_state.vi[viT] + 1);
                 return;
@@ -507,7 +511,11 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
                 addr &= (dataSize - 1);
                 if (addr + 16 <= dataSize)
-                    fastStoreDest(m_state.vf[vfT], reinterpret_cast<const float *>(vuData + addr), dest);
+                {
+                    float tmp[4];
+                    std::memcpy(tmp, vuData + addr, 16);
+                    applyDest(m_state.vf[vfT], tmp, dest);
+                }
                 return;
             }
             case 0x37: // SQD (Store Quadword, pre-decrement)
@@ -517,7 +525,11 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viT]) * 16u;
                 addr &= (dataSize - 1);
                 if (addr + 16 <= dataSize)
-                    queueStore(addr, reinterpret_cast<const uint32_t *>(m_state.vf[vfS]), dest);
+                {
+                    uint32_t words[4]{};
+                    std::memcpy(words, m_state.vf[vfS], sizeof(words));
+                    queueStore(addr, words, dest);
+                }
                 return;
             }
             case 0x38: // DIV
@@ -596,7 +608,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 result[1] = result[0];
                 result[2] = result[0];
                 result[3] = result[0];
-                fastStoreDest(m_state.vf[vfT], result, dest);
+                applyDest(m_state.vf[vfT], result, dest);
                 return;
             }
             case 0x3E: // ILWR - integer load word from address in VI[is]
@@ -643,16 +655,15 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 float value = 0.0f;
                 std::memcpy(&value, &m_state.r, sizeof(value));
                 const float result[4] = {value, value, value, value};
-                fastStoreDest(m_state.vf[vfT], result, dest);
+                applyDest(m_state.vf[vfT], result, dest);
                 return;
             }
             case 0x41: // RGET
             {
                 float value = 0.0f;
                 std::memcpy(&value, &m_state.r, sizeof(value));
-                alignas(16) float result[4];
-                _mm_store_ps(result, _mm_set1_ps(value));
-                fastStoreDest(m_state.vf[vfT], result, dest);
+                const float result[4] = {value, value, value, value};
+                applyDest(m_state.vf[vfT], result, dest);
                 return;
             }
             case 0x42: // RINIT
@@ -673,9 +684,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             }
             case 0x64: // MFP (Move From P register)
             {
-                alignas(16) float result[4];
-                _mm_store_ps(result, _mm_set1_ps(m_state.p));
-                fastStoreDest(m_state.vf[vfT], result, dest);
+                float result[4] = {m_state.p, m_state.p, m_state.p, m_state.p};
+                applyDest(m_state.vf[vfT], result, dest);
                 return;
             }
             case 0x68: // XTOP - move current VIF1 TOP into VI register

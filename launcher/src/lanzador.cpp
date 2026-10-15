@@ -31,30 +31,13 @@ namespace
     const QString kNombreEjecutable = QStringLiteral("ps2EntryRunner");
 #endif
 
-    // Ajustes de rendimiento probados (los de run_gow.sh). Una variable que ya esté en el entorno del usuario se
-    // respeta, para poder comparar sin tocar el lanzador.
+    // GOW-Port: ajustes de juego del runtime de Waffle565 (tools/waffle/play.cmd y run_gow.sh): VIF1/VU1/GIF en el
+    // hilo del GS, FINISH asíncrono y sonido en la salida por defecto. Una variable que ya esté en el entorno del
+    // usuario se respeta, para poder comparar sin tocar el lanzador.
     const std::pair<const char *, const char *> kEntornoBase[] = {
-        {"PS2X_GS_GPU", "1"},
-        {"PS2X_GS_THREAD", "1"},
-        {"GOW_XGKICK_IMMEDIATE", "1"},
-        {"GOW_PERF_FRAME_PC", "0x001837B8"},
+        {"PS2X_GS_WORKER", "1"},
         {"GOW_GS_FINISH_ASINCRONO", "1"},
-        {"PS2X_GS_QUEUE_CHUNKS", "128"},
-        {"PS2X_GS_GPU_DEFER_UPLOADS", "1"},
-        {"PS2X_GS_COMPACT_QUEUE", "1"},
-        {"GOW_UNLOCKED_FPS", "0"},
-        {"GOW_TARGET_FPS", "60"},
-        {"GOW_IOP_BATCH", "1024"},
-        {"GOW_VBLANK_REALTIME", "1"},
-        {"GOW_EE_CICLOS", "50"},
-        {"PS2X_VU1_HILO", "1"},
-        {"PS2X_GS_FRENTE", "1"},
-        {"PS2X_GS_ASYNC_PRESENT", "1"},
-        {"PS2X_GS_PRESENT_BUZON", "1"},
-#if !defined(_WIN32)
-        // GOW-Port: presentación compartida (sin lectura a la RAM); en Windows sin probar con el renderizador nuevo.
-        {"PS2X_GS_DIRECT_PRESENT", "1"},
-#endif
+        {"GOW_AUDIO_DEVICE", "default"},
     };
 
     QString leerTexto(const QString &ruta)
@@ -429,6 +412,8 @@ bool Lanzador::iniciar(const QVariantMap &a)
     bandera("TOBIICHI_FXAA", a.value(QStringLiteral("fxaa")).toBool());
     // Resolución interna del GS (1..8; la interfaz resuelve "automático" según la pantalla) e imagen nítida.
     entorno.insert(QStringLiteral("PS2X_GS_ESCALA"), QString::number(std::clamp(a.value(QStringLiteral("escala"), 1).toInt(), 1, 8)));
+    // GOW-Port: el renderizador de Waffle (render targets) lee la escala de PS2X_GS_HW_SCALE.
+    entorno.insert(QStringLiteral("PS2X_GS_HW_SCALE"), QString::number(std::clamp(a.value(QStringLiteral("escala"), 2).toInt(), 1, 8)));
     bandera("PS2X_GS_NITIDO", a.value(QStringLiteral("imagenNitida"), true).toBool(), "0");
     bandera("PS2X_GS_ESCALA_DINAMICA", a.value(QStringLiteral("escalaDinamica"), true).toBool(), "0");
     bandera("PS2X_GS_HW", a.value(QStringLiteral("dibujoHardware"), true).toBool(), "0");

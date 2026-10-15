@@ -79,8 +79,11 @@ if(PS2X_IS_ARM_TARGET)
     endif()
 endif()
 
-if(NOT MSVC AND NOT PS2X_IS_ARM_TARGET)
-    add_compile_options(-march=native -mavx2 -mfma -O3)
+# GOW-Port (Linux): el código de Waffle usa SSE4.1/AVX como en MSVC x64 (intrínsecos _mm_extract_*). GCC y Clang
+# fusionan a*b+c en FMA por defecto (-ffp-contract=fast); MSVC no (/fp:precise), y la FMAC de VU y la FPU del EE
+# redondean el producto y la suma por separado: -ffp-contract=off da los mismos resultados que en Windows.
+if(NOT MSVC AND NOT PS2X_IS_ARM_TARGET AND NOT PS2X_IS_AARCH64_TARGET AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    add_compile_options(-march=native -ffp-contract=off)
 endif()
 
 if(PS2X_BUILD_RECOMP)

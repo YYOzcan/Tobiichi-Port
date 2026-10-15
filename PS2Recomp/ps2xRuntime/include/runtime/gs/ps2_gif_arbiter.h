@@ -43,8 +43,6 @@ public:
 private:
     ProcessPathPacketFn m_processFn;
     std::vector<GifArbiterPacket> m_queue;
-    // GOW-Port: búferes de paquetes ya procesados, para no reservar memoria en cada paquete (XGKICK, DMA).
-    std::vector<std::vector<uint8_t>> m_spare;
 
     // GOW-Port: el primer quadword de un bloque DMA puede ser payload, no una GIFtag.
     struct Path3InputState
