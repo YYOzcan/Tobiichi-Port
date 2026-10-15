@@ -422,7 +422,11 @@ bool Lanzador::iniciar(const QVariantMap &a)
     bandera("TOBIICHI_VSYNC", a.value(QStringLiteral("vsync")).toBool());
     bandera("TOBIICHI_FPS_GOSTER", a.value(QStringLiteral("mostrarFps")).toBool());
     // Archivos.
-    const QString iso = a.value(QStringLiteral("iso")).toString();
+    // GOW-Port: el runtime de Waffle lee el disco de la ISO (sin PART2.PAK extraído no hay disco completo en la carpeta);
+    // sin ISO elegida se usa la primera que haya junto al ELF.
+    QString iso = a.value(QStringLiteral("iso")).toString();
+    if (iso.isEmpty())
+        iso = primeraIso(QFileInfo(a.value(QStringLiteral("elf")).toString()).absolutePath());
     if (iso.isEmpty())
         entorno.remove(QStringLiteral("GOW_ISO"));
     else

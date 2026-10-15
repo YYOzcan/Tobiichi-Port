@@ -115,6 +115,7 @@ namespace
     // GOW-Port: lectura del mando de God of War (scePad2Read, 0x27B9F0; gowPad2Read en los overrides de Waffle). Con
     // TOBIICHI_TECLAS los sticks del teclado salen del mapa configurable; con el menú de trucos abierto el paquete
     // queda en reposo (botones sueltos, sticks centrados, sin presión).
+    void reaplicarPanoramico(uint8_t *rdram); // más abajo, junto al panorámico
     constexpr uint32_t kGowPad2Read = 0x0027B9F0u;
     PS2Runtime::RecompiledFunction g_gowPad2Read = nullptr;
 
@@ -122,6 +123,9 @@ namespace
     {
         const uint32_t buffer = GPR_U32(ctx, 5) & 0x01FFFFFFu;
         g_gowPad2Read(rdram, ctx, runtime);
+        // Los overrides de Waffle escriben el aspecto 16/9 en cada lectura del mando; con TOBIICHI_PANORAMICO se
+        // vuelve a poner el elegido antes de que el juego lo use (si no, alterna entre los dos en cada cuadro).
+        reaplicarPanoramico(rdram);
         if (GPR_U32(ctx, 2) != 18u || buffer + 18u > PS2_RAM_SIZE)
             return;
         if (gowTrucosEntradaBloqueada())
@@ -204,6 +208,20 @@ namespace
             write32(0x7F04u, read32(0x29CC90u));
         }
         write32(0x7F00u, floatBits(factor));
+    }
+}
+
+namespace
+{
+    void reaplicarPanoramico(uint8_t *rdram)
+    {
+        const float target = gowAspectoPanoramico();
+        if (target <= 0.0f || !rdram)
+            return;
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &target, sizeof(bits));
+        for (const uint32_t address : {0x32F1B0u, 0x2FD930u, 0x2FD968u})
+            std::memcpy(rdram + address, &bits, sizeof(bits));
     }
 }
 

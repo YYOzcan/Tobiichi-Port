@@ -234,6 +234,11 @@ ApplicationWindow {
             ajustes.saltarVideos = true
             ajustes.versionAjustes = 5
         }
+        // GOW-Port: versión 6 (rama ultimate): el runtime de Waffle reproduce los vídeos de forma nativa, con sonido.
+        if (ajustes.versionAjustes < 6) {
+            ajustes.saltarVideos = false
+            ajustes.versionAjustes = 6
+        }
         if (ajustes.idioma.length === 0) {
             var loc = Qt.locale().name
             ajustes.idioma = loc.indexOf("tr") === 0 ? "tr" : (loc.indexOf("es") === 0 ? "es" : "en")

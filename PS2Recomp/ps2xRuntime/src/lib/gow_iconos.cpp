@@ -473,10 +473,10 @@ namespace
         float r, g, b, a; // multiplicadores del cxform (oscurecido y transparencia de los menús)
     };
     std::mutex g_mutex;
-    // GOW-Port: modo 16:9 del propio juego (0x29CC90 = 1; los overrides de Waffle y TOBIICHI_PANORAMICO lo activan).
-    // En ese modo el reproductor de Flash estira el escenario en vertical 4/3 alrededor del centro (640 x 360 visibles en
-    // los 448 renglones): medido en el menú de pausa y en el de título, error < 4 píxeles a 922 x 518.
-    std::atomic<bool> g_panoramicoJuego{false};
+    // GOW-Port: modo panorámico del propio juego (0x29CC90 = 1; los overrides de Waffle y TOBIICHI_PANORAMICO lo
+    // activan). En ese modo el reproductor de Flash estira el escenario en vertical, alrededor del centro, por el aspecto
+    // del juego / (4/3): 4/3 con 16:9, medido en los menús de pausa y de título (error < 4 píxeles a 922 x 518).
+    std::atomic<float> g_estiramientoVertical{1.0f};
     std::vector<Icono> g_construyendo, g_publicados;
     std::chrono::steady_clock::time_point g_ultimoAnotado{}, g_publicadoEn{};
 
@@ -559,7 +559,13 @@ namespace
             g_dibujarForma(rdram, ctx, runtime);
             return;
         }
-        g_panoramicoJuego.store(rdram[0x29CC90u] == 1u, std::memory_order_relaxed);
+        {
+            // Estiramiento vertical del escenario: aspecto del juego (0x32F1B0) / (4/3); 1 sin el modo panorámico.
+            float aspecto = 4.0f / 3.0f;
+            std::memcpy(&aspecto, rdram + 0x32F1B0u, sizeof(aspecto));
+            const bool ancho = rdram[0x29CC90u] == 1u && aspecto > 1.0f && aspecto < 4.0f;
+            g_estiramientoVertical.store(ancho ? aspecto * 0.75f : 1.0f, std::memory_order_relaxed);
+        }
         const uint32_t entrada = GPR_U32(ctx, 4), m = GPR_U32(ctx, 7);
         if (!g_ocultar.empty() && (g_ocultar.count(entrada) || g_ocultar.count(GPR_U32(ctx, 6))))
         {
@@ -1094,7 +1100,7 @@ void gowIconosDibujar(float dx, float dy, float dw, float dh)
         // Radio en píxeles del escenario (el espacio de la matriz va a medio píxel).
         const float r = i.escala * 0.5f * ajuste;
         const float alto = 2.0f * r / 480.0f * dh, ancho = alto * t.aspecto;
-        const float y = g_panoramicoJuego.load(std::memory_order_relaxed) ? 240.0f + (i.y - 240.0f) * (4.0f / 3.0f) : i.y;
+        const float y = 240.0f + (i.y - 240.0f) * g_estiramientoVertical.load(std::memory_order_relaxed);
         const float cx = dx + i.x / 640.0f * dw, cy = dy + y / 480.0f * dh;
         const Rectangle origen{0.0f, 0.0f, float(t.rt.texture.width), -float(t.rt.texture.height)};
         const Color tinte{static_cast<unsigned char>(255.0f * i.r), static_cast<unsigned char>(255.0f * i.g),

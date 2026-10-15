@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFontDatabase>
 #include <QGuiApplication>
+#include <QSettings>
 #include <QIcon>
 #include <QLinearGradient>
 #include <QPainter>
@@ -60,7 +61,19 @@ int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
     QGuiApplication::setOrganizationName(QStringLiteral("Tobiichi"));
-    QGuiApplication::setApplicationName(QStringLiteral("Launcher"));
+    // GOW-Port: rama ultimate (runtime de Waffle565): ajustes propios, para que el lanzador de la rama main no le cambie el
+    // ejecutable. La primera vez se copian los de "Launcher" salvo las rutas del juego y del ejecutable.
+    QGuiApplication::setApplicationName(QStringLiteral("LauncherUltimate"));
+    {
+        QSettings nuevos;
+        if (nuevos.allKeys().isEmpty())
+        {
+            QSettings anteriores(QStringLiteral("Tobiichi"), QStringLiteral("Launcher"));
+            for (const QString &clave : anteriores.allKeys())
+                if (clave != QStringLiteral("ajustes/ejecutable") && clave != QStringLiteral("ajustes/elf"))
+                    nuevos.setValue(clave, anteriores.value(clave));
+        }
+    }
     QGuiApplication::setApplicationDisplayName(QStringLiteral("God Of War: Tobiichi Launcher"));
     QGuiApplication::setApplicationVersion(QStringLiteral(TOBIICHI_VERSION));
     QGuiApplication::setDesktopFileName(QStringLiteral("tobiichi-launcher"));
